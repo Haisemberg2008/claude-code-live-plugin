@@ -1,0 +1,25 @@
+{
+  "name": "claude-code-live",
+  "version": "0.1.0+codex.20260906201459",
+  "description": "Coordena o Claude Code local ou em nuvem com permissoes, acompanhamento e retomada controlados.",
+  "author": {
+    "name": "YOU Telecom"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude Code Live",
+    "shortDescription": "Claude Code local ou em nuvem, com controle.",
+    "longDescription": "Escolha entre execucao local controlada e sessao em nuvem do Claude Code, limite ferramentas e dados, acompanhe o trabalho e valide o resultado no Codex.",
+    "developerName": "YOU Telecom",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use Claude Code Live para executar esta tarefa localmente com permissoes minimas.",
+      "Use Claude Code Live para iniciar e acompanhar esta tarefa em nuvem."
+    ]
+  }
+}
