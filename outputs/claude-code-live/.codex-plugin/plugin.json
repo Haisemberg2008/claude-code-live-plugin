@@ -1,6 +1,6 @@
 {
   "name": "claude-code-live",
-  "version": "0.1.0+codex.20260906201459",
+  "version": "0.1.0+codex.20260907001833",
   "description": "Coordena o Claude Code local ou em nuvem com permissoes, acompanhamento e retomada controlados.",
   "author": {
     "name": "YOU Telecom"

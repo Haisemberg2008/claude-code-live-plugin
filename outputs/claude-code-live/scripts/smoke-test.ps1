@@ -4,6 +4,10 @@ $ErrorActionPreference = 'Stop'
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
 & (Join-Path $PSScriptRoot 'validate.ps1') -BundlePath $bundle
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$testsPath = Join-Path $bundle 'skills\claude-code-live\tests'
+Get-ChildItem -LiteralPath $testsPath -Filter '*.tests.ps1' -File | Sort-Object Name | ForEach-Object {
+    & $_.FullName
+}
 & claude --version
 if ($LASTEXITCODE -ne 0) { throw 'Claude Code CLI is unavailable.' }
 $help = (& claude --help 2>&1) -join "`n"

@@ -4,8 +4,11 @@ param(
     [Parameter(Mandatory)][string]$RunDirectory
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'claude-live-contract.ps1')
+. (Join-Path $PSScriptRoot 'claude-usage.ps1')
 $Host.UI.RawUI.WindowTitle = 'Claude Code | Acompanhamento ao vivo'
 $job = Get-Content -LiteralPath $JobFile -Raw -Encoding utf8 | ConvertFrom-Json
+$contract = Resolve-ClaudeLiveContract -Job $job
 $workspace = (Resolve-Path -LiteralPath $job.workspace).Path
 $promptText = Get-Content -LiteralPath $job.promptFile -Raw -Encoding utf8
 $mode = [string]$job.mode
@@ -33,17 +36,6 @@ $binary = if ($launcher.EndsWith('.exe')) { $launcher } else {
     Join-Path (Split-Path $launcher) 'node_modules/@anthropic-ai/claude-code/bin/claude.exe'
 }
 if (-not (Test-Path -LiteralPath $binary)) { throw 'Claude executable not found; inspect installation.' }
-function Test-ClaudeCompatibility {
-    $help = (& $binary --help 2>&1) -join "`n"
-    foreach ($option in @('--allowedTools','--permission-mode','--permission-prompts','--output-format')) {
-        if ($help -notmatch [regex]::Escape($option)) { throw "Installed Claude Code does not support required option: $option" }
-    }
-    foreach ($arguments in @(@('--tools','Read','--version'), @('--safe-mode','--version'), @('--restricted','--version'), @('--strict-mcp-config','--version'))) {
-        & $binary @arguments | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Installed Claude Code does not support required option: $($arguments[0])" }
-    }
-}
-Test-ClaudeCompatibility
 [IO.Directory]::CreateDirectory($runPath) | Out-Null
 $logPath = Join-Path $runPath 'acompanhamento.txt'
 $statusPath = Join-Path $runPath 'status.json'
@@ -57,6 +49,16 @@ function Write-State($Value, [string]$Path) {
     $temp = $Path + '.tmp'
     $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding utf8
     [IO.File]::Move($temp, $Path, $true)
+}
+$usageSnapshot = $null
+try {
+    $usageSnapshot = Get-ClaudeUsageSnapshot
+    foreach ($usageLine in (Format-ClaudeUsageSnapshot -Usage $usageSnapshot)) { Show-Line $usageLine }
+    if ($usageSnapshot.AlertLevel -ne 'ok') {
+        Show-Line ('[Uso] ALERTA ' + $usageSnapshot.AlertLevel.ToUpperInvariant() + ': confirme a capacidade antes de iniciar trabalho longo.')
+    }
+} catch {
+    Show-Line '[Uso] INDISPONIVEL: limites nao confirmados; nenhuma troca de modelo ou compra foi feita.'
 }
 $tools = switch ($mode) {
     'chat' { @() }
@@ -86,11 +88,10 @@ if ($allowed.Count) {
     foreach ($rule in $allowed) { $start.ArgumentList.Add($rule) }
 }
 if ($resumeId) { $start.ArgumentList.Add('--resume'); $start.ArgumentList.Add($resumeId) }
-if ($job.model) { $start.ArgumentList.Add('--model'); $start.ArgumentList.Add($job.model) }
-if ($job.effort) {
-    if ($job.effort -notin @('low','medium','high','xhigh','max')) { throw 'Invalid effort.' }
-    $start.ArgumentList.Add('--effort'); $start.ArgumentList.Add($job.effort)
-}
+$start.ArgumentList.Add('--model')
+$start.ArgumentList.Add($contract.Model)
+$start.ArgumentList.Add('--effort')
+$start.ArgumentList.Add($contract.Effort)
 $process = [Diagnostics.Process]::new()
 $process.StartInfo = $start
 $started = $false
@@ -99,8 +100,8 @@ $clock = [Diagnostics.Stopwatch]::StartNew()
 $seenTools = [Collections.Generic.List[string]]::new()
 $record = [ordered]@{
     status = 'STARTING'; workspace = $workspace; sessionId = $resumeId
-    model = $null; effort = $job.effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
-    result = $null; toolCalls = @(); toolErrors = 0; permissionDenials = 0
+    requestedModel = $contract.Model; model = $null; effort = $contract.Effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
+    result = $null; usage = $usageSnapshot; toolCalls = @(); toolErrors = 0; permissionDenials = 0
     exitCode = $null; elapsedSeconds = 0
 }
 Show-Line 'CLAUDE CODE - ACOMPANHAMENTO AO VIVO'

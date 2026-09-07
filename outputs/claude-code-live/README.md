@@ -7,7 +7,8 @@ Plugin local que empacota a skill `claude-code-live` e seu executor PowerShell. 
 - `.codex-plugin/plugin.json`: manifesto do plugin.
 - `skills/claude-code-live/SKILL.md`: roteamento e contrato comum.
 - `skills/claude-code-live/references/`: guias de modo local, nuvem e seguranca.
-- `skills/claude-code-live/scripts/`: executor, iniciador do painel e observador PowerShell preservados da skill local.
+- `skills/claude-code-live/scripts/`: executor, painel, contrato de modelo/esforco e consulta sanitizada dos limites de uso.
+- `skills/claude-code-live/tests/`: testes do contrato e do parser de uso, executados pelo smoke test.
 
 ## Instalar localmente
 
