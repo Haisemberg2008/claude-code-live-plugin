@@ -6,6 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $jobPath = (Resolve-Path -LiteralPath $JobFile).Path
 $job = Get-Content -LiteralPath $jobPath -Raw -Encoding utf8 | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'claude-live-contract.ps1')
+$null = Resolve-ClaudeLiveContract -Job $job
 $workspace = (Resolve-Path -LiteralPath $job.workspace).Path
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
 if (Test-Path -LiteralPath $runPath) { throw 'Use a new run directory.' }

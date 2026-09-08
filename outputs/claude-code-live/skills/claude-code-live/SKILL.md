@@ -1,6 +1,6 @@
 ---
 name: claude-code-live
-description: Use when coordinating authorized local Claude Code CLI work that needs visible progress, scoped tools, controlled permissions, resumption, interruption, or native background-session management.
+description: Use when coordinating authorized Claude Code CLI work that needs explicit responsibility assignment, an approved plan, visible progress, scoped tools, controlled permissions, resumption, interruption, or background-session management.
 ---
 
 # Claude Code ao vivo
@@ -16,6 +16,14 @@ Use o CLI instalado e a autenticacao existente. A skill coordena tanto sessoes l
 
 Antes de escolher nuvem, confirme que o repositorio e os dados necessarios estao no ambiente remoto autorizado. Nao envie segredos, arquivos de ambiente, dados pessoais ou perfis reais para criar essa conveniencia. Antes de escolher local, verifique checkout, branch e alteracoes existentes. Se ambos servirem, prefira local para trabalho que requer validacao no computador atual; prefira nuvem para uma sessao remota independente ou revisao hospedada.
 
+## Planejar e atribuir antes de executar
+
+Antes de iniciar implementacao ou qualquer mutacao, inspecione em modo somente leitura o necessario para propor um plano realista. Em uma unica tabela, apresente estas oito responsabilidades e atribua exatamente um ator a cada uma: `planning`, `inspection`, `implementation`, `testing`, `review`, `commit`, `push` e `deploy`. Os atores aceitos sao `codex`, `claude`, `user` e `not_applicable`. `deploy` inclui publicacao e qualquer mutacao externa.
+
+Explique o plano, a matriz e as permissoes que o job concedera, e aguarde aprovacao explicita do usuario. Silencio, envio do plano ou autorizacao anterior para uma tarefa diferente nao significam aprovacao. Antes da aprovacao final, uma sessao Claude pode participar do planejamento somente em `chat` ou `read`; nenhuma ferramenta de escrita ou comando e permitido.
+
+Claude nunca recebe `commit`, `push` ou `deploy`. Essas responsabilidades pertencem ao Codex, ao usuario ou ficam como `not_applicable`. Depois da aprovacao, execute apenas as etapas atribuidas ao Claude. O Codex nao assume automaticamente as demais: segue a matriz e solicita nova decisao quando surgir uma acao que nao estava prevista.
+
 ## Contrato da tarefa
 
 Crie um arquivo de prompt completo e um job JSON fora do checkout ou dentro de uma pasta de trabalho autorizada. Use `apply_patch` para cria-los. Inclua no prompt objetivo, pasta autorizada, arquivos permitidos, criterios de aceite e regras relevantes do projeto. O executor usa safe mode: nao pressupor que CLAUDE.md, AGENTS.md, hooks ou skills do projeto serao carregados automaticamente. Leia-os e transmita as regras aplicaveis.
@@ -24,17 +32,20 @@ Campos do job:
 
 - `workspace`: caminho absoluto da pasta de trabalho.
 - `promptFile`: caminho absoluto do prompt, sem segredos ou PII.
-- `mode`: `chat`, `read` ou `local`.
+- `mode`: `chat`, `read`, `verify` ou `local`.
 - `profile`: `diagnostic` ou `restricted`; omitir equivale a `diagnostic` para compatibilidade.
 - `model`: opcional; omitir usa `fable`, atualmente apresentado ao usuario como Fable 5.1. Uma escolha explicita no job prevalece.
 - `effort`: opcional; omitir usa `high`. Valores aceitos: low, medium, high, xhigh ou max.
-- `allowedCommands`: array opcional de regras Bash especificas, por exemplo `Bash(node check.cjs)`. Somente modo local. Inspecionar os scripts chamados antes de permitir a execucao. Nao usar Bash irrestrito nem regras genericas de interpretador.
+- `coordination`: contrato obrigatorio com `phase`, `scopeId`, `approvalRevision`, `planSummary`, `planApproved` e `responsibilities` para as oito etapas.
+- `allowedCommands`: array opcional de objetos com `rule` e `responsibility`, por exemplo `{ "rule": "Bash(node check.cjs)", "responsibility": "testing" }`. Somente `verify` ou `local`. Inspecionar os scripts chamados antes de permitir a execucao. Nao usar Bash irrestrito nem regras genericas de interpretador.
 - `resumeFrom`: opcional; caminho para resultado.json de uma execucao anterior no mesmo workspace.
 - `timeoutSeconds`: opcional, padrao 1800.
 
-`chat` nao oferece ferramentas; `read` oferece Read/Glob/Grep; `local` acrescenta Write/Edit e, somente com regras de comandos, Bash. Todos usam `dontAsk`, uma allowlist e `--permission-prompts none`: uma acao nao autorizada e negada, registrada como BLOCKED e nunca fica esperando uma aprovacao invisivel.
+`chat` nao oferece ferramentas; `read` oferece Read/Glob/Grep; `verify` acrescenta Bash somente para comandos exatos atribuidos a `inspection` ou `testing`; `local` acrescenta Write/Edit e pode executar comandos exatos de `inspection`, `implementation` ou `testing`. Cada comando exige que Claude seja o responsavel pela etapa indicada. Todos usam `dontAsk`, uma allowlist e `--permission-prompts none`: uma acao nao autorizada e negada, registrada como BLOCKED e nunca fica esperando uma aprovacao invisivel.
 
-Para implementacao autorizada, use por padrao `mode: local`, `profile: restricted`, modelo Fable e esforco high. O painel deve mostrar o modelo efetivo no inicio. Se o alias `fable` deixar de corresponder ao Fable 5.1 solicitado, pare a execucao antes de aceitar o trabalho e comunique a divergencia; nao troque silenciosamente de modelo. Para diagnostico sem edicao, continue usando `read`.
+Use `phase: planning` antes da aprovacao, somente com `chat` ou `read`; a matriz ja deve ter sido escolhida, mas `planApproved` pode ser falso e `planSummary` pode estar vazio. Use `phase: execution` somente com resumo nao vazio e `planApproved: true`. O executor recusa jobs antigos sem `coordination`, matrizes incompletas, atores invalidos, edicao quando `implementation` nao pertence ao Claude e comandos ligados a etapas de outro ator.
+
+Para implementacao atribuida ao Claude e autorizada, use por padrao `mode: local`, `profile: restricted`, modelo Fable e esforco high. Para testes atribuidos ao Claude quando outro ator implementa, use `verify`, que nao concede Write/Edit. O painel deve mostrar o modelo efetivo no inicio. Se o alias `fable` deixar de corresponder ao Fable 5.1 solicitado, pare a execucao antes de aceitar o trabalho e comunique a divergencia; nao troque silenciosamente de modelo. Para diagnostico sem comandos, continue usando `read`.
 
 | Perfil | Quando usar | Contencao |
 |---|---|---|
@@ -60,17 +71,17 @@ Quando nao for necessario painel ao vivo, use o gerenciamento nativo do CLI para
 Para tarefas de engenharia, trabalhe em ciclos verificaveis:
 
 1. O Codex delimita o objetivo, o workspace, as regras do projeto e os criterios de aceite.
-2. O Claude inspeciona os arquivos autorizados, propoe ou aplica a mudanca e executa apenas os testes/comandos permitidos.
+2. O Claude executa somente as etapas que a matriz lhe atribuiu, nos arquivos autorizados e com os testes/comandos permitidos.
 3. O Codex revisa o diff e as evidencias independentemente. Quando houver lacuna, risco ou alternativa melhor, envia uma correcao objetiva retomando a mesma sessao.
 4. O Claude revisa a proposta corrigida ou o novo diff. O Codex decide pela aceitacao com base nos artefatos e testes, nao por concordancia entre modelos.
 
-Use `resumeFrom` quando o objetivo e o workspace continuarem compativeis, preservando a conversa e a grande janela de contexto. Mantenha no prompt seguinte um resumo curto das decisoes, evidencias e pendencias; deixe o Claude reler o codigo necessario com as ferramentas autorizadas, em vez de copiar o repositorio inteiro para o prompt. Uma nova tarefa, mudanca material de escopo ou contexto contaminado exige uma nova sessao.
+Use `resumeFrom` quando o objetivo e o workspace continuarem compativeis, preservando a conversa e a grande janela de contexto. Reutilize o mesmo `scopeId`, `approvalRevision`, plano e matriz quando nada mudou. Qualquer mudanca exige aprovacao explicita e um `approvalRevision` maior; o executor rejeita alteracao com revisao antiga. Mantenha no prompt seguinte um resumo curto das decisoes, evidencias e pendencias; deixe o Claude reler o codigo necessario com as ferramentas autorizadas, em vez de copiar o repositorio inteiro para o prompt. Uma nova tarefa, mudanca material de escopo ou contexto contaminado exige uma nova sessao.
 
 Os modelos colaboram por propostas, diffs, resultados de testes e respostas publicas; nao alegue acesso ao raciocinio interno de nenhum deles. Divergencias sao resolvidas por evidencia reproduzivel. O Codex permanece responsavel por autorizacao, revisao final, mutacoes externas e deploy.
 
 ## Sessoes na nuvem
 
-Para uma tarefa na nuvem, crie uma nova sessao descrevendo o objetivo ou conecte-se a uma sessao ja existente pelo identificador ou link que o usuario forneceu. Use um ambiente remoto especifico somente quando ele tiver sido indicado. Para trabalho longo, o CLI oferece execucao em segundo plano, listagem, logs, conexao ao terminal e interrupcao; acompanhe marcos reais e pare diante de bloqueio, desvio de escopo ou necessidade de nova autorizacao. O uso de recursos em nuvem, agentes hospedados, revisao remota, plugins ou navegador precisa estar no pedido do usuario e manter os mesmos limites de dados e autorizacao.
+Para uma tarefa na nuvem, aplique primeiro o mesmo plano, matriz e aprovacao explicita. Crie uma nova sessao descrevendo somente as etapas atribuidas ao Claude ou conecte-se a uma sessao ja existente pelo identificador ou link que o usuario forneceu. O runner local nao controla o backend de nuvem; portanto o Codex deve preservar a matriz no prompt e bloquear manualmente qualquer ampliacao. Use um ambiente remoto especifico somente quando ele tiver sido indicado. Para trabalho longo, o CLI oferece execucao em segundo plano, listagem, logs, conexao ao terminal e interrupcao; acompanhe marcos reais e pare diante de bloqueio, desvio de escopo ou necessidade de nova autorizacao. O uso de recursos em nuvem, agentes hospedados, revisao remota, plugins ou navegador precisa estar no pedido do usuario e manter os mesmos limites de dados e autorizacao.
 
 Nao trate limite de uso da assinatura como autorizacao para ampliar escopo ou iniciar varias sessoes. Em fluxos por API, use um teto de gasto apenas quando o usuario o tiver autorizado; em fluxos por assinatura, acompanhe somente a janela de uso exibida pelo produto e comunique indisponibilidade sem tentar contornar limites.
 
@@ -78,7 +89,7 @@ Leia `acompanhamento.txt` e `status.json` na pasta da execucao em intervalos raz
 
 O usuario pode apertar Q no painel ou pedir parada aqui. Para parar por aqui, crie `stop.request` na pasta exata da execucao com `apply_patch`; o executor encerra o processo filho e seus descendentes. Ctrl+C no terminal executor tambem aciona a limpeza no finally. X ou fechar o painel encerra somente a visualizacao, nao o trabalho; o painel reabre na proxima chamada. O ultimo resultado permanece visivel e as tarefas seguintes reutilizam a janela. Fechamento forcado do executor ou queda do sistema nao foram garantidos: verificar processos antes de retomar.
 
-`resultado.json` contem status, sessionId, workspace, modelo, perfil, nomes das ferramentas, quantidade de falhas de ferramenta, negativas de permissao e resposta final. `COMPLETED` significa que o CLI terminou, nao que a tarefa foi aprovada. `FAIL`, `BLOCKED`, `CANCELLED` e `TIMEOUT` nunca sao sucesso. Logs ficam preservados; nao sobrescrever uma pasta de execucao anterior.
+`resultado.json` contem status, sessionId, workspace, modelo, perfil, contrato de coordenacao sanitizado, nomes das ferramentas, quantidade de falhas de ferramenta, negativas de permissao e resposta final. O painel mostra fase, escopo, revisao aprovada, resumo e responsaveis. `COMPLETED` significa que o CLI terminou, nao que a tarefa foi aprovada. `FAIL`, `BLOCKED`, `CANCELLED` e `TIMEOUT` nunca sao sucesso. Logs ficam preservados; nao sobrescrever uma pasta de execucao anterior.
 
 Para continuar, crie outro job com `resumeFrom` apontando ao resultado anterior e outra pasta de execucao. A retomada conserva o contexto salvo, nao desfaz edicoes nem repete ferramentas automaticamente. Reinspecione artefatos depois de interrupcao e explique o que falta no prompt seguinte. Nunca reexecutar cegamente uma mutacao. Use sessao em nuvem, plugins, diretorios adicionais, Chrome e agentes somente quando o usuario os pedir explicitamente; eles aumentam o escopo de acesso e nao fazem parte do caminho padrao.
 

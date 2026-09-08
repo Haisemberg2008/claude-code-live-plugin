@@ -2,6 +2,8 @@
 
 Use este modo somente quando o repositorio, ambiente e dados necessarios ja estiverem disponiveis no destino remoto autorizado. A nuvem nao recebe automaticamente o checkout local e nao deve ser usada para transportar segredos ou dados sensiveis.
 
+Antes de criar ou retomar a sessao, apresente o plano e a matriz de `planning`, `inspection`, `implementation`, `testing`, `review`, `commit`, `push` e `deploy`, e aguarde aprovacao explicita. Envie ao Claude somente as etapas atribuidas a ele. Commit, push, deploy e outras mutacoes externas permanecem com Codex, usuario ou `not_applicable`; o runner local nao consegue impor essa trava dentro do backend de nuvem, portanto preserve-a no prompt e na revisao.
+
 Uma sessao em nuvem exige um terminal interativo. Em uma execucao sem TTY, o CLI recusa `--cloud`; nao tente contornar essa restricao nem a substitua silenciosamente por execucao local.
 
 Os exemplos abaixo correspondem ao Claude Code CLI 2.1.263; consulte `claude --help` antes de operar outra versao.

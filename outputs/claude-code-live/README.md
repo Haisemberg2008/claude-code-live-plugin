@@ -1,37 +1,143 @@
 # Claude Code Live para Codex
 
-Plugin local que empacota a skill `claude-code-live` e seu executor PowerShell. Ele ajuda o Codex a escolher entre execucao local controlada e sessao em nuvem do Claude Code, acompanhar o trabalho, interromper/retomar e validar o resultado sem ampliar permissoes.
+Plugin para coordenar Claude Code local ou em nuvem com planejamento aprovado, responsáveis explícitos, permissões mínimas, acompanhamento e retomada controlados.
 
-## Conteudo
+## Fluxo obrigatório
 
-- `.codex-plugin/plugin.json`: manifesto do plugin.
-- `skills/claude-code-live/SKILL.md`: roteamento e contrato comum.
-- `skills/claude-code-live/references/`: guias de modo local, nuvem e seguranca.
-- `skills/claude-code-live/scripts/`: executor, painel, contrato de modelo/esforco e consulta sanitizada dos limites de uso.
-- `skills/claude-code-live/tests/`: testes do contrato e do parser de uso, executados pelo smoke test.
+Antes de implementação ou mutação, o Codex:
 
-## Instalar localmente
+1. inspeciona somente em leitura;
+2. apresenta o plano;
+3. atribui `planning`, `inspection`, `implementation`, `testing`, `review`, `commit`, `push` e `deploy` a `codex`, `claude`, `user` ou `not_applicable`;
+4. aguarda aprovação explícita;
+5. executa apenas as etapas atribuídas ao Claude e revisa os resultados independentemente.
 
-O Codex instala plugins por marketplace. Este projeto nao cria nem modifica marketplace automaticamente. Para instalar com autorizacao explicita:
+Claude nunca pode receber `commit`, `push` ou `deploy`. `deploy` também representa publicação e outras mutações externas. Mudanças de plano, escopo ou responsável exigem nova aprovação.
 
-1. Coloque esta pasta sob `plugins/claude-code-live` de um marketplace local.
-2. Adicione/valide a entrada desse plugin no `marketplace.json` usando o fluxo oficial de `plugin-creator`.
-3. Se for um marketplace nao padrao, configure sua raiz com `codex plugin marketplace add <raiz-do-marketplace>`.
-4. Execute `codex plugin add claude-code-live@<nome-do-marketplace>`.
-5. Abra uma nova tarefa do Codex para carregar a skill instalada.
+## Modos
 
-O marketplace pessoal padrao em `~/.agents/plugins/marketplace.json` e descoberto implicitamente e nao requer `marketplace add`.
+| Modo | Ferramentas | Finalidade |
+|---|---|---|
+| `chat` | Nenhuma | Conversa sem acesso ao projeto |
+| `read` | `Read`, `Glob`, `Grep` | Planejamento e inspeção |
+| `verify` | Leitura e Bash exato | Testes sem `Write` ou `Edit` |
+| `local` | Leitura, `Write`, `Edit` e Bash exato | Implementação atribuída ao Claude |
+
+Todos usam `dontAsk`, `--permission-prompts none` e allowlist. O perfil `restricted` é preferido para alterações; `diagnostic` existe para diagnóstico ou ambientes limpos. Nenhum perfil é sandbox completo do sistema operacional.
+
+## Contrato do job
+
+```json
+{
+  "workspace": "C:\\projeto-autorizado",
+  "promptFile": "C:\\execucoes\\prompt.md",
+  "mode": "verify",
+  "profile": "restricted",
+  "coordination": {
+    "phase": "execution",
+    "scopeId": "validar-correcao",
+    "approvalRevision": 1,
+    "planSummary": "Executar os testes aprovados sem editar arquivos.",
+    "planApproved": true,
+    "responsibilities": {
+      "planning": "codex",
+      "inspection": "claude",
+      "implementation": "codex",
+      "testing": "claude",
+      "review": "codex",
+      "commit": "not_applicable",
+      "push": "not_applicable",
+      "deploy": "not_applicable"
+    }
+  },
+  "allowedCommands": [
+    {
+      "rule": "Bash(pwsh -NoProfile -File tests.ps1)",
+      "responsibility": "testing"
+    }
+  ],
+  "timeoutSeconds": 1800
+}
+```
+
+- `planning` aceita apenas `chat` ou `read` e ainda não exige plano final aprovado.
+- `execution` exige resumo, aprovação e matriz completa.
+- `local` exige que `implementation` pertença ao Claude.
+- `verify` aceita comandos somente de `inspection` ou `testing`.
+- `local` aceita comandos somente de `inspection`, `implementation` ou `testing`.
+- Cada comando exige que Claude seja o ator da responsabilidade indicada.
+- Regras que revelem commit, push, criação ou merge de PR, deploy ou publicação são bloqueadas.
+
+Scripts permitidos ainda precisam ser inspecionados. A trava textual não substitui revisão do conteúdo executado.
+
+## Executar localmente
+
+```powershell
+pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' `
+  -JobFile '<job.json>' `
+  -RunDirectory '<pasta-nova>'
+```
+
+O contrato é validado antes de abrir o painel ou iniciar o Claude. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo e responsáveis.
+
+Cada execução preserva `acompanhamento.txt`, `status.json` e `resultado.json`. Pressione `Q` para interromper; `X` fecha apenas o painel. `COMPLETED` indica término do CLI, não aceite técnico.
+
+## Retomar
+
+Use `resumeFrom` somente no mesmo workspace.
+
+- Sem mudança, mantenha `scopeId`, `approvalRevision`, plano e matriz.
+- Qualquer mudança exige nova aprovação e revisão maior.
+- Resultados antigos sem coordenação completa não podem ser retomados.
+- Reinspecione o estado; a retomada não desfaz edições.
+
+## Nuvem
+
+O mesmo plano e matriz são obrigatórios. Envie somente as etapas atribuídas ao Claude. O runner local não controla o backend remoto, então o Codex preserva as restrições no prompt e na revisão.
+
+Não use nuvem para transportar credenciais, `.env`, PII, perfis reais ou payloads sensíveis. Sessão em nuvem e tarefa local em segundo plano são fluxos distintos.
+
+## Segurança
+
+A skill não autoriza instalação, acesso a banco ou provedor, novos ambientes, diretórios adicionais, commit, push, PR, publicação ou deploy. Nunca inclua tokens, senhas, cookies, chaves, `.env`, dados reais de clientes ou payloads brutos em prompts, jobs ou logs.
+
+Safe mode, perfis e allowlists reduzem acesso, mas não substituem revisão nem isolamento de sistema operacional.
+
+## Conteúdo
+
+- `.codex-plugin/plugin.json`: manifesto.
+- `skills/claude-code-live/SKILL.md`: contrato principal.
+- `skills/claude-code-live/references/`: guias local, nuvem e segurança.
+- `skills/claude-code-live/scripts/`: executor, painel, contrato e consulta de uso.
+- `skills/claude-code-live/tests/`: testes automatizados.
+- `scripts/validate.ps1`: validação estrutural.
+- `scripts/smoke-test.ps1`: validação completa sem iniciar sessão Claude.
+
+## Instalar
+
+O Codex instala plugins por marketplace. Este pacote não altera marketplaces automaticamente.
+
+1. Coloque a pasta sob `plugins/claude-code-live` do marketplace autorizado.
+2. Adicione ou valide a entrada usando `plugin-creator`.
+3. Em marketplace não padrão, execute `codex plugin marketplace add <raiz>`.
+4. Execute `codex plugin add claude-code-live@<marketplace>`.
+5. Abra uma nova tarefa para carregar a versão instalada.
+
+O marketplace pessoal padrão em `~/.agents/plugins/marketplace.json` é descoberto automaticamente.
 
 ## Atualizar
 
-Edite a fonte, valide novamente e use o helper `update_plugin_cachebuster.py` da skill `plugin-creator` para substituir o sufixo de cache da versao. Depois reinstale com `codex plugin add claude-code-live@<nome-do-marketplace>` e teste em uma nova tarefa. Nao edite manualmente o marketplace durante esse ciclo.
+Valide a fonte, atualize o cachebuster com o helper de `plugin-creator`, reinstale e teste em nova tarefa. Não edite `marketplace.json` manualmente.
 
 ## Validar
 
-Use o validador autocontido do pacote. Ele localiza um Python disponivel, fornece o adaptador YAML necessario somente ao processo de validacao e executa os validadores oficiais e o parser do PowerShell:
-
 ```powershell
-pwsh -NoProfile -File '<caminho-do-plugin>\scripts\validate.ps1'
+pwsh -NoProfile -File '<plugin>\scripts\validate.ps1'
+pwsh -NoProfile -File '<plugin>\scripts\smoke-test.ps1'
 ```
 
-Para a verificacao completa que nao usa autenticacao nem inicia uma sessao, execute `scripts\smoke-test.ps1`. Ele verifica a estrutura, a sintaxe e os controles anunciados pelo CLI. Para validar um fluxo real de permissao, parada, retomada ou nuvem, use somente um projeto descartavel e autorizacao explicita; essa etapa cria uma sessao real e nao e automatizada pelo teste de fumaça.
+O smoke test não autentica nem inicia sessão Claude. Testes reais de permissões, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+
+## Migração
+
+Jobs sem `coordination` são rejeitados. `allowedCommands` agora usa objetos `{ rule, responsibility }`, e resultados anteriores sem contrato completo não podem ser retomados. Crie um novo job com plano e matriz aprovados.
