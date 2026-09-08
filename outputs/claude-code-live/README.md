@@ -70,6 +70,23 @@ Todos usam `dontAsk`, `--permission-prompts none` e allowlist. O perfil `restric
 
 Scripts permitidos ainda precisam ser inspecionados. A trava textual não substitui revisão do conteúdo executado.
 
+## Seleção opcional por quota
+
+Jobs sem `modelPolicy` continuam usando o modelo fixo de `model` (ou Fable por padrão). Para permitir a troca automática antes de iniciar ou retomar:
+
+```json
+"modelPolicy": {
+  "mode": "quota-aware",
+  "primary": "fable",
+  "alternate": "opus",
+  "switchAtRemainingPercent": 3
+}
+```
+
+Não combine `model` e `modelPolicy`. O limite padrão é `3` e aceita inteiros de `1` a `20`. Fable é mantido acima do limite; Opus é usado quando apenas o restante efetivo do Fable chega ao limite; sessão ou semana geral baixas bloqueiam a execução. Falha ou formato inesperado em `/usage` também bloqueia um job quota-aware antes de iniciar o Claude.
+
+A decisão é refeita a cada início/retomada e volta ao Fable após a renovação. O painel, `status.json` e `resultado.json` mostram somente política, percentuais sanitizados, modelo solicitado/selecionado e motivo. Alterar a política em uma retomada exige `approvalRevision` maior. O recurso não usa `--fallback-model`, pois esse fallback cobre indisponibilidade/sobrecarga, não quota.
+
 ## Executar localmente
 
 ```powershell

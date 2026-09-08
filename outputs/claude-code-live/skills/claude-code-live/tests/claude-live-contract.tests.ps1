@@ -192,6 +192,49 @@ $override = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
 if ($override.Model -ne 'sonnet') { throw 'An explicit model override must be preserved.' }
 if ($override.Effort -ne 'medium') { throw 'An explicit effort override must be preserved.' }
 
+$quotaAware = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
+    modelPolicy = [pscustomobject]@{
+        mode = 'quota-aware'
+        primary = 'fable'
+        alternate = 'opus'
+    }
+})
+if ($quotaAware.Model -ne 'fable' -or $quotaAware.ModelPolicy.SwitchAtRemainingPercent -ne 3) {
+    throw 'Quota-aware jobs must default the threshold to three percent and expose the primary model.'
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination
+        model = 'fable'
+        modelPolicy = [pscustomobject]@{ mode = 'quota-aware'; primary = 'fable'; alternate = 'opus' }
+    }) | Out-Null
+} 'model.*modelPolicy|modelPolicy.*model' 'fixed and quota-aware model selection cannot be combined'
+
+foreach ($invalidThreshold in @(0, 21, 2.5, '3')) {
+    Assert-Throws {
+        Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+            mode = 'read'
+            coordination = New-Coordination
+            modelPolicy = [pscustomobject]@{
+                mode = 'quota-aware'; primary = 'fable'; alternate = 'opus'
+                switchAtRemainingPercent = $invalidThreshold
+            }
+        }) | Out-Null
+    } 'switchAtRemainingPercent' 'the quota threshold must be an integer from one through twenty'
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination
+        modelPolicy = [pscustomobject]@{ mode = 'quota-aware'; primary = 'opus'; alternate = 'fable' }
+    }) | Out-Null
+} 'primary.*fable|alternate.*opus' 'version one has an intentionally asymmetric Fable-to-Opus policy'
+
 Assert-Throws {
     Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
         mode = 'read'
@@ -213,6 +256,15 @@ $priorCoordination = [pscustomobject]@{
     responsibilities = New-Responsibilities
 }
 Assert-ClaudeLiveResumeCoordination -Current $currentCoordination -Prior $priorCoordination
+
+$priorPolicy = [pscustomobject]@{ mode = 'quota-aware'; primary = 'fable'; alternate = 'opus'; switchAtRemainingPercent = 3 }
+$changedPolicy = [pscustomobject]@{ mode = 'quota-aware'; primary = 'fable'; alternate = 'opus'; switchAtRemainingPercent = 5 }
+Assert-Throws {
+    Assert-ClaudeLiveResumeCoordination -Current $currentCoordination -Prior $priorCoordination -CurrentModelPolicy $changedPolicy -PriorModelPolicy $priorPolicy
+} 'revision' 'a changed quota policy requires a newer approval revision'
+
+$revisedCoordination = New-Coordination -Revision 2
+Assert-ClaudeLiveResumeCoordination -Current $revisedCoordination -Prior $priorCoordination -CurrentModelPolicy $changedPolicy -PriorModelPolicy $priorPolicy
 
 Assert-Throws {
     $malformedPrior = [pscustomobject]@{

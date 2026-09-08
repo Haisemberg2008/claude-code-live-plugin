@@ -39,6 +39,130 @@ function Format-ClaudeUsageSnapshot {
     )
 }
 
+function Select-ClaudeModelForUsage {
+    param(
+        [Parameter(Mandatory)]$Usage,
+        [Parameter(Mandatory)]$ModelPolicy
+    )
+
+    $threshold = [int]$ModelPolicy.SwitchAtRemainingPercent
+    $sharedRemaining = [math]::Min(
+        [int]$Usage.Session.RemainingPercent,
+        [int]$Usage.AllModels.RemainingPercent
+    )
+    $fableRemaining = [math]::Min($sharedRemaining, [int]$Usage.Fable.RemainingPercent)
+    $blocked = $sharedRemaining -le $threshold
+    $effectiveModel = if ($blocked) {
+        $null
+    } elseif ($fableRemaining -le $threshold) {
+        [string]$ModelPolicy.Alternate
+    } else {
+        [string]$ModelPolicy.Primary
+    }
+    $reason = if ($blocked) {
+        'shared_capacity_at_or_below_threshold'
+    } elseif ($fableRemaining -le $threshold) {
+        'primary_at_or_below_threshold'
+    } else {
+        'primary_has_capacity'
+    }
+
+    [pscustomobject][ordered]@{
+        Mode = [string]$ModelPolicy.Mode
+        RequestedModel = [string]$ModelPolicy.Primary
+        EffectiveModel = $effectiveModel
+        AlternateModel = [string]$ModelPolicy.Alternate
+        SwitchAtRemainingPercent = $threshold
+        SharedRemainingPercent = $sharedRemaining
+        FableRemainingPercent = $fableRemaining
+        Blocked = $blocked
+        Reason = $reason
+    }
+}
+
+function Resolve-ClaudeModelDecision {
+    param(
+        [Parameter(Mandatory)][string]$RequestedModel,
+        $ModelPolicy = $null,
+        [scriptblock]$UsageProvider = { Get-ClaudeUsageSnapshot }
+    )
+
+    try {
+        $usage = & $UsageProvider
+    } catch {
+        if ($null -ne $ModelPolicy) {
+            $selection = [pscustomobject][ordered]@{
+                Mode = [string]$ModelPolicy.Mode
+                RequestedModel = [string]$ModelPolicy.Primary
+                EffectiveModel = $null
+                AlternateModel = [string]$ModelPolicy.Alternate
+                SwitchAtRemainingPercent = [int]$ModelPolicy.SwitchAtRemainingPercent
+                SharedRemainingPercent = $null
+                FableRemainingPercent = $null
+                Blocked = $true
+                Reason = 'usage_unavailable'
+            }
+            return [pscustomobject][ordered]@{
+                Usage = $null
+                Selection = $selection
+                EffectiveModel = $null
+                Blocked = $true
+                Reason = 'usage_unavailable'
+                PublicMessage = 'Limites de uso nao puderam ser confirmados; o job quota-aware foi bloqueado antes de iniciar o Claude.'
+            }
+        }
+        return [pscustomobject][ordered]@{
+            Usage = $null
+            Selection = $null
+            EffectiveModel = $RequestedModel
+            Blocked = $false
+            Reason = 'fixed_model_usage_unavailable'
+            PublicMessage = 'Limites de uso nao confirmados; o modelo fixo foi preservado e nenhuma troca foi feita.'
+        }
+    }
+
+    $selection = if ($null -ne $ModelPolicy) {
+        Select-ClaudeModelForUsage -Usage $usage -ModelPolicy $ModelPolicy
+    } else {
+        $null
+    }
+    [pscustomobject][ordered]@{
+        Usage = $usage
+        Selection = $selection
+        EffectiveModel = if ($null -ne $selection) { $selection.EffectiveModel } else { $RequestedModel }
+        Blocked = if ($null -ne $selection) { $selection.Blocked } else { $false }
+        Reason = if ($null -ne $selection) { $selection.Reason } else { 'fixed_model' }
+        PublicMessage = if ($null -ne $selection -and $selection.Blocked) {
+            'A capacidade compartilhada da sessao ou da semana geral atingiu o limite configurado; nenhum modelo foi iniciado.'
+        } else { $null }
+    }
+}
+
+function ConvertTo-ClaudeModelSelectionRecord {
+    param([Parameter(Mandatory)]$Selection)
+    [ordered]@{
+        mode = $Selection.Mode
+        requestedModel = $Selection.RequestedModel
+        effectiveModel = $Selection.EffectiveModel
+        alternateModel = $Selection.AlternateModel
+        switchAtRemainingPercent = $Selection.SwitchAtRemainingPercent
+        sharedRemainingPercent = $Selection.SharedRemainingPercent
+        fableRemainingPercent = $Selection.FableRemainingPercent
+        blocked = $Selection.Blocked
+        reason = $Selection.Reason
+    }
+}
+
+function Format-ClaudeModelSelection {
+    param([Parameter(Mandatory)]$Selection)
+    $effective = if ($Selection.EffectiveModel) { $Selection.EffectiveModel } else { 'BLOCKED' }
+    $shared = if ($null -eq $Selection.SharedRemainingPercent) { 'indisponivel' } else { $Selection.SharedRemainingPercent.ToString() + '%' }
+    $fable = if ($null -eq $Selection.FableRemainingPercent) { 'indisponivel' } else { $Selection.FableRemainingPercent.ToString() + '%' }
+    '[Modelo] quota-aware: solicitado ' + $Selection.RequestedModel + ' | efetivo ' + $effective +
+        ' | compartilhado ' + $shared + ' | Fable efetivo ' + $fable +
+        ' | limite ' + $Selection.SwitchAtRemainingPercent + '% | motivo ' + $Selection.Reason
+}
+
 function Get-ClaudeUsageSnapshot {
     param([int]$TimeoutSeconds = 20)
 

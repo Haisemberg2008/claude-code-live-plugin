@@ -11,6 +11,7 @@ O pacote instalável fica em [`outputs/claude-code-live`](outputs/claude-code-li
 - Separa leitura, verificação por comandos e edição em modos diferentes.
 - Limita ferramentas e comandos por allowlist explícita.
 - Mostra progresso em um painel PowerShell único e preserva resultado e estado.
+- Pode selecionar Fable ou Opus antes de iniciar ou retomar, conforme limites confirmados pelo `/usage`.
 - Permite interromper e retomar uma sessão sem repetir mutações automaticamente.
 - Mantém commit, push, PR, deploy, publicação e outras mutações externas fora do Claude.
 - Obriga o Codex a revisar artefatos e testes; término do processo não equivale a aceite.
@@ -68,7 +69,8 @@ Campos principais:
 - `promptFile`: prompt completo, sem segredos ou PII.
 - `mode`: `chat`, `read`, `verify` ou `local`.
 - `profile`: `diagnostic` ou `restricted`.
-- `model`: opcional; padrão `fable`.
+- `model`: opcional; padrão `fable`. Não combine com `modelPolicy`.
+- `modelPolicy`: política opcional e explícita de seleção por quota; sem ela, o comportamento de modelo fixo permanece inalterado.
 - `effort`: `low`, `medium`, `high`, `xhigh` ou `max`; padrão `high`.
 - `coordination`: plano, aprovação e matriz obrigatórios.
 - `allowedCommands`: objetos com regra Bash exata e responsabilidade correspondente.
@@ -108,6 +110,32 @@ Exemplo de testes sem conceder edição ao Claude:
   ]
 }
 ```
+
+### Seleção opcional por quota
+
+Ative a política somente nos jobs em que a troca automática foi aprovada:
+
+```json
+{
+  "modelPolicy": {
+    "mode": "quota-aware",
+    "primary": "fable",
+    "alternate": "opus",
+    "switchAtRemainingPercent": 3
+  }
+}
+```
+
+`switchAtRemainingPercent` é opcional, usa `3` por padrão e aceita inteiros de `1` a `20`. A política é deliberadamente assimétrica:
+
+- Fable efetivo acima do limite: usa `fable`.
+- Fable efetivo no limite ou abaixo, com capacidade compartilhada acima dele: usa `opus`.
+- Sessão ou semana geral no limite ou abaixo: bloqueia; trocar para Fable não recuperaria capacidade compartilhada.
+- Falha ou formato inesperado em `/usage`: bloqueia o job quota-aware antes de iniciar o Claude.
+
+A capacidade compartilhada é o menor restante entre sessão e semana geral. O restante efetivo do Fable é o menor entre essa capacidade e o limite próprio do Fable. A escolha é recalculada a cada início ou retomada; depois da renovação do Fable, o job volta ao modelo primário. Isso não usa `--fallback-model`, que trata indisponibilidade/sobrecarga e não quota.
+
+O painel, `status.json` e `resultado.json` registram política, percentuais sanitizados, modelo solicitado, modelo selecionado e motivo. Alterar política ou limite ao retomar exige nova aprovação e `approvalRevision` maior.
 
 ### Fases e aprovação
 
