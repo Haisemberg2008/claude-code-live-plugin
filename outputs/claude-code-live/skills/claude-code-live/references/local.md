@@ -12,7 +12,8 @@ Campos do job:
 - `promptFile`: caminho absoluto do prompt, sem segredos ou PII.
 - `mode`: `chat`, `read`, `verify` ou `local`.
 - `profile`: `diagnostic` ou `restricted`; se omitido, usa `diagnostic`.
-- `model`: opcional; omita para manter o modelo configurado.
+- `model`: opcional; modelo fixo, incompativel com `modelPolicy`.
+- `modelPolicy`: opcional; selecao opt-in entre Fable e Opus baseada no `/usage` antes de iniciar ou retomar.
 - `effort`: opcional: `low`, `medium`, `high`, `xhigh` ou `max`.
 - `coordination`: objeto obrigatorio com fase, identificador de escopo, revisao, resumo/aprovacao do plano e a matriz completa de responsaveis.
 - `allowedCommands`: objetos com `rule` e `responsibility`, somente em `verify` ou `local`. Inspecione o script antes; nao permita Bash irrestrito, curingas ou interpretadores genericos.
@@ -35,6 +36,21 @@ Antes do job, mostre ao usuario o plano e uma tabela com `planning`, `inspection
 Um job `planning` pode usar apenas `chat` ou `read` e nao requer plano final aprovado. Um job `execution` requer `planApproved: true` e resumo nao vazio. Em retomada sem mudanca, repita o mesmo contrato; mudanca de plano, escopo ou responsavel exige revisao maior e nova aprovacao.
 
 Jobs antigos sem `coordination` e resultados anteriores sem o contrato completo nao podem iniciar ou retomar; crie um novo job depois da escolha e aprovacao. O validador tambem bloqueia comandos que revelem commit, push, criacao/merge de PR, deploy ou publicacao, mesmo quando estiverem rotulados como outra responsabilidade. Scripts permitidos continuam exigindo inspecao previa, pois classificacao textual nao substitui revisao de seu conteudo.
+
+## Selecao por quota
+
+Use somente quando o usuario tiver aprovado essa politica no job:
+
+```json
+"modelPolicy": {
+  "mode": "quota-aware",
+  "primary": "fable",
+  "alternate": "opus",
+  "switchAtRemainingPercent": 3
+}
+```
+
+O limite padrao e 3 e aceita inteiros de 1 a 20. O executor usa Fable acima do limite; troca para Opus quando somente o restante efetivo do Fable esta no limite ou abaixo; e bloqueia quando sessao ou semana geral tambem estao no limite ou abaixo. Falha em `/usage` bloqueia o job quota-aware antes de abrir uma sessao Claude. A decisao e refeita em cada retomada, portanto uma renovacao devolve o job ao Fable. O painel e os arquivos de estado registram somente a decisao e os percentuais sanitizados. Alterar essa configuracao ao retomar requer `approvalRevision` maior.
 
 Exemplo de execucao de testes sem edicao pelo Claude:
 

@@ -20,7 +20,8 @@ if ($job.resumeFrom) {
     $prior = Get-Content -LiteralPath $job.resumeFrom -Raw -Encoding utf8 | ConvertFrom-Json
     if (-not $prior.sessionId -or $prior.workspace -ne $workspace) { throw 'Resume requires a session in the same workspace.' }
     if (-not $prior.coordination) { throw 'A legacy result without coordination cannot be resumed.' }
-    Assert-ClaudeLiveResumeCoordination -Current $contract.Coordination -Prior $prior.coordination
+    Assert-ClaudeLiveResumeCoordination -Current $contract.Coordination -Prior $prior.coordination `
+        -CurrentModelPolicy $contract.ModelPolicy -PriorModelPolicy $prior.modelPolicy
     $resumeId = $prior.sessionId
 }
 $timeoutSeconds = if ($job.timeoutSeconds) { [int]$job.timeoutSeconds } else { 1800 }
@@ -44,16 +45,20 @@ function Write-State($Value, [string]$Path) {
     $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding utf8
     [IO.File]::Move($temp, $Path, $true)
 }
-$usageSnapshot = $null
-try {
-    $usageSnapshot = Get-ClaudeUsageSnapshot
+$modelDecision = Resolve-ClaudeModelDecision -RequestedModel $contract.Model -ModelPolicy $contract.ModelPolicy
+$usageSnapshot = $modelDecision.Usage
+if ($null -ne $usageSnapshot) {
     foreach ($usageLine in (Format-ClaudeUsageSnapshot -Usage $usageSnapshot)) { Show-Line $usageLine }
     if ($usageSnapshot.AlertLevel -ne 'ok') {
         Show-Line ('[Uso] ALERTA ' + $usageSnapshot.AlertLevel.ToUpperInvariant() + ': confirme a capacidade antes de iniciar trabalho longo.')
     }
-} catch {
-    Show-Line '[Uso] INDISPONIVEL: limites nao confirmados; nenhuma troca de modelo ou compra foi feita.'
+} else {
+    Show-Line ('[Uso] INDISPONIVEL: ' + $modelDecision.PublicMessage)
 }
+if ($null -ne $modelDecision.Selection) {
+    Show-Line (Format-ClaudeModelSelection -Selection $modelDecision.Selection)
+}
+$effectiveModel = $modelDecision.EffectiveModel
 $toolConfiguration = Get-ClaudeLiveToolConfiguration -Contract $contract
 $tools = $toolConfiguration.Tools
 $allowed = $toolConfiguration.Allowed
@@ -80,7 +85,7 @@ if ($allowed.Count) {
 }
 if ($resumeId) { $start.ArgumentList.Add('--resume'); $start.ArgumentList.Add($resumeId) }
 $start.ArgumentList.Add('--model')
-$start.ArgumentList.Add($contract.Model)
+if ($effectiveModel) { $start.ArgumentList.Add([string]$effectiveModel) }
 $start.ArgumentList.Add('--effort')
 $start.ArgumentList.Add($contract.Effort)
 $process = [Diagnostics.Process]::new()
@@ -91,7 +96,16 @@ $clock = [Diagnostics.Stopwatch]::StartNew()
 $seenTools = [Collections.Generic.List[string]]::new()
 $record = [ordered]@{
     status = 'STARTING'; workspace = $workspace; sessionId = $resumeId
-    requestedModel = $contract.Model; model = $null; effort = $contract.Effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
+    requestedModel = $contract.Model; selectedModel = $effectiveModel; model = $null; effort = $contract.Effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
+    modelPolicy = if ($null -ne $contract.ModelPolicy) {
+        [ordered]@{
+            mode = $contract.ModelPolicy.Mode
+            primary = $contract.ModelPolicy.Primary
+            alternate = $contract.ModelPolicy.Alternate
+            switchAtRemainingPercent = $contract.ModelPolicy.SwitchAtRemainingPercent
+        }
+    } else { $null }
+    modelSelection = if ($null -ne $modelDecision.Selection) { ConvertTo-ClaudeModelSelectionRecord -Selection $modelDecision.Selection } else { $null }
     coordination = [ordered]@{
         phase = $contract.Coordination.Phase
         scopeId = $contract.Coordination.ScopeId
@@ -114,6 +128,16 @@ $ownerPairs = @('planning','inspection','implementation','testing','review','com
 Show-Line ('Responsaveis: ' + ($ownerPairs -join '; '))
 Show-Line 'Use apenas arquivos autorizados e sem segredos. Isto nao e um sandbox de sistema operacional.'
 Show-Line ''
+if ($modelDecision.Blocked) {
+    $record.status = 'BLOCKED'
+    $record.result = $modelDecision.PublicMessage
+    Write-State $record $resultPath
+    Write-State $record $statusPath
+    Show-Line ('[BLOCKED] ' + $modelDecision.PublicMessage)
+    Show-Line '[Encerrado] BLOCKED'
+    $process.Dispose()
+    exit 1
+}
 try {
     if (-not $process.Start()) { throw 'Could not start Claude.' }
     $started = $true

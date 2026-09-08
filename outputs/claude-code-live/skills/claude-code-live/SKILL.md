@@ -34,7 +34,8 @@ Campos do job:
 - `promptFile`: caminho absoluto do prompt, sem segredos ou PII.
 - `mode`: `chat`, `read`, `verify` ou `local`.
 - `profile`: `diagnostic` ou `restricted`; omitir equivale a `diagnostic` para compatibilidade.
-- `model`: opcional; omitir usa `fable`, atualmente apresentado ao usuario como Fable 5.1. Uma escolha explicita no job prevalece.
+- `model`: opcional; omitir usa `fable`, atualmente apresentado ao usuario como Fable 5.1. Nao combinar com `modelPolicy`.
+- `modelPolicy`: opcional e opt-in. Em `quota-aware`, usa Fable como primario, Opus como alternativo e um limite configuravel de restante.
 - `effort`: opcional; omitir usa `high`. Valores aceitos: low, medium, high, xhigh ou max.
 - `coordination`: contrato obrigatorio com `phase`, `scopeId`, `approvalRevision`, `planSummary`, `planApproved` e `responsibilities` para as oito etapas.
 - `allowedCommands`: array opcional de objetos com `rule` e `responsibility`, por exemplo `{ "rule": "Bash(node check.cjs)", "responsibility": "testing" }`. Somente `verify` ou `local`. Inspecionar os scripts chamados antes de permitir a execucao. Nao usar Bash irrestrito nem regras genericas de interpretador.
@@ -61,6 +62,8 @@ Nao entregar credenciais, perfil real do owner, arquivos de ambiente, provider r
 Execute `scripts/start-live.ps1 -JobFile <job.json> -RunDirectory <pasta-nova>` com PowerShell 7 pelo terminal do Codex. Ele abre ou reutiliza um unico painel visivel da integracao e executa o Claude em primeiro plano no terminal controlado pelo Codex. Comandos longos retornam uma sessao observavel; acompanhe com write_stdin. O usuario ja autorizou essa janela; nao pedir novamente. Um mutex rejeita execucoes concorrentes nesta integracao. Nao abrir um novo PowerShell visivel para cada tarefa.
 
 Antes de cada execucao local, o executor consulta `/usage` sem ferramentas e mostra no painel o restante da sessao, da semana geral e da semana do Fable, com os respectivos horarios de renovacao. A consulta tambem fica registrada de forma sanitizada em `status.json` e `resultado.json`; nao persistir a resposta bruta, identificadores de MCP ou diagnosticos detalhados. Restante de 20% ou menos gera alerta; 5% ou menos gera alerta critico. A consulta nao autoriza compra de creditos, troca de modelo ou reducao de effort. Se ela falhar, mostrar `INDISPONIVEL` e deixar claro que o limite nao foi confirmado.
+
+Quando o usuario aprovar selecao automatica por quota, omita `model` e use `modelPolicy: { "mode": "quota-aware", "primary": "fable", "alternate": "opus", "switchAtRemainingPercent": 3 }`. O limite e opcional, padrao 3, e aceita inteiro de 1 a 20. Antes de iniciar ou retomar, calcule a capacidade compartilhada como o menor restante entre sessao e semana geral; o restante efetivo do Fable e o menor entre capacidade compartilhada e limite Fable. Use Fable acima do limite, Opus quando apenas Fable estiver no limite ou abaixo, e bloqueie quando a capacidade compartilhada estiver no limite ou abaixo. Se `/usage` falhar ou mudar de formato, bloqueie somente o job quota-aware; jobs de modelo fixo preservam o comportamento anterior. Reavalie em cada inicio/retomada para voltar ao Fable depois da renovacao. Nao use `--fallback-model` para isso. Registre politica, percentuais sanitizados, solicitado, efetivo e motivo no painel e nos JSONs. Mudanca da politica em retomada requer aprovacao nova e `approvalRevision` maior.
 
 Esses percentuais representam limites de uso da assinatura, nao saldo monetario de creditos pre-pagos. Para saldo financeiro, encaminhar o usuario ao painel Usage da conta; nunca inferir um valor em dinheiro a partir dos percentuais do CLI.
 

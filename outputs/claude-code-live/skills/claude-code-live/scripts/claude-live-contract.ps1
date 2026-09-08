@@ -68,6 +68,48 @@ function ConvertTo-ClaudeLiveCoordination {
     }
 }
 
+function ConvertTo-ClaudeLiveModelPolicy {
+    param([Parameter(Mandatory)]$Value)
+    $allowedFields = @('mode','primary','alternate','switchAtRemainingPercent')
+    foreach ($field in @($Value.PSObject.Properties.Name)) {
+        if ($field -notin $allowedFields) { throw "modelPolicy contains unexpected field $field." }
+    }
+    $mode = [string](Get-ClaudeLiveProperty -InputObject $Value -Name 'mode')
+    $primary = [string](Get-ClaudeLiveProperty -InputObject $Value -Name 'primary')
+    $alternate = [string](Get-ClaudeLiveProperty -InputObject $Value -Name 'alternate')
+    if ($mode -ne 'quota-aware') { throw 'modelPolicy.mode must be quota-aware.' }
+    if ($primary -ne 'fable' -or $alternate -ne 'opus') {
+        throw 'modelPolicy.primary must be fable and modelPolicy.alternate must be opus.'
+    }
+    $thresholdValue = Get-ClaudeLiveProperty -InputObject $Value -Name 'switchAtRemainingPercent'
+    if ($null -eq $thresholdValue) { $thresholdValue = 3 }
+    if ($thresholdValue -isnot [byte] -and $thresholdValue -isnot [int16] -and $thresholdValue -isnot [int32] -and $thresholdValue -isnot [int64]) {
+        throw 'modelPolicy.switchAtRemainingPercent must be an integer from 1 through 20.'
+    }
+    $threshold = [int]$thresholdValue
+    if ($threshold -lt 1 -or $threshold -gt 20) {
+        throw 'modelPolicy.switchAtRemainingPercent must be an integer from 1 through 20.'
+    }
+    [pscustomobject][ordered]@{
+        Mode = $mode
+        Primary = $primary
+        Alternate = $alternate
+        SwitchAtRemainingPercent = $threshold
+    }
+}
+
+function Get-ClaudeLiveModelPolicyFingerprint {
+    param($ModelPolicy)
+    if ($null -eq $ModelPolicy) { return 'null' }
+    $normalized = ConvertTo-ClaudeLiveModelPolicy -Value $ModelPolicy
+    [pscustomobject][ordered]@{
+        mode = $normalized.Mode
+        primary = $normalized.Primary
+        alternate = $normalized.Alternate
+        switchAtRemainingPercent = $normalized.SwitchAtRemainingPercent
+    } | ConvertTo-Json -Compress
+}
+
 function Get-ClaudeLiveCoordinationFingerprint {
     param([Parameter(Mandatory)]$Coordination)
     [pscustomobject][ordered]@{
@@ -81,7 +123,9 @@ function Get-ClaudeLiveCoordinationFingerprint {
 function Assert-ClaudeLiveResumeCoordination {
     param(
         [Parameter(Mandatory)]$Current,
-        [Parameter(Mandatory)]$Prior
+        [Parameter(Mandatory)]$Prior,
+        $CurrentModelPolicy = $null,
+        $PriorModelPolicy = $null
     )
     $currentContract = ConvertTo-ClaudeLiveCoordination -Value $Current
     $priorContract = ConvertTo-ClaudeLiveCoordination -Value $Prior
@@ -91,8 +135,9 @@ function Assert-ClaudeLiveResumeCoordination {
         throw 'A resumed job cannot use an older approval revision.'
     }
     $changed = (Get-ClaudeLiveCoordinationFingerprint $currentContract) -ne (Get-ClaudeLiveCoordinationFingerprint $priorContract)
+    $changed = $changed -or ((Get-ClaudeLiveModelPolicyFingerprint $CurrentModelPolicy) -ne (Get-ClaudeLiveModelPolicyFingerprint $PriorModelPolicy))
     if ($changed -and $currentRevision -le $priorRevision) {
-        throw 'A changed resumed plan or responsibility matrix requires a newer approval revision.'
+        throw 'A changed resumed plan, responsibility matrix, or model policy requires a newer approval revision.'
     }
 }
 
@@ -126,7 +171,19 @@ function Resolve-ClaudeLiveContract {
         throw 'Local editing mode requires Claude to own the implementation responsibility.'
     }
 
-    $model = if ($Job.model) { [string]$Job.model } else { 'fable' }
+    $modelValue = Get-ClaudeLiveProperty -InputObject $Job -Name 'model'
+    $modelPolicyValue = Get-ClaudeLiveProperty -InputObject $Job -Name 'modelPolicy'
+    if ($null -ne $modelValue -and $null -ne $modelPolicyValue) {
+        throw 'Use either model or modelPolicy, never both.'
+    }
+    $modelPolicy = if ($null -ne $modelPolicyValue) { ConvertTo-ClaudeLiveModelPolicy -Value $modelPolicyValue } else { $null }
+    $model = if ($null -ne $modelValue -and -not [string]::IsNullOrWhiteSpace([string]$modelValue)) {
+        [string]$modelValue
+    } elseif ($null -ne $modelPolicy) {
+        $modelPolicy.Primary
+    } else {
+        'fable'
+    }
     $effort = if ($Job.effort) { [string]$Job.effort } else { 'high' }
     if ($effort -notin @('low','medium','high','xhigh','max')) {
         throw 'Invalid effort.'
@@ -164,6 +221,7 @@ function Resolve-ClaudeLiveContract {
 
     [pscustomobject]@{
         Model = $model
+        ModelPolicy = $modelPolicy
         Effort = $effort
         Mode = $mode
         Profile = $profile
