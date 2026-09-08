@@ -4,6 +4,8 @@
 
 A skill nao concede permissao para instalar ou atualizar software, publicar, fazer deploy, acessar banco ou provedor externo, criar ambientes, habilitar integracoes ou ampliar o conjunto de arquivos. Cada uma dessas acoes exige estar no pedido atual ou receber autorizacao adicional.
 
+Antes de qualquer mutacao, o usuario aprova o plano e a matriz de oito responsabilidades. Claude nunca e responsavel por commit, push, deploy, publicacao ou outra mutacao externa. O contrato local bloqueia essas atribuicoes; em nuvem, onde o runner local nao controla o backend, o Codex aplica o mesmo limite no prompt e na revisao.
+
 ## Dados proibidos por padrao
 
 Nao inclua em prompt, job, log ou sessao remota:

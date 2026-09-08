@@ -11,23 +11,17 @@ $job = Get-Content -LiteralPath $JobFile -Raw -Encoding utf8 | ConvertFrom-Json
 $contract = Resolve-ClaudeLiveContract -Job $job
 $workspace = (Resolve-Path -LiteralPath $job.workspace).Path
 $promptText = Get-Content -LiteralPath $job.promptFile -Raw -Encoding utf8
-$mode = [string]$job.mode
-if ($mode -notin @('chat','read','local')) { throw 'Mode must be chat, read or local.' }
-$profile = if ($job.profile) { [string]$job.profile } else { 'diagnostic' }
-if ($profile -notin @('diagnostic','restricted')) { throw 'Profile must be diagnostic or restricted.' }
+$mode = $contract.Mode
+$profile = $contract.Profile
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
 if (Test-Path -LiteralPath $runPath) { throw 'Use a new run directory.' }
 $resumeId = $null
 if ($job.resumeFrom) {
     $prior = Get-Content -LiteralPath $job.resumeFrom -Raw -Encoding utf8 | ConvertFrom-Json
     if (-not $prior.sessionId -or $prior.workspace -ne $workspace) { throw 'Resume requires a session in the same workspace.' }
+    if (-not $prior.coordination) { throw 'A legacy result without coordination cannot be resumed.' }
+    Assert-ClaudeLiveResumeCoordination -Current $contract.Coordination -Prior $prior.coordination
     $resumeId = $prior.sessionId
-}
-$commands = @($job.allowedCommands | Where-Object { $_ })
-foreach ($rule in $commands) {
-    if ($mode -ne 'local' -or $rule -notmatch '^Bash\([^*\r\n]+\)$' -or $rule -match '[:*]') {
-        throw 'Only explicit Bash command rules without wildcards are allowed in local mode.'
-    }
 }
 $timeoutSeconds = if ($job.timeoutSeconds) { [int]$job.timeoutSeconds } else { 1800 }
 if ($timeoutSeconds -lt 1) { throw 'Invalid timeout.' }
@@ -60,12 +54,9 @@ try {
 } catch {
     Show-Line '[Uso] INDISPONIVEL: limites nao confirmados; nenhuma troca de modelo ou compra foi feita.'
 }
-$tools = switch ($mode) {
-    'chat' { @() }
-    'read' { @('Read','Glob','Grep') }
-    'local' { @('Read','Glob','Grep','Write','Edit'); if ($commands.Count) { 'Bash' } }
-}
-$allowed = @($tools | Where-Object { $_ -ne 'Bash' }) + $commands
+$toolConfiguration = Get-ClaudeLiveToolConfiguration -Contract $contract
+$tools = $toolConfiguration.Tools
+$allowed = $toolConfiguration.Allowed
 $start = [Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $binary
 $start.WorkingDirectory = $workspace
@@ -101,12 +92,26 @@ $seenTools = [Collections.Generic.List[string]]::new()
 $record = [ordered]@{
     status = 'STARTING'; workspace = $workspace; sessionId = $resumeId
     requestedModel = $contract.Model; model = $null; effort = $contract.Effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
+    coordination = [ordered]@{
+        phase = $contract.Coordination.Phase
+        scopeId = $contract.Coordination.ScopeId
+        approvalRevision = $contract.Coordination.ApprovalRevision
+        planSummary = $contract.Coordination.PlanSummary
+        planApproved = $contract.Coordination.PlanApproved
+        responsibilities = $contract.Coordination.Responsibilities
+    }
     result = $null; usage = $usageSnapshot; toolCalls = @(); toolErrors = 0; permissionDenials = 0
     exitCode = $null; elapsedSeconds = 0
 }
 Show-Line 'CLAUDE CODE - ACOMPANHAMENTO AO VIVO'
 Show-Line 'Q no painel solicita parada; Ctrl+C no terminal executor interrompe. Resultados ficam preservados.'
 Show-Line ('Modo: ' + $mode + ' | Perfil: ' + $profile + ' | Ferramentas e comandos limitados ao job aprovado.')
+Show-Line ('Coordenacao: ' + $contract.Coordination.Phase + ' | Escopo: ' + $contract.Coordination.ScopeId + ' | Revisao aprovada: ' + $contract.Coordination.ApprovalRevision)
+if ($contract.Coordination.PlanSummary) { Show-Line ('Plano: ' + $contract.Coordination.PlanSummary) }
+$ownerPairs = @('planning','inspection','implementation','testing','review','commit','push','deploy') | ForEach-Object {
+    $_ + '=' + $contract.Coordination.Responsibilities.$_
+}
+Show-Line ('Responsaveis: ' + ($ownerPairs -join '; '))
 Show-Line 'Use apenas arquivos autorizados e sem segredos. Isto nao e um sandbox de sistema operacional.'
 Show-Line ''
 try {

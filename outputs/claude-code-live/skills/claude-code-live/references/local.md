@@ -10,11 +10,12 @@ Campos do job:
 
 - `workspace`: caminho absoluto da pasta autorizada.
 - `promptFile`: caminho absoluto do prompt, sem segredos ou PII.
-- `mode`: `chat`, `read` ou `local`.
+- `mode`: `chat`, `read`, `verify` ou `local`.
 - `profile`: `diagnostic` ou `restricted`; se omitido, usa `diagnostic`.
 - `model`: opcional; omita para manter o modelo configurado.
 - `effort`: opcional: `low`, `medium`, `high`, `xhigh` ou `max`.
-- `allowedCommands`: regras Bash exatas, somente em `local`, como `Bash(node check.cjs)`. Inspecione o script antes; nao permita Bash irrestrito, curingas ou interpretadores genericos.
+- `coordination`: objeto obrigatorio com fase, identificador de escopo, revisao, resumo/aprovacao do plano e a matriz completa de responsaveis.
+- `allowedCommands`: objetos com `rule` e `responsibility`, somente em `verify` ou `local`. Inspecione o script antes; nao permita Bash irrestrito, curingas ou interpretadores genericos.
 - `resumeFrom`: caminho para `resultado.json` anterior no mesmo workspace.
 - `timeoutSeconds`: opcional; padrao de 1800 segundos.
 
@@ -22,9 +23,52 @@ Modos de ferramenta:
 
 - `chat`: nenhuma ferramenta.
 - `read`: `Read`, `Glob` e `Grep`.
-- `local`: adiciona `Write` e `Edit`; `Bash` existe apenas para regras exatas em `allowedCommands`.
+- `verify`: leitura e Bash apenas quando houver regras exatas de `inspection` ou `testing`; nunca oferece `Write` ou `Edit`.
+- `local`: adiciona `Write` e `Edit`; Bash existe apenas para regras exatas de `inspection`, `implementation` ou `testing`.
 
 Todos usam `dontAsk`, allowlist e `--permission-prompts none`: uma operacao fora do escopo e negada, nunca fica aguardando aprovacao invisivel.
+
+## Coordenacao obrigatoria
+
+Antes do job, mostre ao usuario o plano e uma tabela com `planning`, `inspection`, `implementation`, `testing`, `review`, `commit`, `push` e `deploy`. Cada linha recebe `codex`, `claude`, `user` ou `not_applicable`. Aguarde aprovacao explicita antes de usar `phase: execution`; Claude nao pode receber commit, push ou deploy.
+
+Um job `planning` pode usar apenas `chat` ou `read` e nao requer plano final aprovado. Um job `execution` requer `planApproved: true` e resumo nao vazio. Em retomada sem mudanca, repita o mesmo contrato; mudanca de plano, escopo ou responsavel exige revisao maior e nova aprovacao.
+
+Jobs antigos sem `coordination` e resultados anteriores sem o contrato completo nao podem iniciar ou retomar; crie um novo job depois da escolha e aprovacao. O validador tambem bloqueia comandos que revelem commit, push, criacao/merge de PR, deploy ou publicacao, mesmo quando estiverem rotulados como outra responsabilidade. Scripts permitidos continuam exigindo inspecao previa, pois classificacao textual nao substitui revisao de seu conteudo.
+
+Exemplo de execucao de testes sem edicao pelo Claude:
+
+```json
+{
+  "workspace": "C:\\projeto-autorizado",
+  "promptFile": "C:\\execucoes\\prompt.md",
+  "mode": "verify",
+  "profile": "restricted",
+  "coordination": {
+    "phase": "execution",
+    "scopeId": "corrigir-validacao",
+    "approvalRevision": 1,
+    "planSummary": "Validar a mudanca local aprovada sem editar arquivos.",
+    "planApproved": true,
+    "responsibilities": {
+      "planning": "codex",
+      "inspection": "claude",
+      "implementation": "codex",
+      "testing": "claude",
+      "review": "codex",
+      "commit": "not_applicable",
+      "push": "not_applicable",
+      "deploy": "not_applicable"
+    }
+  },
+  "allowedCommands": [
+    {
+      "rule": "Bash(pwsh -NoProfile -File tests.ps1)",
+      "responsibility": "testing"
+    }
+  ]
+}
+```
 
 ## Perfis
 

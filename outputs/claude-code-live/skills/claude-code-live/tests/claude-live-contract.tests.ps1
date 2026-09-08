@@ -7,23 +7,232 @@ if (-not (Test-Path -LiteralPath $contractScript)) {
 }
 . $contractScript
 
-$defaults = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{})
+function New-Responsibilities {
+    param(
+        [string]$Planning = 'codex',
+        [string]$Inspection = 'claude',
+        [string]$Implementation = 'claude',
+        [string]$Testing = 'claude',
+        [string]$Review = 'codex',
+        [string]$Commit = 'not_applicable',
+        [string]$Push = 'not_applicable',
+        [string]$Deploy = 'not_applicable'
+    )
+    [pscustomobject]@{
+        planning = $Planning
+        inspection = $Inspection
+        implementation = $Implementation
+        testing = $Testing
+        review = $Review
+        commit = $Commit
+        push = $Push
+        deploy = $Deploy
+    }
+}
+
+function New-Coordination {
+    param(
+        [string]$Phase = 'execution',
+        [bool]$Approved = $true,
+        [int]$Revision = 1,
+        [string]$Summary = 'Implement the approved coordination gate.',
+        $Responsibilities = (New-Responsibilities)
+    )
+    [pscustomobject]@{
+        phase = $Phase
+        scopeId = 'coordination-gate'
+        approvalRevision = $Revision
+        planSummary = $Summary
+        planApproved = $Approved
+        responsibilities = $Responsibilities
+    }
+}
+
+function Assert-Throws {
+    param([scriptblock]$Action, [string]$Pattern, [string]$Because)
+    $message = $null
+    try { & $Action } catch { $message = $_.Exception.Message }
+    if (-not $message -or $message -notmatch $Pattern) {
+        throw "Expected rejection because ${Because}; received: $message"
+    }
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{ mode = 'read' }) | Out-Null
+} 'coordination' 'coordination is mandatory'
+
+$planning = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination -Phase 'planning' -Approved $false -Summary '' -Responsibilities (New-Responsibilities -Planning 'claude' -Implementation 'codex')
+})
+if ($planning.Coordination.Phase -ne 'planning' -or $planning.Coordination.PlanApproved) {
+    throw 'A read-only planning job must be accepted before final plan approval.'
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'local'
+        coordination = New-Coordination -Phase 'planning' -Approved $false -Summary ''
+    }) | Out-Null
+} 'planning.*chat.*read' 'planning cannot grant mutation tools'
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination -Approved $false
+    }) | Out-Null
+} 'approved' 'execution requires explicit plan approval'
+
+Assert-Throws {
+    $owners = New-Responsibilities
+    $owners.PSObject.Properties.Remove('review')
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination -Responsibilities $owners
+    }) | Out-Null
+} 'review' 'all eight responsibility rows are mandatory'
+
+Assert-Throws {
+    $owners = New-Responsibilities
+    $owners | Add-Member -NotePropertyName publish -NotePropertyValue codex
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination -Responsibilities $owners
+    }) | Out-Null
+} 'unexpected.*publish|publish.*unexpected' 'unreviewed responsibility rows cannot be smuggled into the matrix'
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination -Responsibilities (New-Responsibilities -Inspection 'team')
+    }) | Out-Null
+} 'inspection.*actor' 'responsibility actors use the closed enum'
+
+foreach ($criticalStage in @('commit','push','deploy')) {
+    $owners = New-Responsibilities
+    $owners.$criticalStage = 'claude'
+    Assert-Throws {
+        Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+            mode = 'read'
+            coordination = New-Coordination -Responsibilities $owners
+        }) | Out-Null
+    } $criticalStage "Claude cannot own $criticalStage"
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'local'
+        coordination = New-Coordination -Responsibilities (New-Responsibilities -Implementation 'codex')
+    }) | Out-Null
+} 'implementation.*Claude|Claude.*implementation' 'local mode grants editing only to the implementation owner'
+
+$verification = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'verify'
+    coordination = New-Coordination -Responsibilities (New-Responsibilities -Implementation 'codex')
+    allowedCommands = @(
+        [pscustomobject]@{ rule = 'Bash(pwsh -NoProfile -File tests.ps1)'; responsibility = 'testing' }
+    )
+})
+if ($verification.Mode -ne 'verify' -or $verification.AllowedCommands[0].Responsibility -ne 'testing') {
+    throw 'Verify mode must preserve an approved test command without granting editing.'
+}
+$verificationTools = Get-ClaudeLiveToolConfiguration -Contract $verification
+if ($verificationTools.Tools -contains 'Write' -or $verificationTools.Tools -contains 'Edit') {
+    throw 'Verify mode must never expose writing tools.'
+}
+foreach ($expectedTool in @('Read','Glob','Grep','Bash')) {
+    if ($verificationTools.Tools -notcontains $expectedTool) { throw "Verify mode is missing $expectedTool." }
+}
+if ($verificationTools.Allowed -notcontains 'Bash(pwsh -NoProfile -File tests.ps1)') {
+    throw 'Verify mode must pass the exact approved command rule to Claude.'
+}
+
+$localContract = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'local'
+    coordination = New-Coordination
+})
+$localTools = Get-ClaudeLiveToolConfiguration -Contract $localContract
+foreach ($expectedTool in @('Read','Glob','Grep','Write','Edit')) {
+    if ($localTools.Tools -notcontains $expectedTool) { throw "Local mode is missing $expectedTool." }
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'verify'
+        coordination = New-Coordination
+        allowedCommands = @(
+            [pscustomobject]@{ rule = 'Bash(git push origin HEAD)'; responsibility = 'push' }
+        )
+    }) | Out-Null
+} 'critical.*command|command.*critical' 'critical commands cannot be delegated to Claude'
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'verify'
+        coordination = New-Coordination
+        allowedCommands = @(
+            [pscustomobject]@{ rule = 'Bash(git push origin HEAD)'; responsibility = 'testing' }
+        )
+    }) | Out-Null
+} 'critical.*command|command.*critical' 'a critical command cannot bypass ownership by using a false responsibility label'
+
+$defaults = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
+})
 if ($defaults.Model -ne 'fable') { throw 'The default Claude model must be fable.' }
 if ($defaults.Effort -ne 'high') { throw 'The default effort must be high.' }
 
 $override = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
     model = 'sonnet'
     effort = 'medium'
 })
 if ($override.Model -ne 'sonnet') { throw 'An explicit model override must be preserved.' }
 if ($override.Effort -ne 'medium') { throw 'An explicit effort override must be preserved.' }
 
-$invalidEffortRejected = $false
-try {
-    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{ effort = 'invalid' }) | Out-Null
-} catch {
-    $invalidEffortRejected = $true
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination
+        effort = 'invalid'
+    }) | Out-Null
+} 'effort' 'invalid effort is rejected'
+
+$currentCoordination = (Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
+})).Coordination
+$priorCoordination = [pscustomobject]@{
+    phase = 'execution'
+    scopeId = 'coordination-gate'
+    approvalRevision = 1
+    planSummary = 'Implement the approved coordination gate.'
+    planApproved = $true
+    responsibilities = New-Responsibilities
 }
-if (-not $invalidEffortRejected) { throw 'Invalid effort must be rejected.' }
+Assert-ClaudeLiveResumeCoordination -Current $currentCoordination -Prior $priorCoordination
+
+Assert-Throws {
+    $malformedPrior = [pscustomobject]@{
+        phase = 'execution'
+        scopeId = 'coordination-gate'
+        planSummary = 'Implement the approved coordination gate.'
+        planApproved = $true
+        responsibilities = New-Responsibilities
+    }
+    Assert-ClaudeLiveResumeCoordination -Current $currentCoordination -Prior $malformedPrior
+} 'approvalRevision' 'a partial legacy coordination record is not valid resume evidence'
+
+Assert-Throws {
+    $changed = New-Coordination -Summary 'Expanded scope without a new approval.'
+    $changedContract = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{ mode = 'read'; coordination = $changed })
+    Assert-ClaudeLiveResumeCoordination -Current $changedContract.Coordination -Prior $priorCoordination
+} 'revision' 'a changed resumed plan requires a newer approval revision'
+
+$reapproved = New-Coordination -Revision 2 -Summary 'Expanded and explicitly reapproved scope.'
+$reapprovedContract = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{ mode = 'read'; coordination = $reapproved })
+Assert-ClaudeLiveResumeCoordination -Current $reapprovedContract.Coordination -Prior $priorCoordination
 
 Write-Output 'claude-live contract tests passed'
