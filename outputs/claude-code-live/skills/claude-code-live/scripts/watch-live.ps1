@@ -1,7 +1,8 @@
 #requires -Version 7.0
 param([Parameter(Mandatory)][string]$StateDirectory, [Parameter(Mandatory)][string]$PanelKey)
 $ErrorActionPreference = 'Stop'
-$panelMutex = [Threading.Mutex]::new($false, ('Local\ClaudeLivePanel-' + $PanelKey))
+. (Join-Path $PSScriptRoot 'claude-thread-context.ps1')
+$panelMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Panel -ThreadKey $PanelKey))
 try { $panelLockHeld = $panelMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $panelLockHeld = $true }
 if (-not $panelLockHeld) { $panelMutex.Dispose(); exit }
 $Host.UI.RawUI.WindowTitle = 'Claude Code | Painel ao vivo'

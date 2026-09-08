@@ -193,6 +193,11 @@ function Resolve-ClaudeLiveContract {
     if ($profile -notin @('diagnostic','restricted')) {
         throw 'Profile must be diagnostic or restricted.'
     }
+    $codexThreadIdValue = Get-ClaudeLiveProperty -InputObject $Job -Name 'codexThreadId'
+    $codexThreadId = if ($null -ne $codexThreadIdValue) { [string]$codexThreadIdValue } else { $null }
+    if ($codexThreadId -and $codexThreadId -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$') {
+        throw 'codexThreadId must contain only letters, numbers, underscores, or hyphens and be at most 128 characters.'
+    }
     $commands = @()
     foreach ($commandValue in @($Job.allowedCommands | Where-Object { $null -ne $_ })) {
         if ($mode -notin @('verify','local')) {
@@ -225,6 +230,7 @@ function Resolve-ClaudeLiveContract {
         Effort = $effort
         Mode = $mode
         Profile = $profile
+        CodexThreadId = $codexThreadId
         AllowedCommands = @($commands)
         Coordination = $coordination
     }

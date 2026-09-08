@@ -192,6 +192,21 @@ $override = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
 if ($override.Model -ne 'sonnet') { throw 'An explicit model override must be preserved.' }
 if ($override.Effort -ne 'medium') { throw 'An explicit effort override must be preserved.' }
 
+$threadBound = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
+    codexThreadId = 'manual-task-7'
+})
+if ($threadBound.CodexThreadId -ne 'manual-task-7') { throw 'An explicit standalone Codex task identity must be preserved.' }
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination
+        codexThreadId = '..\shared'
+    }) | Out-Null
+} 'codexThreadId' 'task identity cannot escape its state directory or mutex namespace'
+
 $quotaAware = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
     mode = 'read'
     coordination = New-Coordination

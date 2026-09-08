@@ -97,11 +97,15 @@ pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' 
 
 O contrato é validado antes de abrir o painel ou iniciar o Claude. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo e responsáveis.
 
+Cada tarefa Codex usa `CODEX_THREAD_ID` para manter diretório, painel, mutex e sessão Claude próprios. Jobs da mesma tarefa são serializados; tarefas diferentes podem executar ao mesmo tempo. A leitura de quota permanece globalmente serializada. Fora do Codex, `codexThreadId` fornece uma identidade estável opcional; sem identidade, cada chamada recebe uma chave isolada de uso único.
+
 Cada execução preserva `acompanhamento.txt`, `status.json` e `resultado.json`. Pressione `Q` para interromper; `X` fecha apenas o painel. `COMPLETED` indica término do CLI, não aceite técnico.
 
 ## Retomar
 
-Use `resumeFrom` somente no mesmo workspace.
+O plugin retoma automaticamente a última sessão da mesma tarefa apenas quando toda a configuração aprovada continua idêntica. Mudança de workspace, escopo, revisão, responsáveis, modo, perfil, effort ou modelo inicia uma sessão nova.
+
+Use `resumeFrom` para retomada explícita no mesmo workspace. Uma sessão vinculada a outra tarefa Codex é rejeitada; resultados legados sem identidade permanecem compatíveis com as verificações anteriores.
 
 - Sem mudança, mantenha `scopeId`, `approvalRevision`, plano e matriz.
 - Qualquer mudança exige nova aprovação e revisão maior.
