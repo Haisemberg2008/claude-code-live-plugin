@@ -1,6 +1,6 @@
 {
   "name": "claude-code-live",
-  "version": "0.1.0+codex.20260908174518",
+  "version": "0.1.0+codex.20260908223306",
   "description": "Coordena o Claude Code com plano aprovado, responsaveis explicitos, permissoes e acompanhamento controlados.",
   "author": {
     "name": "YOU Telecom"
