@@ -18,6 +18,7 @@ Campos do job:
 - `coordination`: objeto obrigatorio com fase, identificador de escopo, revisao, resumo/aprovacao do plano e a matriz completa de responsaveis.
 - `allowedCommands`: objetos com `rule` e `responsibility`, somente em `verify` ou `local`. Inspecione o script antes; nao permita Bash irrestrito, curingas ou interpretadores genericos.
 - `resumeFrom`: caminho para `resultado.json` anterior no mesmo workspace.
+- `codexThreadId`: fallback opcional para atribuir identidade estavel fora do Codex; dentro dele, `CODEX_THREAD_ID` e automatico.
 - `timeoutSeconds`: opcional; padrao de 1800 segundos.
 
 Modos de ferramenta:
@@ -103,8 +104,8 @@ Execute com PowerShell 7:
 pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' -JobFile '<job.json>' -RunDirectory '<nova-pasta>'
 ```
 
-O script abre ou reutiliza um painel visivel unico. Use uma pasta de execucao nova. Acompanhe `acompanhamento.txt` e `status.json`; o modelo efetivo aparece no inicio. O mutex rejeita execucoes simultaneas desta integracao.
+O script abre ou reutiliza um painel visivel por tarefa Codex. Use uma pasta de execucao nova. Acompanhe `acompanhamento.txt` e `status.json`; o modelo efetivo aparece no inicio. O mutex bloqueia concorrencia dentro da mesma tarefa, mas permite tarefas diferentes em paralelo. A consulta de quota usa mutex global.
 
 Para interromper, pressione `Q` no painel ou crie `stop.request` na pasta exata da execucao. `Ctrl+C` no executor tambem aciona a limpeza. `X` ou fechar o painel encerra apenas a visualizacao. Depois de queda ou fechamento forcado, verifique os processos antes de retomar.
 
-`resultado.json` registra status, sessao, workspace, modelo, perfil, ferramentas, falhas, negativas de permissao e resposta final. Para continuar, crie outro job com `resumeFrom` e outra pasta de execucao.
+`resultado.json` registra status, `codexThreadId`, modo de retomada, sessao, workspace, modelo, perfil, ferramentas, falhas, negativas de permissao e resposta final. `session.json` aponta para o ultimo resultado retomavel daquela tarefa. Um novo job exatamente compativel retoma automaticamente; use `resumeFrom` para retomada explicita.

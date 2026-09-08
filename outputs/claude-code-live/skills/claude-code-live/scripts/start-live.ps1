@@ -7,19 +7,23 @@ $ErrorActionPreference = 'Stop'
 $jobPath = (Resolve-Path -LiteralPath $JobFile).Path
 $job = Get-Content -LiteralPath $jobPath -Raw -Encoding utf8 | ConvertFrom-Json
 . (Join-Path $PSScriptRoot 'claude-live-contract.ps1')
+. (Join-Path $PSScriptRoot 'claude-thread-context.ps1')
 $null = Resolve-ClaudeLiveContract -Job $job
 $workspace = (Resolve-Path -LiteralPath $job.workspace).Path
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
 if (Test-Path -LiteralPath $runPath) { throw 'Use a new run directory.' }
-$panelKey = 'primary'
-$stateDirectory = Join-Path $env:LOCALAPPDATA ('CodexClaudeLive\' + $panelKey)
+$threadContext = Resolve-ClaudeLiveThreadContext -Job $job -CodexThreadId $env:CODEX_THREAD_ID -CodexSessionId $env:CODEX_SESSION_ID
+$panelKey = $threadContext.ThreadKey
+$stateDirectory = Get-ClaudeLiveStateDirectory -LocalAppData $env:LOCALAPPDATA -ThreadKey $panelKey
 [IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
-$runMutex = [Threading.Mutex]::new($false, ('Local\ClaudeLiveRun-' + $panelKey))
+$runMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Run -ThreadKey $panelKey))
 try { $runLockHeld = $runMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $runLockHeld = $true }
 if (-not $runLockHeld) { $runMutex.Dispose(); throw 'A task is already running in this integration.' }
 try {
     $pointer = Join-Path $stateDirectory 'current.json'
-    [pscustomobject]@{runDirectory=$runPath} | ConvertTo-Json -Compress |
+    $sessionPointerFile = Join-Path $stateDirectory 'session.json'
+    $previousResultFile = Get-ClaudeLivePreviousResultFile -StateDirectory $stateDirectory
+    [pscustomobject]@{runDirectory=$runPath;codexThreadId=$threadContext.ThreadId} | ConvertTo-Json -Compress |
         Set-Content -LiteralPath ($pointer + '.tmp') -Encoding utf8
     [IO.File]::Move(($pointer + '.tmp'),$pointer,$true)
     $registration = Join-Path $stateDirectory 'panel.json'
@@ -40,7 +44,8 @@ try {
         $panelProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $launchArgs -WindowStyle Normal -PassThru
     }
     Write-Host ('[Painel] ' + $(if ($panelAlive) {'Reutilizado'} else {'Aberto'}) + ' | PID: ' + $panelProcess.Id)
-    & (Join-Path $PSScriptRoot 'run-live.ps1') -JobFile $jobPath -RunDirectory $runPath
+    & (Join-Path $PSScriptRoot 'run-live.ps1') -JobFile $jobPath -RunDirectory $runPath `
+        -ThreadId $threadContext.ThreadId -PreviousResultFile $previousResultFile -SessionPointerFile $sessionPointerFile
     exit ([int]$LASTEXITCODE)
 } finally {
     $runMutex.ReleaseMutex()

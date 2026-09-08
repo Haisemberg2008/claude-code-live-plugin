@@ -10,7 +10,7 @@ O pacote instalável fica em [`outputs/claude-code-live`](outputs/claude-code-li
 - Exige planejamento e uma matriz de responsáveis antes de implementação ou mutação.
 - Separa leitura, verificação por comandos e edição em modos diferentes.
 - Limita ferramentas e comandos por allowlist explícita.
-- Mostra progresso em um painel PowerShell único e preserva resultado e estado.
+- Mantém um painel e uma sessão Claude independentes para cada tarefa Codex.
 - Pode selecionar Fable ou Opus antes de iniciar ou retomar, conforme limites confirmados pelo `/usage`.
 - Permite interromper e retomar uma sessão sem repetir mutações automaticamente.
 - Mantém commit, push, PR, deploy, publicação e outras mutações externas fora do Claude.
@@ -75,6 +75,7 @@ Campos principais:
 - `coordination`: plano, aprovação e matriz obrigatórios.
 - `allowedCommands`: objetos com regra Bash exata e responsabilidade correspondente.
 - `resumeFrom`: caminho para um `resultado.json` anterior do mesmo workspace.
+- `codexThreadId`: fallback opcional para execução fora do Codex; dentro do Codex, `CODEX_THREAD_ID` é usado automaticamente.
 - `timeoutSeconds`: tempo limite; padrão de 1800 segundos.
 
 Exemplo de testes sem conceder edição ao Claude:
@@ -156,7 +157,7 @@ pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' 
   -RunDirectory '<pasta-nova>'
 ```
 
-O preflight valida o contrato antes de abrir o painel ou iniciar o Claude. Uma única execução pode usar a integração por vez.
+O preflight valida o contrato antes de abrir o painel ou iniciar o Claude. Cada tarefa Codex possui diretório de estado, painel e mutex próprios; jobs da mesma tarefa são serializados, enquanto tarefas diferentes podem executar simultaneamente. A consulta de quota continua protegida por um mutex global porque os limites pertencem à conta, não à tarefa.
 
 O painel mostra modo, perfil, modelo efetivo, fase, escopo, revisão aprovada, resumo do plano, responsáveis, limites de uso sanitizados, ferramentas e mudanças de estado.
 
@@ -173,7 +174,9 @@ Cada pasta de execução preserva:
 
 ## Retomada
 
-Use `resumeFrom` somente no mesmo workspace e quando a sessão anterior continuar compatível.
+Dentro da mesma tarefa Codex, o plugin retoma automaticamente a última sessão Claude somente quando thread, workspace, modo, perfil, effort, modelo/política, plano, revisão e responsáveis são idênticos. Caso contrário inicia uma sessão nova.
+
+Use `resumeFrom` para uma retomada explícita no mesmo workspace. Resultados novos vinculados a outra tarefa Codex são rejeitados; resultados legados sem `codexThreadId` continuam aceitos após as verificações existentes.
 
 - Sem mudança, preserve `scopeId`, `approvalRevision`, plano e matriz.
 - Com mudança, obtenha nova aprovação e aumente `approvalRevision`.
