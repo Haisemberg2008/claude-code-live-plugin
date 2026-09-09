@@ -1,6 +1,6 @@
 # OpenAInthropic
 
-<img src="assets/openainthropic-icon.png" alt="Ícone do OpenAInthropic" width="180">
+![Fluxo do OpenAInthropic: planejamento, aprovação e coordenação de sessões Opus e Fable](assets/openainthropic-workflow.png)
 
 **Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar Claude Code local ou em nuvem, com planejamento aprovado, responsáveis explícitos, permissões mínimas, acompanhamento e retomada controlados. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
