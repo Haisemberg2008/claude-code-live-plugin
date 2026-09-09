@@ -1,5 +1,7 @@
 # OpenAInthropic
 
+<img src="outputs/claude-code-live/assets/openainthropic-icon.png" alt="Ícone do OpenAInthropic" width="180">
+
 **Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex, com planejamento aprovado, responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
 O identificador técnico permanece `claude-code-live`, preservando instalações, comandos, caminhos, automações e sessões existentes.

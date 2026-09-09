@@ -1,6 +1,6 @@
 {
   "name": "claude-code-live",
-  "version": "0.1.0+codex.20260909131333",
+  "version": "0.1.0+codex.20260909132028",
   "description": "OpenAInthropic coordena Codex com Opus e Fable sob plano, responsabilidades e permissoes aprovados.",
   "author": {
     "name": "YOU Telecom"
@@ -20,6 +20,10 @@
     "defaultPrompt": [
       "Use OpenAInthropic para o Codex planejar esta tarefa, definir os responsaveis e coordenar Opus ou Fable somente depois da minha aprovacao.",
       "Use OpenAInthropic para planejar e atribuir esta tarefa antes de iniciar e acompanhar uma sessao Claude Code em nuvem."
-    ]
+    ],
+    "brandColor": "#6D28D9",
+    "composerIcon": "./assets/openainthropic-icon.png",
+    "logo": "./assets/openainthropic-icon.png",
+    "logoDark": "./assets/openainthropic-icon.png"
   }
 }
