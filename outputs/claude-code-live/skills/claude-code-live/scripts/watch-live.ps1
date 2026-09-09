@@ -2,17 +2,18 @@
 param([Parameter(Mandatory)][string]$StateDirectory, [Parameter(Mandatory)][string]$PanelKey)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'claude-thread-context.ps1')
+. (Join-Path $PSScriptRoot 'claude-log-reader.ps1')
 $panelMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Panel -ThreadKey $PanelKey))
 try { $panelLockHeld = $panelMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $panelLockHeld = $true }
 if (-not $panelLockHeld) { $panelMutex.Dispose(); exit }
-$Host.UI.RawUI.WindowTitle = 'Claude Code | Painel ao vivo'
+$Host.UI.RawUI.WindowTitle = 'Claude Code | ' + $PanelKey
 $pointer = Join-Path $StateDirectory 'current.json'
 $registration = Join-Path $StateDirectory 'panel.json'
 $self = Get-Process -Id $PID
 [pscustomobject]@{pid=$PID;started=$self.StartTime.ToUniversalTime().Ticks} |
     ConvertTo-Json -Compress | Set-Content -LiteralPath $registration -Encoding utf8
 $currentRun = $null
-$displayed = 0
+$cursor = New-ClaudeLogCursor
 try {
     Write-Host 'CLAUDE CODE | PAINEL UNICO'
     Write-Host 'Aguardando tarefa. Q interrompe a tarefa atual; X fecha somente o painel.'
@@ -35,7 +36,7 @@ try {
                 $active = Get-Content -LiteralPath $pointer -Raw -Encoding utf8 | ConvertFrom-Json
                 if ($active.runDirectory -ne $currentRun) {
                     $currentRun = $active.runDirectory
-                    $displayed = 0
+                    $cursor = New-ClaudeLogCursor
                     Clear-Host
                     Write-Host 'CLAUDE CODE | PAINEL UNICO'
                     Write-Host 'Q: interromper tarefa. X: fechar painel. Fechar o painel nao interrompe o executor.'
@@ -43,11 +44,17 @@ try {
                 }
                 $log = Join-Path $currentRun 'acompanhamento.txt'
                 if (Test-Path -LiteralPath $log) {
-                    $content = [string](Get-Content -LiteralPath $log -Raw -Encoding utf8)
-                    if ($content.Length -gt $displayed) {
-                        Write-Host -NoNewline $content.Substring($displayed)
-                        $displayed = $content.Length
+                    $content = Read-ClaudeLogDelta -Cursor $cursor -Path $log
+                    if ($content.Length) { Write-Host -NoNewline $content }
+                }
+                $stateFile = Join-Path $currentRun 'status.json'
+                if (Test-Path -LiteralPath $stateFile) {
+                    $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+                    $elapsed = $state.elapsedSeconds
+                    if ($state.startedAt -and $state.status -in @('STARTING','RUNNING')) {
+                        $elapsed = [math]::Floor(([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($state.startedAt)).TotalSeconds)
                     }
+                    $Host.UI.RawUI.WindowTitle = 'Claude Code | ' + $PanelKey + ' | ' + $state.status + ' | ' + $elapsed + 's'
                 }
             }
         } catch { }

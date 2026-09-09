@@ -4,53 +4,31 @@ param(
     [Parameter(Mandatory)][string]$RunDirectory,
     [Parameter(Mandatory)][string]$ThreadId,
     [string]$PreviousResultFile,
-    [Parameter(Mandatory)][string]$SessionPointerFile
+    [Parameter(Mandatory)][string]$SessionPointerFile,
+    [string]$TestAdapter
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'claude-live-contract.ps1')
 . (Join-Path $PSScriptRoot 'claude-usage.ps1')
 . (Join-Path $PSScriptRoot 'claude-thread-context.ps1')
 $Host.UI.RawUI.WindowTitle = 'Claude Code | Acompanhamento ao vivo'
-$job = Get-Content -LiteralPath $JobFile -Raw -Encoding utf8 | ConvertFrom-Json
-$contract = Resolve-ClaudeLiveContract -Job $job
-$workspace = (Resolve-Path -LiteralPath $job.workspace).Path
-$promptText = Get-Content -LiteralPath $job.promptFile -Raw -Encoding utf8
-$mode = $contract.Mode
-$profile = $contract.Profile
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
 if (Test-Path -LiteralPath $runPath) { throw 'Use a new run directory.' }
-$resumeId = $null
-$resumeMode = 'new'
-if ($job.resumeFrom) {
-    $prior = Get-Content -LiteralPath $job.resumeFrom -Raw -Encoding utf8 | ConvertFrom-Json
-    if (-not $prior.sessionId -or $prior.workspace -ne $workspace) { throw 'Resume requires a session in the same workspace.' }
-    if (-not $prior.coordination) { throw 'A legacy result without coordination cannot be resumed.' }
-    Assert-ClaudeLiveResumeThreadIdentity -CurrentThreadId $ThreadId -PriorResult $prior
-    Assert-ClaudeLiveResumeCoordination -Current $contract.Coordination -Prior $prior.coordination `
-        -CurrentModelPolicy $contract.ModelPolicy -PriorModelPolicy $prior.modelPolicy
-    $resumeId = $prior.sessionId
-    $resumeMode = 'explicit'
-} elseif ($PreviousResultFile -and (Test-Path -LiteralPath $PreviousResultFile)) {
-    try {
-        $prior = Get-Content -LiteralPath $PreviousResultFile -Raw -Encoding utf8 | ConvertFrom-Json
-        if (Test-ClaudeLiveAutomaticResume -CurrentContract $contract -Workspace $workspace -ThreadId $ThreadId -PriorResult $prior) {
-            $resumeId = $prior.sessionId
-            $resumeMode = 'automatic'
-        }
-    } catch { }
-}
-$timeoutSeconds = if ($job.timeoutSeconds) { [int]$job.timeoutSeconds } else { 1800 }
-if ($timeoutSeconds -lt 1) { throw 'Invalid timeout.' }
-$launcher = (Get-Command claude -ErrorAction Stop).Source
-$binary = if ($launcher.EndsWith('.exe')) { $launcher } else {
-    Join-Path (Split-Path $launcher) 'node_modules/@anthropic-ai/claude-code/bin/claude.exe'
-}
-if (-not (Test-Path -LiteralPath $binary)) { throw 'Claude executable not found; inspect installation.' }
 [IO.Directory]::CreateDirectory($runPath) | Out-Null
 $logPath = Join-Path $runPath 'acompanhamento.txt'
 $statusPath = Join-Path $runPath 'status.json'
 $resultPath = Join-Path $runPath 'resultado.json'
 $stopPath = Join-Path $runPath 'stop.request'
+$started = $false
+$sessionConfirmed = $false
+$process = $null
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$seenTools = [Collections.Generic.List[string]]::new()
+$startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+$record = [ordered]@{ status='STARTING'; codexThreadId=$ThreadId; startedAt=$startedAt; sessionId=$null; result=$null; exitCode=$null; elapsedSeconds=0; toolCalls=@() }
+$binaryArguments = @()
+$usageProvider = { Get-ClaudeUsageSnapshot }
+$quotaWaitMilliseconds = 30000
 function Show-Line([string]$Text) {
     Write-Host $Text
     Add-Content -LiteralPath $logPath -Value $Text -Encoding utf8
@@ -60,113 +38,160 @@ function Write-State($Value, [string]$Path) {
     $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding utf8
     [IO.File]::Move($temp, $Path, $true)
 }
-$quotaMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Quota))
-$quotaLockHeld = $false
+Write-State $record $statusPath
 try {
-    try { $quotaLockHeld = $quotaMutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $quotaLockHeld = $true }
-    if (-not $quotaLockHeld) { throw 'Timed out waiting for the global Claude usage check.' }
-    $modelDecision = Resolve-ClaudeModelDecision -RequestedModel $contract.Model -ModelPolicy $contract.ModelPolicy
-} finally {
-    if ($quotaLockHeld) { $quotaMutex.ReleaseMutex() }
-    $quotaMutex.Dispose()
-}
-$usageSnapshot = $modelDecision.Usage
-if ($null -ne $usageSnapshot) {
-    foreach ($usageLine in (Format-ClaudeUsageSnapshot -Usage $usageSnapshot)) { Show-Line $usageLine }
-    if ($usageSnapshot.AlertLevel -ne 'ok') {
-        Show-Line ('[Uso] ALERTA ' + $usageSnapshot.AlertLevel.ToUpperInvariant() + ': confirme a capacidade antes de iniciar trabalho longo.')
+    $preparationStage = 'contract'
+    $job = Get-Content -LiteralPath $JobFile -Raw -Encoding utf8 | ConvertFrom-Json
+    $contract = Resolve-ClaudeLiveContract -Job $job
+    $workspace = (Resolve-Path -LiteralPath $job.workspace).Path
+    $promptText = Get-Content -LiteralPath $job.promptFile -Raw -Encoding utf8
+    $mode = $contract.Mode
+    $profile = $contract.Profile
+    $resumeId = $null
+    $resumeMode = 'new'
+    $preparationStage = 'resume'
+    if ($job.resumeFrom) {
+        $prior = Get-Content -LiteralPath $job.resumeFrom -Raw -Encoding utf8 | ConvertFrom-Json
+        if (-not $prior.sessionId -or $prior.workspace -ne $workspace) { throw 'Resume requires a session in the same workspace.' }
+        if (-not $prior.coordination) { throw 'A legacy result without coordination cannot be resumed.' }
+        Assert-ClaudeLiveResumeThreadIdentity -CurrentThreadId $ThreadId -PriorResult $prior
+        Assert-ClaudeLiveResumeCommands -CurrentContract $contract -PriorResult $prior
+        Assert-ClaudeLiveResumeCoordination -Current $contract.Coordination -Prior $prior.coordination `
+            -CurrentModelPolicy $contract.ModelPolicy -PriorModelPolicy $prior.modelPolicy
+        $resumeId = $prior.sessionId
+        $resumeMode = 'explicit'
+    } elseif ($PreviousResultFile -and (Test-Path -LiteralPath $PreviousResultFile)) {
+        try {
+            $prior = Get-Content -LiteralPath $PreviousResultFile -Raw -Encoding utf8 | ConvertFrom-Json
+            if (Test-ClaudeLiveAutomaticResume -CurrentContract $contract -Workspace $workspace -ThreadId $ThreadId -PriorResult $prior) {
+                $resumeId = $prior.sessionId
+                $resumeMode = 'automatic'
+            }
+        } catch { }
     }
-} else {
-    Show-Line ('[Uso] INDISPONIVEL: ' + $modelDecision.PublicMessage)
-}
-if ($null -ne $modelDecision.Selection) {
-    Show-Line (Format-ClaudeModelSelection -Selection $modelDecision.Selection)
-}
-$effectiveModel = $modelDecision.EffectiveModel
-$toolConfiguration = Get-ClaudeLiveToolConfiguration -Contract $contract
-$tools = $toolConfiguration.Tools
-$allowed = $toolConfiguration.Allowed
-$start = [Diagnostics.ProcessStartInfo]::new()
-$start.FileName = $binary
-$start.WorkingDirectory = $workspace
-$start.UseShellExecute = $false
-$start.RedirectStandardOutput = $true
-$start.RedirectStandardError = $true
-$start.RedirectStandardInput = $true
-$start.StandardOutputEncoding = [Text.Encoding]::UTF8
-$start.StandardErrorEncoding = [Text.Encoding]::UTF8
-$start.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
-$start.CreateNoWindow = $true
-foreach ($argValue in @('--safe-mode','--tools',($tools -join ','),'--permission-mode','dontAsk','--permission-prompts','none','--output-format','stream-json','--verbose','--include-partial-messages','-p')) {
-    $start.ArgumentList.Add([string]$argValue)
-}
-if ($profile -eq 'restricted') {
-    foreach ($argValue in @('--restricted','--strict-mcp-config')) { $start.ArgumentList.Add([string]$argValue) }
-}
-if ($allowed.Count) {
-    $start.ArgumentList.Add('--allowedTools')
-    foreach ($rule in $allowed) { $start.ArgumentList.Add($rule) }
-}
-if ($resumeId) { $start.ArgumentList.Add('--resume'); $start.ArgumentList.Add($resumeId) }
-$start.ArgumentList.Add('--model')
-if ($effectiveModel) { $start.ArgumentList.Add([string]$effectiveModel) }
-$start.ArgumentList.Add('--effort')
-$start.ArgumentList.Add($contract.Effort)
-$process = [Diagnostics.Process]::new()
-$process.StartInfo = $start
-$started = $false
-$finalReceived = $false
-$clock = [Diagnostics.Stopwatch]::StartNew()
-$seenTools = [Collections.Generic.List[string]]::new()
-$record = [ordered]@{
-    status = 'STARTING'; workspace = $workspace; sessionId = $resumeId; codexThreadId = $ThreadId; resumeMode = $resumeMode
-    requestedModel = $contract.Model; selectedModel = $effectiveModel; model = $null; effort = $contract.Effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
-    modelPolicy = if ($null -ne $contract.ModelPolicy) {
-        [ordered]@{
-            mode = $contract.ModelPolicy.Mode
-            primary = $contract.ModelPolicy.Primary
-            alternate = $contract.ModelPolicy.Alternate
-            switchAtRemainingPercent = $contract.ModelPolicy.SwitchAtRemainingPercent
+    $timeoutSeconds = if ($job.timeoutSeconds) { [int]$job.timeoutSeconds } else { 1800 }
+    if ($timeoutSeconds -lt 1) { throw 'Invalid timeout.' }
+    $preparationStage = 'cli-resolution'
+    if ($TestAdapter) { . (Resolve-Path -LiteralPath $TestAdapter).Path }
+    if (-not $TestAdapter) {
+        $launcher = (Get-Command claude -ErrorAction Stop).Source
+        $binary = if ($launcher.EndsWith('.exe')) { $launcher } else {
+            Join-Path (Split-Path $launcher) 'node_modules/@anthropic-ai/claude-code/bin/claude.exe'
         }
-    } else { $null }
-    modelSelection = if ($null -ne $modelDecision.Selection) { ConvertTo-ClaudeModelSelectionRecord -Selection $modelDecision.Selection } else { $null }
-    coordination = [ordered]@{
-        phase = $contract.Coordination.Phase
-        scopeId = $contract.Coordination.ScopeId
-        approvalRevision = $contract.Coordination.ApprovalRevision
-        planSummary = $contract.Coordination.PlanSummary
-        planApproved = $contract.Coordination.PlanApproved
-        responsibilities = $contract.Coordination.Responsibilities
     }
-    result = $null; usage = $usageSnapshot; toolCalls = @(); toolErrors = 0; permissionDenials = 0
-    exitCode = $null; elapsedSeconds = 0
-}
-Show-Line 'CLAUDE CODE - ACOMPANHAMENTO AO VIVO'
-Show-Line 'Q no painel solicita parada; Ctrl+C no terminal executor interrompe. Resultados ficam preservados.'
-Show-Line ('Modo: ' + $mode + ' | Perfil: ' + $profile + ' | Ferramentas e comandos limitados ao job aprovado.')
-Show-Line ('Coordenacao: ' + $contract.Coordination.Phase + ' | Escopo: ' + $contract.Coordination.ScopeId + ' | Revisao aprovada: ' + $contract.Coordination.ApprovalRevision)
-Show-Line ('Tarefa Codex: ' + $ThreadId + ' | Sessao Claude: ' + $resumeMode)
-if ($contract.Coordination.PlanSummary) { Show-Line ('Plano: ' + $contract.Coordination.PlanSummary) }
-$ownerPairs = @('planning','inspection','implementation','testing','review','commit','push','deploy') | ForEach-Object {
-    $_ + '=' + $contract.Coordination.Responsibilities.$_
-}
-Show-Line ('Responsaveis: ' + ($ownerPairs -join '; '))
-Show-Line 'Use apenas arquivos autorizados e sem segredos. Isto nao e um sandbox de sistema operacional.'
-Show-Line ''
-if ($modelDecision.Blocked) {
-    $record.status = 'BLOCKED'
-    $record.result = $modelDecision.PublicMessage
-    Write-State $record $resultPath
-    Write-State $record $statusPath
-    if ($record.sessionId) { Write-ClaudeLiveSessionPointer -PointerFile $SessionPointerFile -ResultFile $resultPath }
-    Show-Line ('[BLOCKED] ' + $modelDecision.PublicMessage)
-    Show-Line '[Encerrado] BLOCKED'
-    $process.Dispose()
-    exit 1
-}
-try {
+    if (-not (Test-Path -LiteralPath $binary)) { throw 'Claude executable not found; inspect installation.' }
+
+    $quotaMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Quota))
+    $quotaLockHeld = $false
+    try {
+        $preparationStage = 'usage-lock'
+        try { $quotaLockHeld = $quotaMutex.WaitOne($quotaWaitMilliseconds) } catch [Threading.AbandonedMutexException] { $quotaLockHeld = $true }
+        if (-not $quotaLockHeld) { throw 'Timed out waiting for the global Claude usage check.' }
+        $preparationStage = 'usage-query'
+        $modelDecision = Resolve-ClaudeModelDecision -RequestedModel $contract.Model -ModelPolicy $contract.ModelPolicy -UsageProvider $usageProvider
+    } finally {
+        if ($quotaLockHeld) { $quotaMutex.ReleaseMutex() }
+        $quotaMutex.Dispose()
+    }
+    $usageCheckedAt = [DateTimeOffset]::UtcNow.ToString('o')
+    $usageSnapshot = $modelDecision.Usage
+    Show-Line ('[Uso] Consulta na preparacao: ' + $usageCheckedAt + ' | nao e monitoramento continuo.')
+    if ($null -ne $usageSnapshot) {
+        foreach ($usageLine in (Format-ClaudeUsageSnapshot -Usage $usageSnapshot)) { Show-Line $usageLine }
+        if ($usageSnapshot.AlertLevel -ne 'ok') {
+            Show-Line ('[Uso] ALERTA ' + $usageSnapshot.AlertLevel.ToUpperInvariant() + ': confirme a capacidade antes de iniciar trabalho longo.')
+        }
+    } else {
+        Show-Line ('[Uso] INDISPONIVEL: ' + $modelDecision.PublicMessage)
+    }
+    if ($null -ne $modelDecision.Selection) {
+        Show-Line (Format-ClaudeModelSelection -Selection $modelDecision.Selection)
+    }
+    $effectiveModel = $modelDecision.EffectiveModel
+    $toolConfiguration = Get-ClaudeLiveToolConfiguration -Contract $contract
+    $tools = $toolConfiguration.Tools
+    $allowed = $toolConfiguration.Allowed
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $binary
+    foreach ($prefixArgument in $binaryArguments) { $start.ArgumentList.Add([string]$prefixArgument) }
+    $start.WorkingDirectory = $workspace
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.RedirectStandardInput = $true
+    $start.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $start.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
+    $start.CreateNoWindow = $true
+    foreach ($argValue in @('--safe-mode','--tools',($tools -join ','),'--permission-mode','dontAsk','--permission-prompts','none','--output-format','stream-json','--verbose','--include-partial-messages','-p')) {
+        $start.ArgumentList.Add([string]$argValue)
+    }
+    if ($profile -eq 'restricted') {
+        foreach ($argValue in @('--restricted','--strict-mcp-config')) { $start.ArgumentList.Add([string]$argValue) }
+    }
+    if ($allowed.Count) {
+        $start.ArgumentList.Add('--allowedTools')
+        foreach ($rule in $allowed) { $start.ArgumentList.Add($rule) }
+    }
+    if ($resumeId) { $start.ArgumentList.Add('--resume'); $start.ArgumentList.Add($resumeId) }
+    $start.ArgumentList.Add('--model')
+    if ($effectiveModel) { $start.ArgumentList.Add([string]$effectiveModel) }
+    $start.ArgumentList.Add('--effort')
+    $start.ArgumentList.Add($contract.Effort)
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $started = $false
+    $finalReceived = $false
+    $record = [ordered]@{
+        startedAt = $startedAt; usageCheckedAt = $usageCheckedAt
+        allowedCommands = @(ConvertTo-ClaudeLiveCommandRecord $contract.AllowedCommands)
+        status = 'STARTING'; workspace = $workspace; sessionId = $resumeId; codexThreadId = $ThreadId; resumeMode = $resumeMode
+        requestedModel = $contract.Model; selectedModel = $effectiveModel; model = $null; effort = $contract.Effort; mode = $mode; profile = $profile; monitorPid = $PID; processId = $null; processStartedTicks = $null
+        modelPolicy = if ($null -ne $contract.ModelPolicy) {
+            [ordered]@{
+                mode = $contract.ModelPolicy.Mode
+                primary = $contract.ModelPolicy.Primary
+                alternate = $contract.ModelPolicy.Alternate
+                switchAtRemainingPercent = $contract.ModelPolicy.SwitchAtRemainingPercent
+            }
+        } else { $null }
+        modelSelection = if ($null -ne $modelDecision.Selection) { ConvertTo-ClaudeModelSelectionRecord -Selection $modelDecision.Selection } else { $null }
+        coordination = [ordered]@{
+            phase = $contract.Coordination.Phase
+            scopeId = $contract.Coordination.ScopeId
+            approvalRevision = $contract.Coordination.ApprovalRevision
+            planSummary = $contract.Coordination.PlanSummary
+            planApproved = $contract.Coordination.PlanApproved
+            responsibilities = $contract.Coordination.Responsibilities
+        }
+        result = $null; usage = $usageSnapshot; toolCalls = @(); toolErrors = 0; permissionDenials = 0
+        exitCode = $null; elapsedSeconds = 0
+    }
+    Show-Line 'CLAUDE CODE - ACOMPANHAMENTO AO VIVO'
+    Show-Line 'Q no painel solicita parada; Ctrl+C no terminal executor interrompe. Resultados ficam preservados.'
+    Show-Line ('Modo: ' + $mode + ' | Perfil: ' + $profile + ' | Ferramentas e comandos limitados ao job aprovado.')
+    Show-Line ('Coordenacao: ' + $contract.Coordination.Phase + ' | Escopo: ' + $contract.Coordination.ScopeId + ' | Revisao aprovada: ' + $contract.Coordination.ApprovalRevision)
+    Show-Line ('Tarefa Codex: ' + $ThreadId + ' | Sessao Claude: ' + $resumeMode)
+    if ($contract.Coordination.PlanSummary) { Show-Line ('Plano: ' + $contract.Coordination.PlanSummary) }
+    $ownerPairs = @('planning','inspection','implementation','testing','review','commit','push','deploy') | ForEach-Object {
+        $_ + '=' + $contract.Coordination.Responsibilities.$_
+    }
+    Show-Line ('Responsaveis: ' + ($ownerPairs -join '; '))
+    Show-Line 'Use apenas arquivos autorizados e sem segredos. Isto nao e um sandbox de sistema operacional.'
+    Show-Line ''
+    if ($modelDecision.Blocked) {
+        $record.status = 'BLOCKED'
+        $record.result = $modelDecision.PublicMessage
+        Write-State $record $resultPath
+        Write-State $record $statusPath
+        Show-Line ('[BLOCKED] ' + $modelDecision.PublicMessage)
+        Show-Line '[Encerrado] BLOCKED'
+        throw 'Model capacity blocked.'
+    }
+    $preparationStage = 'process-start'
     if (-not $process.Start()) { throw 'Could not start Claude.' }
     $started = $true
+    $preparationStage = 'stream'
     $record.processId = $process.Id
     $record.processStartedTicks = $process.StartTime.ToUniversalTime().Ticks
     $record.status = 'RUNNING'
@@ -194,6 +219,7 @@ try {
             'system' {
                 if ($event.subtype -eq 'init') {
                     $record.sessionId = $event.session_id
+                    $sessionConfirmed = -not [string]::IsNullOrWhiteSpace([string]$event.session_id)
                     $record.model = $event.model
                     Show-Line ('[Conectado] Modelo: ' + $event.model)
                     Write-State $record $statusPath
@@ -228,7 +254,7 @@ try {
             'result' {
                 $finalReceived = $true
                 $record.result = $event.result
-                if ($event.session_id) { $record.sessionId = $event.session_id }
+                if ($event.session_id) { $record.sessionId = $event.session_id; $sessionConfirmed = $true }
                 $record.permissionDenials = @($event.permission_denials | Where-Object { $_ }).Count
                 $record.status = if ($record.permissionDenials) { 'BLOCKED' } elseif ($event.is_error) { 'FAIL' } else { 'COMPLETED' }
             }
@@ -249,8 +275,9 @@ try {
         $record.status = 'FAIL'
     }
 } catch {
-    $record.status = 'FAIL'
-    Show-Line '[FAIL] Falha no executor. Detalhes brutos suprimidos; diagnosticar de forma sanitizada.'
+    $record.failureStage = $preparationStage
+    if ($record.status -ne 'BLOCKED') { $record.status = 'FAIL'; $record.result = 'Falha na preparacao ou execucao; consulte o estado sanitizado.' }
+    if ($record.status -eq 'FAIL') { Show-Line ('[FAIL] Etapa: ' + $preparationStage + '. Detalhes brutos suprimidos.') }
 } finally {
     if ($started -and -not $process.HasExited) {
         $process.Kill($true)
@@ -261,8 +288,8 @@ try {
     $record.toolCalls = @($seenTools.ToArray())
     Write-State $record $resultPath
     Write-State $record $statusPath
-    if ($record.sessionId) { Write-ClaudeLiveSessionPointer -PointerFile $SessionPointerFile -ResultFile $resultPath }
-    $process.Dispose()
+    if ($sessionConfirmed) { Write-ClaudeLiveSessionPointer -PointerFile $SessionPointerFile -ResultFile $resultPath }
+    if ($null -ne $process) { $process.Dispose() }
 }
 Show-Line ('[Encerrado] ' + $record.status)
 Show-Line 'COMPLETED confirma o fim da execucao; a aprovacao depende da revisao dos artefatos.'

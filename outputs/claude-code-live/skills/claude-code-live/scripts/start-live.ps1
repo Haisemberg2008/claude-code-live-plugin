@@ -1,7 +1,10 @@
 #requires -Version 7.0
 param(
     [Parameter(Mandatory)][string]$JobFile,
-    [Parameter(Mandatory)][string]$RunDirectory
+    [Parameter(Mandatory)][string]$RunDirectory,
+    [string]$TestAdapter,
+    [string]$TestStateRoot,
+    [switch]$NoPanel
 )
 $ErrorActionPreference = 'Stop'
 $jobPath = (Resolve-Path -LiteralPath $JobFile).Path
@@ -15,6 +18,10 @@ if (Test-Path -LiteralPath $runPath) { throw 'Use a new run directory.' }
 $threadContext = Resolve-ClaudeLiveThreadContext -Job $job -CodexThreadId $env:CODEX_THREAD_ID -CodexSessionId $env:CODEX_SESSION_ID
 $panelKey = $threadContext.ThreadKey
 $stateDirectory = Get-ClaudeLiveStateDirectory -LocalAppData $env:LOCALAPPDATA -ThreadKey $panelKey
+if ($TestStateRoot -or $NoPanel) {
+    if (-not $TestAdapter) { throw 'Test-only options require an explicit TestAdapter.' }
+    if ($TestStateRoot) { $stateDirectory = Get-ClaudeLiveStateDirectory -LocalAppData $TestStateRoot -ThreadKey $panelKey }
+}
 [IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
 $runMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Run -ThreadKey $panelKey))
 try { $runLockHeld = $runMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $runLockHeld = $true }
@@ -35,7 +42,7 @@ try {
             $panelAlive = $panelProcess.ProcessName -eq 'pwsh' -and $panelProcess.StartTime.ToUniversalTime().Ticks -eq $panelInfo.started
         } catch { }
     }
-    if (-not $panelAlive) {
+    if (-not $panelAlive -and -not $NoPanel) {
         $closeRequest = Join-Path $stateDirectory 'close-panel.request'
         if (Test-Path -LiteralPath $closeRequest) { Remove-Item -LiteralPath $closeRequest }
         $watcher = Join-Path $PSScriptRoot 'watch-live.ps1'
@@ -43,9 +50,9 @@ try {
         $launchArgs = @('-NoProfile','-File',('"' + $watcher + '"'),'-StateDirectory',('"' + $stateDirectory + '"'),'-PanelKey',$panelKey)
         $panelProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $launchArgs -WindowStyle Normal -PassThru
     }
-    Write-Host ('[Painel] ' + $(if ($panelAlive) {'Reutilizado'} else {'Aberto'}) + ' | PID: ' + $panelProcess.Id)
+    if (-not $NoPanel) { Write-Host ('[Painel] ' + $(if ($panelAlive) {'Reutilizado'} else {'Aberto'}) + ' | PID: ' + $panelProcess.Id) }
     & (Join-Path $PSScriptRoot 'run-live.ps1') -JobFile $jobPath -RunDirectory $runPath `
-        -ThreadId $threadContext.ThreadId -PreviousResultFile $previousResultFile -SessionPointerFile $sessionPointerFile
+        -ThreadId $threadContext.ThreadId -PreviousResultFile $previousResultFile -SessionPointerFile $sessionPointerFile -TestAdapter $TestAdapter
     exit ([int]$LASTEXITCODE)
 } finally {
     $runMutex.ReleaseMutex()

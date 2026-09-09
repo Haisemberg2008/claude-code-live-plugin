@@ -84,6 +84,7 @@ $prior = [pscustomobject]@{
         responsibilities = New-TestResponsibilities
     }
     modelPolicy = $null
+    allowedCommands = @()
 }
 
 $compatible = Test-ClaudeLiveAutomaticResume -CurrentContract $contract -Workspace 'C:\workspace-a' -ThreadId $threadA.ThreadId -PriorResult $prior

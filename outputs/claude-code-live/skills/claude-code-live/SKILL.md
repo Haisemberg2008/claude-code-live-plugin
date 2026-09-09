@@ -99,4 +99,6 @@ Para continuar na mesma tarefa Codex, crie outro job compatível em outra pasta 
 
 ## Aceitacao
 
+A compatibilidade de retomada inclui `allowedCommands`, normalizados e ordenados com suas responsabilidades. Resultados antigos sem esse campo nao retomam automaticamente; para retomada explicita exigem `approvalRevision` maior, assim como mudancas nos comandos. Falhas de preparacao geram estado terminal sanitizado e preservam o ponteiro da ultima sessao confirmada. `startedAt` alimenta o tempo decorrido do painel e `usageCheckedAt` data a tentativa de consulta inicial. Nao apresentar esses limites como monitoramento continuo nem prometer troca durante uma execucao. O painel identifica a tarefa no titulo e le novos bytes do log incrementalmente. Os adaptadores e parametros de teste sao exclusivos do harness local confiavel, nunca do job delegado.
+
 Verifique os arquivos e execute os testes relevantes independentemente do relato do Claude. Registre a distincao entre transporte concluido, ferramentas executadas e comportamento aprovado. Use o fluxo normal do projeto para revisao, commit e eventual deploy; a skill nao os executa automaticamente. Para diagnostico da instalacao, use a verificacao de saude do CLI antes de alterar configuracoes; para limite de custo em chamadas por API, defina um teto somente quando o usuario o tiver autorizado.
