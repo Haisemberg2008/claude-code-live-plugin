@@ -83,6 +83,24 @@ function Write-ClaudeLiveSessionPointer {
     [IO.File]::Move($temp, $PointerFile, $true)
 }
 
+function ConvertTo-ClaudeLiveCommandRecord {
+    param($Commands)
+    @($Commands | ForEach-Object {
+        [pscustomobject][ordered]@{ rule = [string]$_.Rule; responsibility = ([string]$_.Responsibility).ToLowerInvariant() }
+    } | Sort-Object -Property rule,responsibility -CaseSensitive -Unique)
+}
+
+function Assert-ClaudeLiveResumeCommands {
+    param($CurrentContract, $PriorResult)
+    $known = $null -ne $PriorResult.PSObject.Properties['allowedCommands']
+    $current = ConvertTo-Json -InputObject @(ConvertTo-ClaudeLiveCommandRecord $CurrentContract.AllowedCommands) -Compress
+    $previous = ConvertTo-Json -InputObject @(ConvertTo-ClaudeLiveCommandRecord $PriorResult.allowedCommands) -Compress
+    if ((-not $known -or $current -cne $previous) -and
+        $CurrentContract.Coordination.ApprovalRevision -le $PriorResult.coordination.approvalRevision) {
+        throw 'Changed or legacy command permissions require a newer approval revision.'
+    }
+}
+
 function Get-ClaudeLiveSessionFingerprint {
     param(
         [Parameter(Mandatory)]$Contract,
@@ -95,6 +113,7 @@ function Get-ClaudeLiveSessionFingerprint {
         profile = [string]$Contract.Profile
         effort = [string]$Contract.Effort
         requestedModel = [string]$Contract.Model
+        allowedCommands = @(ConvertTo-ClaudeLiveCommandRecord $Contract.AllowedCommands)
         modelPolicy = Get-ClaudeLiveModelPolicyFingerprint -ModelPolicy $ModelPolicy
         coordination = [pscustomobject][ordered]@{
             phase = $normalizedCoordination.Phase
@@ -115,6 +134,7 @@ function Test-ClaudeLiveAutomaticResume {
         [Parameter(Mandatory)]$PriorResult
     )
     if (-not $PriorResult.sessionId -or -not $PriorResult.coordination -or -not $PriorResult.codexThreadId) { return $false }
+    if ($null -eq $PriorResult.PSObject.Properties['allowedCommands']) { return $false }
     if (-not [string]::Equals([string]$PriorResult.workspace, $Workspace, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     if (-not [string]::Equals([string]$PriorResult.codexThreadId, $ThreadId, [StringComparison]::OrdinalIgnoreCase)) { return $false }
 
@@ -124,10 +144,11 @@ function Test-ClaudeLiveAutomaticResume {
             Profile = [string]$PriorResult.profile
             Effort = [string]$PriorResult.effort
             Model = [string]$PriorResult.requestedModel
+            AllowedCommands = $PriorResult.allowedCommands
         }
         $currentFingerprint = Get-ClaudeLiveSessionFingerprint -Contract $CurrentContract -Coordination $CurrentContract.Coordination -ModelPolicy $CurrentContract.ModelPolicy
         $priorFingerprint = Get-ClaudeLiveSessionFingerprint -Contract $priorContract -Coordination $PriorResult.coordination -ModelPolicy $PriorResult.modelPolicy
-        return $currentFingerprint -eq $priorFingerprint
+        return $currentFingerprint -ceq $priorFingerprint
     } catch {
         return $false
     }

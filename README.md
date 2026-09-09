@@ -174,9 +174,9 @@ Cada pasta de execução preserva:
 
 ## Retomada
 
-Dentro da mesma tarefa Codex, o plugin retoma automaticamente a última sessão Claude somente quando thread, workspace, modo, perfil, effort, modelo/política, plano, revisão e responsáveis são idênticos. Caso contrário inicia uma sessão nova.
+Dentro da mesma tarefa Codex, o plugin retoma automaticamente a última sessão Claude somente quando thread, workspace, modo, perfil, effort, modelo/política, plano, revisão, responsáveis e comandos autorizados são idênticos. A ordem dos comandos não altera a compatibilidade. Caso contrário inicia uma sessão nova.
 
-Use `resumeFrom` para uma retomada explícita no mesmo workspace. Resultados novos vinculados a outra tarefa Codex são rejeitados; resultados legados sem `codexThreadId` continuam aceitos após as verificações existentes.
+Use `resumeFrom` para uma retomada explícita no mesmo workspace. Resultados vinculados a outra tarefa Codex são rejeitados. Comandos alterados ou resultados legados sem `allowedCommands` exigem revisão de aprovação maior para retomada explícita; resultados sem esse registro nunca são retomados automaticamente.
 
 - Sem mudança, preserve `scopeId`, `approvalRevision`, plano e matriz.
 - Com mudança, obtenha nova aprovação e aumente `approvalRevision`.
@@ -239,7 +239,15 @@ pwsh -NoProfile -File '.\outputs\claude-code-live\scripts\validate.ps1'
 pwsh -NoProfile -File '.\outputs\claude-code-live\scripts\smoke-test.ps1'
 ```
 
-O smoke test valida contrato, parser de uso, presença do Claude CLI e opções necessárias sem autenticar ou iniciar sessão Claude. Fluxos reais de permissão, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+O smoke test valida contrato, parser de uso, presença do Claude CLI e opções necessárias sem autenticar ou iniciar sessão Claude. Inclui testes com CLI simulado para concorrência, cancelamento isolado, retomada, falhas de preparação e leitura incremental UTF-8. Fluxos reais de permissão, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+
+### Confiabilidade do executor e do painel
+
+O executor grava `STARTING` antes das consultas externas. Falhas de preparação produzem resultado terminal sanitizado com `failureStage`; não substituem o ponteiro da última sessão confirmada pelo CLI. `startedAt` permite que o painel calcule o tempo decorrido mesmo sem eventos novos.
+
+`usageCheckedAt` registra o horário da tentativa de consulta inicial. A capacidade não é monitorada continuamente: é reavaliada em cada início ou retomada, sem interromper uma execução longa para trocar de modelo. O painel identifica a tarefa no título e lê somente novos bytes do log, preservando caracteres UTF-8 e reiniciando a leitura na troca de execução ou truncamento detectado.
+
+Os parâmetros `TestAdapter`, `TestStateRoot` e `NoPanel` são exclusivos do harness de testes. O adaptador é um script local confiável executado pelo coordenador, nunca um campo do job. O harness usa processos simulados e estado temporário; `TestStateRoot` e `NoPanel` exigem adaptador explícito.
 
 ## Compatibilidade
 

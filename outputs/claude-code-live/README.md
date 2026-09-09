@@ -103,9 +103,9 @@ Cada execução preserva `acompanhamento.txt`, `status.json` e `resultado.json`.
 
 ## Retomar
 
-O plugin retoma automaticamente a última sessão da mesma tarefa apenas quando toda a configuração aprovada continua idêntica. Mudança de workspace, escopo, revisão, responsáveis, modo, perfil, effort ou modelo inicia uma sessão nova.
+O plugin retoma automaticamente a última sessão da mesma tarefa apenas quando toda a configuração aprovada continua idêntica. Mudança de workspace, escopo, revisão, responsáveis, modo, perfil, effort, modelo ou comandos autorizados inicia uma sessão nova. A lista de comandos e responsabilidades é normalizada e ordenada no resultado.
 
-Use `resumeFrom` para retomada explícita no mesmo workspace. Uma sessão vinculada a outra tarefa Codex é rejeitada; resultados legados sem identidade permanecem compatíveis com as verificações anteriores.
+Use `resumeFrom` para retomada explícita no mesmo workspace. Uma sessão vinculada a outra tarefa Codex é rejeitada. Mudança de comandos ou resultado legado sem `allowedCommands` exige revisão maior na retomada explícita. Sem esse campo, a retomada automática é desabilitada.
 
 - Sem mudança, mantenha `scopeId`, `approvalRevision`, plano e matriz.
 - Qualquer mudança exige nova aprovação e revisão maior.
@@ -157,7 +157,11 @@ pwsh -NoProfile -File '<plugin>\scripts\validate.ps1'
 pwsh -NoProfile -File '<plugin>\scripts\smoke-test.ps1'
 ```
 
-O smoke test não autentica nem inicia sessão Claude. Testes reais de permissões, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+O smoke test não autentica nem inicia sessão Claude. Um CLI simulado verifica concorrência, cancelamento isolado, retomada e falhas de preparação. O leitor incremental é testado com UTF-8 dividido entre escritas, truncamento e troca de log. Testes reais de permissões, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+
+O estado inicial é gravado antes da consulta de uso. Falhas de preparação deixam estado terminal com `failureStage` sanitizado e preservam a última sessão confirmada. `startedAt` alimenta o tempo decorrido no título do painel; `usageCheckedAt` data a tentativa de consulta inicial. Os limites são reavaliados em cada início/retomada, sem troca no meio da execução. O painel identifica a tarefa e lê somente os novos bytes do log.
+
+`TestAdapter` é um script local confiável, exclusivo do harness; não pode ser fornecido pelo job. `TestStateRoot` e `NoPanel` requerem adaptador explícito. Os testes usam estado temporário e não consultam a conta Claude.
 
 ## Migração
 
