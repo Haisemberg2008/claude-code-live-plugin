@@ -3,7 +3,9 @@ name: claude-code-live
 description: Use when coordinating authorized Claude Code CLI work that needs explicit responsibility assignment, an approved plan, visible progress, scoped tools, controlled permissions, resumption, interruption, or background-session management.
 ---
 
-# Claude Code ao vivo
+# OpenAInthropic
+
+OpenAInthropic e a marca visivel desta integracao local independente para o Codex coordenar Opus e Fable; nao e produto oficial nem representa parceria entre OpenAI e Anthropic. O identificador tecnico da skill permanece `claude-code-live`.
 
 Use o CLI instalado e a autenticacao existente. A skill coordena tanto sessoes locais quanto sessoes na nuvem; escolha o destino por tarefa, nao por preferencia fixa. Nao transforme isso em automacao recorrente. O usuario acompanha uma janela de terminal; o Codex coordena, le os resultados e verifica os artefatos. O encerramento do processo nunca prova que a tarefa foi aprovada.
 

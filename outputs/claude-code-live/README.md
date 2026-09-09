@@ -1,6 +1,8 @@
-# Claude Code Live para Codex
+# OpenAInthropic
 
-Plugin para coordenar Claude Code local ou em nuvem com planejamento aprovado, responsáveis explícitos, permissões mínimas, acompanhamento e retomada controlados.
+**Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar Claude Code local ou em nuvem, com planejamento aprovado, responsáveis explícitos, permissões mínimas, acompanhamento e retomada controlados. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
+
+O identificador técnico permanece `claude-code-live`, preservando instalações, comandos, caminhos, automações e sessões existentes.
 
 ## Fluxo obrigatório
 
