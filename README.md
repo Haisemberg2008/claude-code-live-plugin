@@ -1,6 +1,6 @@
 # OpenAInthropic
 
-![Fluxo do OpenAInthropic: planejamento, aprovação e coordenação de sessões Opus e Fable](outputs/claude-code-live/assets/openainthropic-workflow.png)
+![Fluxo do OpenAInthropic: Codex Terra e Sol planejam, supervisionam e revisam sessões separadas do Claude Opus e Fable](outputs/claude-code-live/assets/openainthropic-workflow-terra-sol.png)
 
 **Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
