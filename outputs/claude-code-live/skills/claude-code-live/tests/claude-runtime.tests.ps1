@@ -51,6 +51,13 @@ function Wait-Running($Name) {
     throw "Did not start: $Name"
 }
 try {
+    $timeState = [pscustomobject]@{status='RUNNING';startedAt=[DateTimeOffset]::UtcNow.AddSeconds(-10).ToString('o');elapsedSeconds=0}
+    foreach ($stateVariant in @($timeState, ($timeState | ConvertTo-Json | ConvertFrom-Json))) {
+        $elapsed = Get-ClaudeElapsedSeconds $stateVariant
+        Assert-True ($elapsed -ge 10 -and $elapsed -lt 15) 'Elapsed time must handle both ISO strings and parsed JSON dates'
+    }
+    $timeState.status='COMPLETED'; $timeState.elapsedSeconds=5
+    Assert-True ((Get-ClaudeElapsedSeconds $timeState) -eq 5) 'Terminal elapsed time must stop advancing'
     'test' | Set-Content (Join-Path $root 'prompt.txt')
     $job = New-Job 'a'
     $null = New-Job 'b'

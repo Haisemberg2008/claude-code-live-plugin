@@ -2,6 +2,14 @@ function New-ClaudeLogCursor {
     @{ Path = $null; Offset = 0L; Decoder = [Text.Encoding]::UTF8.GetDecoder() }
 }
 
+function Get-ClaudeElapsedSeconds {
+    param($State)
+    if ($State.startedAt -and $State.status -in @('STARTING','RUNNING')) {
+        return [math]::Max(0, [math]::Floor(([DateTimeOffset]::UtcNow - [DateTimeOffset]$State.startedAt).TotalSeconds))
+    }
+    return $State.elapsedSeconds
+}
+
 function Read-ClaudeLogDelta {
     param([hashtable]$Cursor, [string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }

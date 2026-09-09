@@ -50,10 +50,7 @@ try {
                 $stateFile = Join-Path $currentRun 'status.json'
                 if (Test-Path -LiteralPath $stateFile) {
                     $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
-                    $elapsed = $state.elapsedSeconds
-                    if ($state.startedAt -and $state.status -in @('STARTING','RUNNING')) {
-                        $elapsed = [math]::Floor(([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($state.startedAt)).TotalSeconds)
-                    }
+                    $elapsed = Get-ClaudeElapsedSeconds -State $state
                     $Host.UI.RawUI.WindowTitle = 'Claude Code | ' + $PanelKey + ' | ' + $state.status + ' | ' + $elapsed + 's'
                 }
             }
