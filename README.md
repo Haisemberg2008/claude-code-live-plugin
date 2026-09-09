@@ -2,7 +2,7 @@
 
 ![Fluxo do OpenAInthropic: planejamento, aprovação e coordenação de sessões Opus e Fable](outputs/claude-code-live/assets/openainthropic-workflow.png)
 
-**Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex, com planejamento aprovado, responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
+**Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
 O identificador técnico permanece `claude-code-live`, preservando instalações, comandos, caminhos, automações e sessões existentes.
 
@@ -15,6 +15,7 @@ O pacote instalável fica em [`outputs/claude-code-live`](outputs/claude-code-li
 - Separa leitura, verificação por comandos e edição em modos diferentes.
 - Limita ferramentas e comandos por allowlist explícita.
 - Mantém um painel e uma sessão Claude independentes para cada tarefa Codex.
+- Permite que modelos Codex, como Terra e Sol, planejem, deleguem, acompanhem e revisem o trabalho executado por Opus e Fable.
 - Pode selecionar Fable ou Opus antes de iniciar ou retomar, conforme limites confirmados pelo `/usage`.
 - Permite interromper e retomar uma sessão sem repetir mutações automaticamente.
 - Mantém commit, push, PR, deploy, publicação e outras mutações externas fora do Claude.

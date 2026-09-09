@@ -1,15 +1,15 @@
 {
   "name": "claude-code-live",
-  "version": "0.1.0+codex.20260909133118",
-  "description": "OpenAInthropic coordena Codex com Opus e Fable sob plano, responsabilidades e permissoes aprovados.",
+  "version": "0.1.0+codex.20260909133424",
+  "description": "OpenAInthropic permite que modelos Codex, como Terra e Sol, coordenem Opus e Fable sob plano, responsabilidades e permissoes aprovados.",
   "author": {
     "name": "YOU Telecom"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "OpenAInthropic",
-    "shortDescription": "Codex com Opus e Fable, sob plano aprovado.",
-    "longDescription": "Integracao local independente para o Codex coordenar Opus e Fable. Defina quem planeja, inspeciona, implementa, testa, revisa, commita, envia e publica; aprove o plano e execute Claude Code com ferramentas controladas.",
+    "shortDescription": "Terra e Sol coordenando Opus e Fable.",
+    "longDescription": "Integracao local independente para modelos Codex, como Terra e Sol, planejarem, supervisionarem e revisarem sessoes Claude Opus e Fable. Defina quem planeja, inspeciona, implementa, testa, revisa, commita, envia e publica; aprove o plano e execute Claude Code com ferramentas controladas.",
     "developerName": "YOU Telecom",
     "category": "Productivity",
     "capabilities": [
@@ -18,7 +18,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Use OpenAInthropic para o Codex planejar esta tarefa, definir os responsaveis e coordenar Opus ou Fable somente depois da minha aprovacao.",
+      "Use OpenAInthropic para um modelo Codex, como Terra ou Sol, planejar esta tarefa, definir os responsaveis e coordenar Opus ou Fable somente depois da minha aprovacao.",
       "Use OpenAInthropic para planejar e atribuir esta tarefa antes de iniciar e acompanhar uma sessao Claude Code em nuvem."
     ],
     "brandColor": "#6D28D9",
