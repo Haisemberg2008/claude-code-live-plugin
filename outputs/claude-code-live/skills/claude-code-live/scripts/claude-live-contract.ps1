@@ -98,6 +98,50 @@ function ConvertTo-ClaudeLiveModelPolicy {
     }
 }
 
+function ConvertTo-ClaudeLivePositiveInteger {
+    param($Value, [Parameter(Mandatory)][string]$FieldName)
+    if ($Value -isnot [byte] -and $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64]) {
+        throw "$FieldName must be a positive integer."
+    }
+    $number = [int64]$Value
+    if ($number -lt 1 -or $number -gt [int]::MaxValue) { throw "$FieldName must be a positive integer." }
+    return [int]$number
+}
+
+function ConvertTo-ClaudeLiveTimeoutPolicy {
+    param($Value = $null, $TimeoutSeconds = $null)
+    if ($null -ne $Value -and $null -ne $TimeoutSeconds) {
+        throw 'Use either timeoutSeconds or timeoutPolicy, never both.'
+    }
+    if ($null -ne $TimeoutSeconds) {
+        return [pscustomobject][ordered]@{
+            Mode = 'fixed'
+            TimeoutSeconds = ConvertTo-ClaudeLivePositiveInteger -Value $TimeoutSeconds -FieldName 'timeoutSeconds'
+        }
+    }
+    if ($null -eq $Value) { $Value = [pscustomobject]@{ mode = 'adaptive' } }
+    $allowedFields = @('mode','renewEverySeconds','idleAfterSeconds','hardStopAfterSeconds')
+    foreach ($field in @($Value.PSObject.Properties.Name)) {
+        if ($field -notin $allowedFields) { throw "timeoutPolicy contains unexpected field $field." }
+    }
+    $mode = [string](Get-ClaudeLiveProperty -InputObject $Value -Name 'mode')
+    if ($mode -ne 'adaptive') { throw 'timeoutPolicy.mode must be adaptive.' }
+    $renewValue = Get-ClaudeLiveProperty -InputObject $Value -Name 'renewEverySeconds'
+    $idleValue = Get-ClaudeLiveProperty -InputObject $Value -Name 'idleAfterSeconds'
+    $hardValue = Get-ClaudeLiveProperty -InputObject $Value -Name 'hardStopAfterSeconds'
+    $renew = ConvertTo-ClaudeLivePositiveInteger -Value $(if ($null -eq $renewValue) { 1800 } else { $renewValue }) -FieldName 'timeoutPolicy.renewEverySeconds'
+    $idle = ConvertTo-ClaudeLivePositiveInteger -Value $(if ($null -eq $idleValue) { 1200 } else { $idleValue }) -FieldName 'timeoutPolicy.idleAfterSeconds'
+    $hard = ConvertTo-ClaudeLivePositiveInteger -Value $(if ($null -eq $hardValue) { 7200 } else { $hardValue }) -FieldName 'timeoutPolicy.hardStopAfterSeconds'
+    if ($renew -ge $hard) { throw 'timeoutPolicy.renewEverySeconds must be less than hardStopAfterSeconds.' }
+    if ($idle -ge $hard) { throw 'timeoutPolicy.idleAfterSeconds must be less than hardStopAfterSeconds.' }
+    [pscustomobject][ordered]@{
+        Mode = 'adaptive'
+        RenewEverySeconds = $renew
+        IdleAfterSeconds = $idle
+        HardStopAfterSeconds = $hard
+    }
+}
+
 function Get-ClaudeLiveModelPolicyFingerprint {
     param($ModelPolicy)
     if ($null -eq $ModelPolicy) { return 'null' }
@@ -198,6 +242,9 @@ function Resolve-ClaudeLiveContract {
     if ($codexThreadId -and $codexThreadId -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$') {
         throw 'codexThreadId must contain only letters, numbers, underscores, or hyphens and be at most 128 characters.'
     }
+    $timeoutPolicy = ConvertTo-ClaudeLiveTimeoutPolicy `
+        -Value (Get-ClaudeLiveProperty -InputObject $Job -Name 'timeoutPolicy') `
+        -TimeoutSeconds (Get-ClaudeLiveProperty -InputObject $Job -Name 'timeoutSeconds')
     $commands = @()
     foreach ($commandValue in @($Job.allowedCommands | Where-Object { $null -ne $_ })) {
         if ($mode -notin @('verify','local')) {
@@ -231,6 +278,7 @@ function Resolve-ClaudeLiveContract {
         Mode = $mode
         Profile = $profile
         CodexThreadId = $codexThreadId
+        TimeoutPolicy = $timeoutPolicy
         AllowedCommands = @($commands)
         Coordination = $coordination
     }

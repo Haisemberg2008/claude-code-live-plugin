@@ -60,7 +60,12 @@ Todos usam `dontAsk`, `--permission-prompts none` e allowlist. O perfil `restric
       "responsibility": "testing"
     }
   ],
-  "timeoutSeconds": 1800
+  "timeoutPolicy": {
+    "mode": "adaptive",
+    "renewEverySeconds": 1800,
+    "idleAfterSeconds": 1200,
+    "hardStopAfterSeconds": 7200
+  }
 }
 ```
 
@@ -73,6 +78,8 @@ Todos usam `dontAsk`, `--permission-prompts none` e allowlist. O perfil `restric
 - Regras que revelem commit, push, criação ou merge de PR, deploy ou publicação são bloqueadas.
 
 Scripts permitidos ainda precisam ser inspecionados. A trava textual não substitui revisão do conteúdo executado.
+
+Se `timeoutPolicy` for omitido, esses mesmos valores adaptativos são usados por padrão. Cada evento JSON válido renova a evidência de atividade; 20 minutos sem eventos encerram por `inactivity`, e 2 horas encerram por `hard_limit` mesmo com atividade. A preparação não consome esse relógio. Para compatibilidade, `timeoutSeconds` ainda define um limite fixo positivo, mas não pode ser combinado com `timeoutPolicy`. Um `TIMEOUT` preserva sessão, arquivos e logs para revisão; nunca inicia outra execução automaticamente.
 
 ## Seleção opcional por quota
 
@@ -99,7 +106,7 @@ pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' 
   -RunDirectory '<pasta-nova>'
 ```
 
-O contrato é validado antes de abrir o painel ou iniciar o Claude. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo e responsáveis.
+O contrato é validado antes de abrir o painel ou iniciar o Claude. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo, responsáveis e renovações do tempo adaptativo.
 
 Cada tarefa Codex usa `CODEX_THREAD_ID` para manter diretório, painel, mutex e sessão Claude próprios. Jobs da mesma tarefa são serializados; tarefas diferentes podem executar ao mesmo tempo. A leitura de quota permanece globalmente serializada. Fora do Codex, `codexThreadId` fornece uma identidade estável opcional; sem identidade, cada chamada recebe uma chave isolada de uso único.
 
@@ -161,7 +168,7 @@ pwsh -NoProfile -File '<plugin>\scripts\validate.ps1'
 pwsh -NoProfile -File '<plugin>\scripts\smoke-test.ps1'
 ```
 
-O smoke test não autentica nem inicia sessão Claude. Um CLI simulado verifica concorrência, cancelamento isolado, retomada e falhas de preparação. O leitor incremental é testado com UTF-8 dividido entre escritas, truncamento e troca de log. Testes reais de permissões, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+O smoke test não autentica nem inicia sessão Claude. Um CLI simulado verifica concorrência, cancelamento isolado, retomada, falhas de preparação, renovação adaptativa, inatividade, teto absoluto e limite fixo legado. O leitor incremental é testado com UTF-8 dividido entre escritas, truncamento e troca de log. Testes reais de permissões, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
 
 O estado inicial é gravado antes da consulta de uso. Falhas de preparação deixam estado terminal com `failureStage` sanitizado e preservam a última sessão confirmada. `startedAt` alimenta o tempo decorrido no título do painel; `usageCheckedAt` data a tentativa de consulta inicial. Os limites são reavaliados em cada início/retomada, sem troca no meio da execução. O painel identifica a tarefa e lê somente os novos bytes do log.
 

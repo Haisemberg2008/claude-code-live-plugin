@@ -19,7 +19,8 @@ Campos do job:
 - `allowedCommands`: objetos com `rule` e `responsibility`, somente em `verify` ou `local`. Inspecione o script antes; nao permita Bash irrestrito, curingas ou interpretadores genericos.
 - `resumeFrom`: caminho para `resultado.json` anterior no mesmo workspace.
 - `codexThreadId`: fallback opcional para atribuir identidade estavel fora do Codex; dentro dele, `CODEX_THREAD_ID` e automatico.
-- `timeoutSeconds`: opcional; padrao de 1800 segundos.
+- `timeoutPolicy`: politica adaptativa opcional; por padrao renova em 1800 segundos com atividade, encerra apos 1200 segundos sem eventos e para em 7200 segundos no total.
+- `timeoutSeconds`: limite fixo legado, inteiro positivo; nao combinar com `timeoutPolicy`.
 
 Modos de ferramenta:
 
@@ -52,6 +53,21 @@ Use somente quando o usuario tiver aprovado essa politica no job:
 ```
 
 O limite padrao e 3 e aceita inteiros de 1 a 20. O executor usa Fable acima do limite; troca para Opus quando somente o restante efetivo do Fable esta no limite ou abaixo; e bloqueia quando sessao ou semana geral tambem estao no limite ou abaixo. Falha em `/usage` bloqueia o job quota-aware antes de abrir uma sessao Claude. A decisao e refeita em cada retomada, portanto uma renovacao devolve o job ao Fable. O painel e os arquivos de estado registram somente a decisao e os percentuais sanitizados. Alterar essa configuracao ao retomar requer `approvalRevision` maior.
+
+Politica de tempo padrao:
+
+```json
+{
+  "timeoutPolicy": {
+    "mode": "adaptive",
+    "renewEverySeconds": 1800,
+    "idleAfterSeconds": 1200,
+    "hardStopAfterSeconds": 7200
+  }
+}
+```
+
+O relogio comeca depois de iniciar o processo Claude. Qualquer evento JSON valido atualiza `lastActivityAt`; cada renovacao atualiza `nextRenewalAt` e `extensionCount`. Inatividade, teto absoluto e limite fixo legado produzem `timeoutReason` igual a `inactivity`, `hard_limit` ou `fixed_limit`. Nao ha retomada automatica imediata: o Codex deve revisar o que mudou e iniciar outro job compativel somente depois disso.
 
 Exemplo de execucao de testes sem edicao pelo Claude:
 
@@ -108,6 +124,6 @@ O script abre ou reutiliza um painel visivel por tarefa Codex. Use uma pasta de 
 
 Para interromper, pressione `Q` no painel ou crie `stop.request` na pasta exata da execucao. `Ctrl+C` no executor tambem aciona a limpeza. `X` ou fechar o painel encerra apenas a visualizacao. Depois de queda ou fechamento forcado, verifique os processos antes de retomar.
 
-`resultado.json` registra status, `codexThreadId`, modo de retomada, sessao, workspace, modelo, perfil, ferramentas, falhas, negativas de permissao e resposta final. Tambem registra `allowedCommands` normalizados e ordenados, `startedAt` e `usageCheckedAt`. `session.json` aponta para a ultima sessao confirmada pelo CLI e e preservado em falhas de preparacao. Um novo job exatamente compativel retoma automaticamente; comandos diferentes iniciam sessao nova. Resultados sem `allowedCommands` nao retomam automaticamente. Retomada explicita com comandos diferentes ou sem esse registro exige revisao maior.
+`resultado.json` registra status, `codexThreadId`, modo de retomada, sessao, workspace, modelo, perfil, politica de tempo, ultima atividade, renovacoes, motivo terminal, ferramentas, falhas, negativas de permissao e resposta final. Tambem registra `allowedCommands` normalizados e ordenados, `startedAt` e `usageCheckedAt`. `session.json` aponta para a ultima sessao confirmada pelo CLI e e preservado em falhas de preparacao. Um novo job exatamente compativel retoma automaticamente; comandos diferentes iniciam sessao nova. Resultados sem `allowedCommands` nao retomam automaticamente. Retomada explicita com comandos diferentes ou sem esse registro exige revisao maior.
 
 O estado `STARTING` precede consultas externas. Falhas de preparacao geram resultado terminal e `failureStage` sanitizado. O painel calcula o tempo decorrido, identifica a tarefa no titulo e le incrementalmente UTF-8. A consulta de limite e uma fotografia inicial, datada por `usageCheckedAt`, refeita em cada inicio/retomada; nao existe troca durante a execucao. Os parametros `TestAdapter`, `TestStateRoot` e `NoPanel` sao exclusivos do harness com CLI simulado; nunca inclui-los no job de trabalho.

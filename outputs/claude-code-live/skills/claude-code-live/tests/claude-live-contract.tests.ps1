@@ -182,6 +182,72 @@ $defaults = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
 })
 if ($defaults.Model -ne 'fable') { throw 'The default Claude model must be fable.' }
 if ($defaults.Effort -ne 'high') { throw 'The default effort must be high.' }
+if ($defaults.TimeoutPolicy.Mode -ne 'adaptive' -or
+    $defaults.TimeoutPolicy.RenewEverySeconds -ne 1800 -or
+    $defaults.TimeoutPolicy.IdleAfterSeconds -ne 1200 -or
+    $defaults.TimeoutPolicy.HardStopAfterSeconds -ne 7200) {
+    throw 'Jobs without a timeout setting must use the safe adaptive defaults.'
+}
+
+$adaptiveTimeout = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
+    timeoutPolicy = [pscustomobject]@{
+        mode = 'adaptive'
+        renewEverySeconds = 60
+        idleAfterSeconds = 30
+        hardStopAfterSeconds = 180
+    }
+})
+if ($adaptiveTimeout.TimeoutPolicy.Mode -ne 'adaptive' -or
+    $adaptiveTimeout.TimeoutPolicy.RenewEverySeconds -ne 60 -or
+    $adaptiveTimeout.TimeoutPolicy.IdleAfterSeconds -ne 30 -or
+    $adaptiveTimeout.TimeoutPolicy.HardStopAfterSeconds -ne 180) {
+    throw 'An explicit adaptive timeout policy must be normalized and preserved.'
+}
+
+$fixedTimeout = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+    mode = 'read'
+    coordination = New-Coordination
+    timeoutSeconds = 90
+})
+if ($fixedTimeout.TimeoutPolicy.Mode -ne 'fixed' -or $fixedTimeout.TimeoutPolicy.TimeoutSeconds -ne 90) {
+    throw 'Legacy timeoutSeconds must retain fixed-deadline behavior.'
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination
+        timeoutSeconds = 90
+        timeoutPolicy = [pscustomobject]@{ mode = 'adaptive' }
+    }) | Out-Null
+} 'timeoutSeconds.*timeoutPolicy|timeoutPolicy.*timeoutSeconds' 'fixed and adaptive timeout settings cannot be combined'
+
+foreach ($invalidPolicy in @(
+    [pscustomobject]@{ mode = 'fixed' },
+    [pscustomobject]@{ mode = 'adaptive'; renewEverySeconds = 0 },
+    [pscustomobject]@{ mode = 'adaptive'; idleAfterSeconds = '30' },
+    [pscustomobject]@{ mode = 'adaptive'; hardStopAfterSeconds = 10; renewEverySeconds = 20 },
+    [pscustomobject]@{ mode = 'adaptive'; hardStopAfterSeconds = 10; idleAfterSeconds = 20 },
+    [pscustomobject]@{ mode = 'adaptive'; extra = 1 }
+)) {
+    Assert-Throws {
+        Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+            mode = 'read'
+            coordination = New-Coordination
+            timeoutPolicy = $invalidPolicy
+        }) | Out-Null
+    } 'timeoutPolicy' 'malformed adaptive timeout policies must be rejected'
+}
+
+Assert-Throws {
+    Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
+        mode = 'read'
+        coordination = New-Coordination
+        timeoutSeconds = 0
+    }) | Out-Null
+} 'timeoutSeconds' 'fixed timeoutSeconds must remain a positive integer'
 
 $override = Resolve-ClaudeLiveContract -Job ([pscustomobject]@{
     mode = 'read'

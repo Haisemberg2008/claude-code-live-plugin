@@ -11,7 +11,8 @@ $usageProvider = {
     $lockPath = Join-Path $env:CLAUDE_LIVE_TEST_ROOT 'usage.lock'
     $lease = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
-        Start-Sleep -Milliseconds 150
+        $usageDelay = if ($env:CLAUDE_LIVE_TEST_USAGE_DELAY) { [int]$env:CLAUDE_LIVE_TEST_USAGE_DELAY } else { 150 }
+        Start-Sleep -Milliseconds $usageDelay
         ConvertFrom-ClaudeUsageText -Text "Current session: 10% used resets tomorrow`nCurrent week (all models): 20% used resets tomorrow`nCurrent week (Fable): 25% used resets tomorrow"
     } finally { $lease.Dispose(); [IO.File]::Delete($lockPath) }
 }

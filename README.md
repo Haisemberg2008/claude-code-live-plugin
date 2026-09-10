@@ -81,7 +81,8 @@ Campos principais:
 - `allowedCommands`: objetos com regra Bash exata e responsabilidade correspondente.
 - `resumeFrom`: caminho para um `resultado.json` anterior do mesmo workspace.
 - `codexThreadId`: fallback opcional para execução fora do Codex; dentro do Codex, `CODEX_THREAD_ID` é usado automaticamente.
-- `timeoutSeconds`: tempo limite; padrão de 1800 segundos.
+- `timeoutPolicy`: política adaptativa opcional; sem configuração usa renovação a cada 1800 segundos, inatividade de 1200 segundos e teto absoluto de 7200 segundos.
+- `timeoutSeconds`: compatibilidade legada para um limite fixo positivo; não combine com `timeoutPolicy`.
 
 Exemplo de testes sem conceder edição ao Claude:
 
@@ -143,6 +144,23 @@ A capacidade compartilhada é o menor restante entre sessão e semana geral. O r
 
 O painel, `status.json` e `resultado.json` registram política, percentuais sanitizados, modelo solicitado, modelo selecionado e motivo. Alterar política ou limite ao retomar exige nova aprovação e `approvalRevision` maior.
 
+### Tempo de execução adaptativo
+
+Sem configuração explícita, o relógio de execução do Claude começa somente depois que o processo é iniciado. A cada 30 minutos, o plugin renova o prazo se recebeu um evento JSON válido nos últimos 20 minutos. A sessão pode continuar ativa por no máximo 2 horas:
+
+```json
+{
+  "timeoutPolicy": {
+    "mode": "adaptive",
+    "renewEverySeconds": 1800,
+    "idleAfterSeconds": 1200,
+    "hardStopAfterSeconds": 7200
+  }
+}
+```
+
+Eventos de texto, ferramentas e conclusão contam como atividade. Inatividade encerra com `timeoutReason: "inactivity"`; o teto absoluto usa `timeoutReason: "hard_limit"`. Um job legado com `timeoutSeconds` mantém o limite fixo e usa `timeoutReason: "fixed_limit"`. Em todos os casos, `TIMEOUT` preserva logs, alterações e uma sessão confirmada, mas exige revisão do Codex antes da retomada; o plugin não inicia outra execução automaticamente.
+
 ### Fases e aprovação
 
 - `planning` aceita somente `chat` ou `read`; a matriz já existe, mas o plano final pode não estar aprovado.
@@ -164,15 +182,15 @@ pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' 
 
 O preflight valida o contrato antes de abrir o painel ou iniciar o Claude. Cada tarefa Codex possui diretório de estado, painel e mutex próprios; jobs da mesma tarefa são serializados, enquanto tarefas diferentes podem executar simultaneamente. A consulta de quota continua protegida por um mutex global porque os limites pertencem à conta, não à tarefa.
 
-O painel mostra modo, perfil, modelo efetivo, fase, escopo, revisão aprovada, resumo do plano, responsáveis, limites de uso sanitizados, ferramentas e mudanças de estado.
+O painel mostra modo, perfil, modelo efetivo, fase, escopo, revisão aprovada, resumo do plano, responsáveis, limites de uso sanitizados, política de tempo, renovações, ferramentas e mudanças de estado.
 
 Pressione `Q` para solicitar parada. `X` ou fechar o painel encerra apenas a visualização. `Ctrl+C` no executor tenta encerrar o processo filho e seus descendentes.
 
 Cada pasta de execução preserva:
 
 - `acompanhamento.txt`: saída pública acompanhável.
-- `status.json`: estado corrente sanitizado.
-- `resultado.json`: resultado, sessão, contrato, ferramentas e contadores.
+- `status.json`: estado corrente sanitizado, incluindo última atividade e próxima renovação.
+- `resultado.json`: resultado, sessão, contrato, política de tempo, motivo terminal, ferramentas e contadores.
 - `stop.request`: solicitação de interrupção, quando criada.
 
 `FAIL`, `BLOCKED`, `CANCELLED` e `TIMEOUT` nunca são sucesso. `COMPLETED` confirma apenas que o CLI terminou.

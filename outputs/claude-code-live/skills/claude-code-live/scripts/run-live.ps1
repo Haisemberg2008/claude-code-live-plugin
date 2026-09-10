@@ -23,6 +23,7 @@ $started = $false
 $sessionConfirmed = $false
 $process = $null
 $clock = [Diagnostics.Stopwatch]::StartNew()
+$runtimeClock = $null
 $seenTools = [Collections.Generic.List[string]]::new()
 $startedAt = [DateTimeOffset]::UtcNow.ToString('o')
 $record = [ordered]@{ status='STARTING'; codexThreadId=$ThreadId; startedAt=$startedAt; sessionId=$null; result=$null; exitCode=$null; elapsedSeconds=0; toolCalls=@() }
@@ -69,8 +70,7 @@ try {
             }
         } catch { }
     }
-    $timeoutSeconds = if ($job.timeoutSeconds) { [int]$job.timeoutSeconds } else { 1800 }
-    if ($timeoutSeconds -lt 1) { throw 'Invalid timeout.' }
+    $timeoutPolicy = $contract.TimeoutPolicy
     $preparationStage = 'cli-resolution'
     if ($TestAdapter) { . (Resolve-Path -LiteralPath $TestAdapter).Path }
     if (-not $TestAdapter) {
@@ -164,6 +164,18 @@ try {
             planApproved = $contract.Coordination.PlanApproved
             responsibilities = $contract.Coordination.Responsibilities
         }
+        timeoutPolicy = if ($timeoutPolicy.Mode -eq 'fixed') {
+            [ordered]@{ mode = 'fixed'; timeoutSeconds = $timeoutPolicy.TimeoutSeconds }
+        } else {
+            [ordered]@{
+                mode = 'adaptive'
+                renewEverySeconds = $timeoutPolicy.RenewEverySeconds
+                idleAfterSeconds = $timeoutPolicy.IdleAfterSeconds
+                hardStopAfterSeconds = $timeoutPolicy.HardStopAfterSeconds
+            }
+        }
+        processStartedAt = $null; lastActivityAt = $null; nextRenewalAt = $null
+        extensionCount = 0; timeoutReason = $null; runtimeSeconds = 0
         result = $null; usage = $usageSnapshot; toolCalls = @(); toolErrors = 0; permissionDenials = 0
         exitCode = $null; elapsedSeconds = 0
     }
@@ -194,6 +206,19 @@ try {
     $preparationStage = 'stream'
     $record.processId = $process.Id
     $record.processStartedTicks = $process.StartTime.ToUniversalTime().Ticks
+    $processStarted = [DateTimeOffset]::UtcNow
+    $runtimeClock = [Diagnostics.Stopwatch]::StartNew()
+    $lastActivityElapsed = 0.0
+    $lastActivityStateWriteElapsed = 0.0
+    $record.processStartedAt = $processStarted.ToString('o')
+    $record.lastActivityAt = $record.processStartedAt
+    if ($timeoutPolicy.Mode -eq 'adaptive') {
+        $nextRenewalElapsed = [double]$timeoutPolicy.RenewEverySeconds
+        $record.nextRenewalAt = $processStarted.AddSeconds($nextRenewalElapsed).ToString('o')
+        Show-Line ('[Tempo] Adaptativo: renovar a cada ' + $timeoutPolicy.RenewEverySeconds + 's com atividade; inatividade ' + $timeoutPolicy.IdleAfterSeconds + 's; teto ' + $timeoutPolicy.HardStopAfterSeconds + 's.')
+    } else {
+        Show-Line ('[Tempo] Fixo: limite de ' + $timeoutPolicy.TimeoutSeconds + 's de execucao do Claude.')
+    }
     $record.status = 'RUNNING'
     Write-State $record $statusPath
     $errorRead = $process.StandardError.ReadToEndAsync()
@@ -209,12 +234,52 @@ try {
             }
         } catch { }
         if ($stopRequested) { $record.status = 'CANCELLED'; break }
-        if ($clock.Elapsed.TotalSeconds -gt $timeoutSeconds) { $record.status = 'TIMEOUT'; break }
+        $runtimeSeconds = $runtimeClock.Elapsed.TotalSeconds
+        if ($timeoutPolicy.Mode -eq 'fixed') {
+            if ($runtimeSeconds -ge $timeoutPolicy.TimeoutSeconds) {
+                $record.status = 'TIMEOUT'
+                $record.timeoutReason = 'fixed_limit'
+                $record.result = 'A sessao atingiu o limite fixo de execucao antes da conclusao.'
+                Show-Line ('[Tempo] Limite fixo de ' + $timeoutPolicy.TimeoutSeconds + 's atingido; sessao preservada para revisao.')
+                break
+            }
+        } else {
+            if ($runtimeSeconds -ge $timeoutPolicy.HardStopAfterSeconds) {
+                $record.status = 'TIMEOUT'
+                $record.timeoutReason = 'hard_limit'
+                $record.result = 'A sessao atingiu o teto absoluto antes da conclusao; revise antes de retomar.'
+                Show-Line ('[Tempo] Teto absoluto de ' + $timeoutPolicy.HardStopAfterSeconds + 's atingido; revise antes de retomar.')
+                break
+            }
+            if (($runtimeSeconds - $lastActivityElapsed) -ge $timeoutPolicy.IdleAfterSeconds) {
+                $record.status = 'TIMEOUT'
+                $record.timeoutReason = 'inactivity'
+                $record.result = 'A sessao ficou sem eventos validos ate o limite de inatividade; revise antes de retomar.'
+                Show-Line ('[Tempo] Sem atividade por ' + $timeoutPolicy.IdleAfterSeconds + 's; sessao preservada para revisao.')
+                break
+            }
+            if ($runtimeSeconds -ge $nextRenewalElapsed) {
+                do {
+                    $record.extensionCount++
+                    $nextRenewalElapsed += $timeoutPolicy.RenewEverySeconds
+                } while ($runtimeSeconds -ge $nextRenewalElapsed -and $nextRenewalElapsed -lt $timeoutPolicy.HardStopAfterSeconds)
+                $nextRenewalElapsed = [math]::Min($nextRenewalElapsed, $timeoutPolicy.HardStopAfterSeconds)
+                $record.nextRenewalAt = $processStarted.AddSeconds($nextRenewalElapsed).ToString('o')
+                Show-Line ('[Tempo] Sessao ativa; prazo renovado. Renovacoes: ' + $record.extensionCount + '.')
+                Write-State $record $statusPath
+            }
+        }
         if (-not $lineTask.Wait(200)) { continue }
         $line = $lineTask.GetAwaiter().GetResult()
         if ($null -eq $line) { break }
         $lineTask = $process.StandardOutput.ReadLineAsync()
         try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $lastActivityElapsed = $runtimeClock.Elapsed.TotalSeconds
+        $record.lastActivityAt = [DateTimeOffset]::UtcNow.ToString('o')
+        if (($lastActivityElapsed - $lastActivityStateWriteElapsed) -ge 1) {
+            Write-State $record $statusPath
+            $lastActivityStateWriteElapsed = $lastActivityElapsed
+        }
         switch ($event.type) {
             'system' {
                 if ($event.subtype -eq 'init') {
@@ -285,6 +350,7 @@ try {
     }
     if ($record.status -in @('STARTING','RUNNING')) { $record.status = 'CANCELLED' }
     $record.elapsedSeconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
+    if ($null -ne $runtimeClock) { $record.runtimeSeconds = [math]::Round($runtimeClock.Elapsed.TotalSeconds, 1) }
     $record.toolCalls = @($seenTools.ToArray())
     Write-State $record $resultPath
     Write-State $record $statusPath

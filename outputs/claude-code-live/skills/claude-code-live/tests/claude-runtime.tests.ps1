@@ -23,7 +23,7 @@ function New-Job($Name, $Resume = $null) {
     $job | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root "$Name.json")
     return $job
 }
-function Start-TestRun($Name, $Thread, $Failure = '', $Delay = 6000) {
+function Start-TestRun($Name, $Thread, $Failure = '', $Delay = 6000, $Pattern = '', $EventInterval = 250, $UsageDelay = 150) {
     $info = [Diagnostics.ProcessStartInfo]::new((Get-Command pwsh).Source)
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
@@ -32,6 +32,9 @@ function Start-TestRun($Name, $Thread, $Failure = '', $Delay = 6000) {
     $info.Environment['CLAUDE_LIVE_TEST_ROOT'] = $root
     $info.Environment['CLAUDE_LIVE_TEST_FAILURE'] = $Failure
     $info.Environment['CLAUDE_LIVE_TEST_DELAY'] = [string]$Delay
+    $info.Environment['CLAUDE_LIVE_TEST_PATTERN'] = [string]$Pattern
+    $info.Environment['CLAUDE_LIVE_TEST_EVENT_INTERVAL'] = [string]$EventInterval
+    $info.Environment['CLAUDE_LIVE_TEST_USAGE_DELAY'] = [string]$UsageDelay
     foreach ($argValue in @('-NoProfile','-File',(Join-Path $scripts 'start-live.ps1'),'-JobFile',(Join-Path $root "$Name.json"),'-RunDirectory',(Join-Path $root $Name),'-TestAdapter',(Join-Path $PSScriptRoot 'fake-adapter.ps1'),'-TestStateRoot',$root,'-NoPanel')) { $info.ArgumentList.Add($argValue) }
     $p = [Diagnostics.Process]::Start($info)
     $processes.Add($p)
@@ -139,6 +142,72 @@ try {
     Wait-Result $p
     $explicit = Read-Result 'explicit-approved'
     Assert-True ($explicit.status -eq 'COMPLETED' -and $explicit.resumeMode -eq 'explicit' -and $explicit.sessionId -eq $prior.sessionId) 'New revision must permit explicit resume'
+
+    $adaptiveThread = 'test-' + [guid]::NewGuid().ToString('N')
+    $adaptive = New-Job 'adaptive-extend'
+    $adaptive | Add-Member -NotePropertyName timeoutPolicy -NotePropertyValue ([pscustomobject]@{
+        mode='adaptive'; renewEverySeconds=2; idleAfterSeconds=3; hardStopAfterSeconds=5
+    })
+    $adaptive | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'adaptive-extend.json')
+    $p = Start-TestRun 'adaptive-extend' $adaptiveThread '' 2500 'activity' 200
+    Wait-Running 'adaptive-extend'
+    $firstActivity = [DateTimeOffset](Get-Content (Join-Path $root 'adaptive-extend/status.json') -Raw | ConvertFrom-Json).lastActivityAt
+    Start-Sleep -Milliseconds 1250
+    $liveActivity = [DateTimeOffset](Get-Content (Join-Path $root 'adaptive-extend/status.json') -Raw | ConvertFrom-Json).lastActivityAt
+    Assert-True ($liveActivity -gt $firstActivity) 'Valid stream events must advance lastActivityAt in live status before renewal'
+    Wait-Result $p
+    $extended = Read-Result 'adaptive-extend'
+    Assert-True ($extended.status -eq 'COMPLETED') 'An active session must complete beyond its first renewal checkpoint'
+    Assert-True ($extended.extensionCount -ge 1 -and -not $extended.timeoutReason) 'Active events must renew the deadline without recording a timeout'
+    Assert-True ($extended.timeoutPolicy.mode -eq 'adaptive' -and $extended.lastActivityAt) 'Adaptive timing state must be preserved in the result'
+
+    $idleThread = 'test-' + [guid]::NewGuid().ToString('N')
+    $idle = New-Job 'adaptive-idle'
+    $idle | Add-Member -NotePropertyName timeoutPolicy -NotePropertyValue ([pscustomobject]@{
+        mode='adaptive'; renewEverySeconds=2; idleAfterSeconds=1; hardStopAfterSeconds=5
+    })
+    $idle | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'adaptive-idle.json')
+    $p = Start-TestRun 'adaptive-idle' $idleThread '' 5000
+    Wait-Result $p
+    $idleResult = Read-Result 'adaptive-idle'
+    Assert-True ($p.ExitCode -ne 0 -and $idleResult.status -eq 'TIMEOUT' -and $idleResult.timeoutReason -eq 'inactivity') 'A silent session must stop at its inactivity limit'
+
+    $hardThread = 'test-' + [guid]::NewGuid().ToString('N')
+    $hard = New-Job 'adaptive-hard'
+    $hard | Add-Member -NotePropertyName timeoutPolicy -NotePropertyValue ([pscustomobject]@{
+        mode='adaptive'; renewEverySeconds=1; idleAfterSeconds=2; hardStopAfterSeconds=3
+    })
+    $hard | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'adaptive-hard.json')
+    $p = Start-TestRun 'adaptive-hard' $hardThread '' 5000 'activity' 200
+    Wait-Result $p
+    $hardResult = Read-Result 'adaptive-hard'
+    Assert-True ($p.ExitCode -ne 0 -and $hardResult.status -eq 'TIMEOUT' -and $hardResult.timeoutReason -eq 'hard_limit') 'Continuous activity must not bypass the absolute runtime cap'
+
+    $hardResume = New-Job 'adaptive-hard-resume'
+    $hardResume | Add-Member -NotePropertyName timeoutPolicy -NotePropertyValue $hard.timeoutPolicy
+    $hardResume | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'adaptive-hard-resume.json')
+    $p = Start-TestRun 'adaptive-hard-resume' $hardThread '' 10
+    Wait-Result $p
+    $hardResumed = Read-Result 'adaptive-hard-resume'
+    Assert-True ($hardResumed.status -eq 'COMPLETED' -and $hardResumed.resumeMode -eq 'automatic' -and $hardResumed.sessionId -eq $hardResult.sessionId) 'A confirmed timed-out session must remain resumable after review'
+
+    $fixedThread = 'test-' + [guid]::NewGuid().ToString('N')
+    $fixed = New-Job 'fixed-timeout'
+    $fixed | Add-Member -NotePropertyName timeoutSeconds -NotePropertyValue 1
+    $fixed | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'fixed-timeout.json')
+    $p = Start-TestRun 'fixed-timeout' $fixedThread '' 5000
+    Wait-Result $p
+    $fixedResult = Read-Result 'fixed-timeout'
+    Assert-True ($p.ExitCode -ne 0 -and $fixedResult.status -eq 'TIMEOUT' -and $fixedResult.timeoutReason -eq 'fixed_limit') 'Legacy timeoutSeconds must remain a fixed runtime cap'
+
+    $preparationThread = 'test-' + [guid]::NewGuid().ToString('N')
+    $preparation = New-Job 'preparation-outside-timeout'
+    $preparation | Add-Member -NotePropertyName timeoutSeconds -NotePropertyValue 1
+    $preparation | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'preparation-outside-timeout.json')
+    $p = Start-TestRun 'preparation-outside-timeout' $preparationThread '' 10 '' 250 1500
+    Wait-Result $p
+    Assert-True ((Read-Result 'preparation-outside-timeout').status -eq 'COMPLETED') 'Preparation time must not consume the Claude runtime limit'
+
     $log = Join-Path $root 'log.txt'; $cursor = New-ClaudeLogCursor
     $bytes = [Text.Encoding]::UTF8.GetBytes('á🙂fim')
     [IO.File]::WriteAllBytes($log, $bytes[0..2])

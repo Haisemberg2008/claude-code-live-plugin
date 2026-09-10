@@ -1,6 +1,6 @@
 {
   "name": "claude-code-live",
-  "version": "0.1.0+codex.20260909133530",
+  "version": "0.1.0+codex.20260910201327",
   "description": "OpenAInthropic permite que modelos Codex, como Terra e Sol, coordenem Opus e Fable sob plano, responsabilidades e permissoes aprovados.",
   "author": {
     "name": "YOU Telecom"
