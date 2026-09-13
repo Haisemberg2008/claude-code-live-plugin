@@ -44,6 +44,26 @@ node runtime/dist/codeorquestra.mjs dashboard --task-handle '<handle-retornado>'
 
 O primeiro comando não inicia o Claude. Uma execução só começa depois que o job v2 aprovado é enviado por `codeorquestra_start` ou pelo comando `start`. Se o inventário encontrar instruções, configurações, hooks, agentes, skills ou MCPs, o início falha fechado até o conjunto ser aprovado para aquele projeto.
 
+## Execucao paralela em worktrees
+
+Um job v2 pode pedir uma arvore isolada com `execution.mode: "worktree"`; sem o
+campo, tudo roda no checkout declarado exatamente como antes. Habilitar o
+repositorio e uma acao local do usuario, porque criar um worktree altera o
+repositorio de forma persistente:
+
+```powershell
+node runtime/dist/codeorquestra.mjs worktree enable --repo '<caminho>' --note '<motivo>'
+node runtime/dist/codeorquestra.mjs worktree list
+```
+
+A trava de escrita nao some: ela passa a ser sobre a **arvore de trabalho**, e
+as mutacoes do `.git` compartilhado serializam sob um mutex por repositorio. Os
+worktrees vivem sob o state root, fora do repositorio, em caminho deterministico
+por `(repositorio, tarefa)` — dentro dele, o inventario de confianca veria a
+copia do `CLAUDE.md` de cada worktree e recusaria toda execucao no checkout
+principal. Trabalho nao commitado nunca e apagado; `commit` nunca pertence ao
+Claude, entao esse e o estado normal de uma execucao bem-sucedida.
+
 ## Layout
 
 ```
