@@ -261,13 +261,19 @@ export async function ensureWorktree(options: {
 }
 
 /**
- * Removes a worktree only when git agrees it is clean.
+ * Removes a worktree.
  *
- * Never forced: `git worktree remove` refuses a dirty tree, and that refusal is
- * the safety property, not an obstacle.
+ * Unforced by default, and that is the safety property, not an obstacle: `git
+ * worktree remove` refuses a tree holding modifications or untracked files, so
+ * the normal end of a run can never delete the deliverable.
+ *
+ * `force` exists only for the administrative discard, where the operator named
+ * the files being thrown away and said so explicitly. It is git's own primitive
+ * for this; trying to clean the tree first would not work anyway, since
+ * `git checkout -- .` restores tracked files and leaves untracked ones behind.
  */
-export async function removeWorktree(repository: Repository, target: string): Promise<{ removed: boolean; reason?: string }> {
-  const result = await git(['worktree', 'remove', target], repository.topLevel);
+export async function removeWorktree(repository: Repository, target: string, options: { force?: boolean } = {}): Promise<{ removed: boolean; reason?: string }> {
+  const result = await git(['worktree', 'remove', ...(options.force ? ['--force'] : []), target], repository.topLevel);
   if (result.code === 0) {
     await git(['worktree', 'prune'], repository.topLevel).catch(() => undefined);
     return { removed: true };

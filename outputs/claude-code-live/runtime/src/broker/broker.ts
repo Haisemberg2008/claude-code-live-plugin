@@ -281,6 +281,17 @@ export class Broker {
       this.requireAdministrative(identity);
       return sendJson(res, 200, await this.tasks.worktreeInventory());
     }
+    if (parts[1] === 'worktrees' && parts[2] === 'release' && method === 'POST') {
+      // Discarding uncommitted work is never a default, and never a side effect
+      // of anything else: it is its own administrative action, with a note.
+      this.requireAdministrative(identity);
+      const target = typeof body.path === 'string' ? body.path : '';
+      if (!target) throw new HttpError(400, 'PATH_REQUIRED', { message: 'Informe o caminho do worktree em "path".' });
+      return sendJson(res, 200, await this.tasks.releaseWorktree(target, {
+        note: typeof body.note === 'string' ? body.note : null,
+        confirmDiscardUncommitted: body.confirmDiscardUncommitted === true,
+      }, identity.source));
+    }
     if (parts[1] === 'quota' && method === 'GET') {
       return sendJson(res, 200, this.tasks.quota.view('claude-fable-5-1'));
     }

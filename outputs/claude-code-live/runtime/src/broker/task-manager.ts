@@ -23,7 +23,7 @@ import { resolvePreflight, type PreflightResult, type ProbeResult, type Resolved
 import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
 import { inventoryCustomizations, canonicalizeWorkspace, type Inventory } from '../trust/inventory.ts';
 import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
-import { gitStatus, listOrphans, resolveRepository, worktreePathFor, ensureWorktree, removeWorktree, withRepositoryMutex, assertUsablePathLength, canonicalize, canonicalizePlanned, type Repository } from './worktree.ts';
+import { git, gitStatus, listOrphans, resolveRepository, worktreePathFor, ensureWorktree, removeWorktree, withRepositoryMutex, assertUsablePathLength, canonicalize, canonicalizePlanned, type Repository } from './worktree.ts';
 import { WorktreePolicyStore, type WorktreePolicyRecord } from './worktree-policy.ts';
 import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
@@ -415,6 +415,55 @@ export class TaskManager {
       await fs.rm(path.join(this.locksDir(), file), { force: true });
       this.assertOperational();
     }
+    await this.sweepOrphanWorktrees();
+  }
+
+  /**
+   * Removes worktrees no live task owns, and reports the ones it will not touch.
+   *
+   * Deliberately the LAST pass: quarantined locks are re-seeded just above, and
+   * a quarantined worktree must never be swept — a process of the previous run
+   * may still be able to write there.
+   *
+   * This is not optional once provisioning exists. `git worktree add` can
+   * outlast PREPARATION_DRAIN_MS on a large repository; shutdown logs and
+   * proceeds, leaving a registered worktree with no task. Without this sweep
+   * that leaks, one directory per interrupted start.
+   *
+   * Removal is narrow by design: only a tree with no uncommitted work, and only
+   * through git, which refuses a dirty tree on its own. Anything dirty or
+   * unattributable is listed and left alone.
+   */
+  private async sweepOrphanWorktrees(): Promise<void> {
+    const owned = new Set<string>();
+    for (const task of this.tasks.values()) owned.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) owned.add(lock.holderTaskId.slice(0, 16));
+    let orphans: Awaited<ReturnType<typeof listOrphans>>;
+    try {
+      orphans = await listOrphans(this.stateRoot, (_repoKey, prefix) => owned.has(prefix));
+    } catch {
+      return;
+    }
+    for (const orphan of orphans) {
+      this.assertOperational();
+      if (orphan.dirtyFiles.length > 0) {
+        this.options.log(`worktree órfão preservado (${orphan.dirtyFiles.length} arquivo(s) não commitado(s)): ${orphan.path}`);
+        continue;
+      }
+      // The repository is reached through the worktree itself; if that fails,
+      // the directory is not a usable worktree and is left for a human.
+      let repository: Repository;
+      try {
+        repository = await resolveRepository(orphan.path);
+      } catch {
+        this.options.log(`worktree órfão não atribuível, preservado: ${orphan.path}`);
+        continue;
+      }
+      const removal = await withRepositoryMutex(repository.repoKey, () => removeWorktree(repository, orphan.path));
+      this.options.log(removal.removed
+        ? `worktree órfão limpo removido: ${orphan.path}`
+        : `worktree órfão preservado (git recusou a remoção): ${orphan.path} — ${removal.reason ?? 'sem motivo informado'}`);
+    }
   }
 
   private async openTask(record: TaskRecord, dir: string): Promise<TaskState> {
@@ -550,6 +599,51 @@ export class TaskManager {
     for (const lock of this.locks.values()) if (lock.quarantined) ownedPrefixes.add(lock.holderTaskId.slice(0, 16));
     const orphans = await listOrphans(this.stateRoot, (_repoKey, taskPrefix) => ownedPrefixes.has(taskPrefix));
     return { policies: await this.worktreePolicy.list(), orphans };
+  }
+
+  /**
+   * Removes a retained worktree, on the operator's explicit instruction.
+   *
+   * Retention exists because uncommitted work is the normal end state of a run,
+   * so discarding it has to be stated, not defaulted: a dirty tree is only
+   * removed with confirmDiscardUncommitted, and the files being discarded are
+   * named back in the answer. A tree whose lock is still quarantined is never
+   * removed here — releasing ownership is the other, survivor-checking action.
+   */
+  async releaseWorktree(target: string, request: { note: string | null; confirmDiscardUncommitted: boolean }, source: ActionSource): Promise<{ removed: boolean; path: string; discarded: string[]; note: string }> {
+    const note = (request.note ?? '').trim();
+    if (!note) throw new HttpError(400, 'NOTE_REQUIRED', { message: 'Remover um worktree exige uma nota; a remoção fica registrada.' });
+    const canonical = canonicalize(target);
+    for (const lock of this.locks.values()) {
+      if (canonicalize(lock.workspace) !== canonical) continue;
+      if (lock.quarantined) {
+        throw new HttpError(409, 'WORKSPACE_LOCK_QUARANTINED', {
+          holderTaskId: lock.holderTaskId,
+          note: lock.quarantineNote,
+          remediation: 'Um processo da execução anterior pode continuar escrevendo aqui. Libere a posse pela rota de travas, que reverifica sobreviventes, antes de remover o diretório.',
+        });
+      }
+      throw new HttpError(409, 'WORKSPACE_WRITER_LOCKED', { holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, message: 'Este worktree ainda pertence a uma execução ativa.' });
+    }
+    let repository: Repository;
+    try {
+      repository = await resolveRepository(target);
+    } catch (error) {
+      throw new HttpError(400, (error as { code?: string }).code ?? 'NOT_A_GIT_REPOSITORY', { message: (error as Error).message });
+    }
+    const dirty = await gitStatus(target);
+    if (dirty.length > 0 && !request.confirmDiscardUncommitted) {
+      throw new HttpError(409, 'WORKTREE_HAS_UNCOMMITTED_WORK', {
+        files: dirty.slice(0, 50),
+        message: `Este worktree tem ${dirty.length} arquivo(s) com alterações não commitadas. Commite a partir dele, ou repita com confirmDiscardUncommitted para descartar.`,
+      });
+    }
+    // Forced only here, only after the operator confirmed, and only for the
+    // files just named back to them.
+    const removal = await withRepositoryMutex(repository.repoKey, () => removeWorktree(repository, target, { force: dirty.length > 0 }));
+    if (!removal.removed) throw new HttpError(409, 'WORKTREE_REMOVE_REFUSED', { message: removal.reason ?? 'git recusou a remoção.' });
+    this.options.log(`worktree removido por ação administrativa (${source}): ${target} — ${note}`);
+    return { removed: true, path: target, discarded: dirty.slice(0, 50), note };
   }
 
   async releaseQuarantinedLock(workspaceKey: string, request: { note: string | null; confirmHistoricalRisk: boolean; expectedTaskId: string | null; expectedRunId: string | null }, source: ActionSource): Promise<{ released: boolean; workspaceKey: string; livePids: number[]; note: string; historicalAncestryConclusive: boolean }> {

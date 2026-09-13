@@ -226,3 +226,25 @@ describe('mutual exclusion', () => {
     assert.deepEqual(order, ['a-inicio', 'a-fim', 'b'], 'mutações do mesmo repositório não podem se sobrepor');
   });
 });
+
+describe('administrative removal', () => {
+  test('a dirty worktree is only discarded when the operator says so, and the files are named back', async () => {
+    // Exercised through the task manager's rules rather than the route, so the
+    // decision logic is covered without standing a broker up.
+    const target = worktreePathFor(stateRoot, repository.repoKey, 'task-descarte-0001').path;
+    await ensureWorktree({ repository, target, branch: 'codeorquestra/descarte', baseRef: 'main' });
+    await writeFile(path.join(target, 'src', 'nao-commitado.ts'), 'export const w = 4;\n');
+
+    // git alone refuses, which is the property the product leans on.
+    const refused = await removeWorktree(repository, target);
+    assert.equal(refused.removed, false);
+    await access(path.join(target, 'src', 'nao-commitado.ts'));
+
+    // Discarding is a separate, explicit act — and it is git's own primitive.
+    // Note that cleaning first would not have worked: `git checkout -- .`
+    // restores tracked files and leaves untracked ones exactly where they are.
+    const removed = await removeWorktree(repository, target, { force: true });
+    assert.equal(removed.removed, true, removed.reason);
+    await assert.rejects(access(target));
+  });
+});
