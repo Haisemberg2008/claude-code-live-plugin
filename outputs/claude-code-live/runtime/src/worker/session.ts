@@ -17,6 +17,7 @@ import { planLaunch, type JsonObject, type PermissionAnswer } from '../engine/pr
 import { SessionClient, type HookContext, type PermissionContext } from '../engine/session-client.ts';
 import type { EngineAdapter } from './engine-adapter.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from './protocol.ts';
+import { sanitizeClaudeUsageReport } from '../usage/claude-usage.ts';
 
 type Send = (message: WorkerToBroker) => void;
 
@@ -758,7 +759,12 @@ export class WorkerSession {
     const isError = message.is_error === true || subtype !== 'success';
     const resultText = subtype === 'success' && typeof message.result === 'string' ? redactSensitiveText(message.result) : '';
     const preview = boundedPreview(resultText, 64 * 1024);
-    const usage = message.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+    const usage = message.usage as {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    } | undefined;
     const denials = Array.isArray(message.permission_denials) ? message.permission_denials.length : 0;
     const data = {
       turn: this.turn,
@@ -768,7 +774,9 @@ export class WorkerSession {
       truncated: preview.truncated,
       numTurns: typeof message.num_turns === 'number' ? message.num_turns : null,
       durationMs: typeof message.duration_ms === 'number' ? message.duration_ms : null,
-      tokens: usage ? { input: usage.input_tokens ?? null, output: usage.output_tokens ?? null } : null,
+      // Persist only the documented numeric counters. Missing fields remain
+      // absent so the meter can label a report as partial instead of zero.
+      usage: sanitizeClaudeUsageReport(usage),
       permissionDenials: denials,
       terminalReason: typeof message.terminal_reason === 'string' ? message.terminal_reason : null,
       errors: Array.isArray(message.errors) ? (message.errors as string[]).map((error) => redactSensitiveText(String(error)).slice(0, 300)) : [],

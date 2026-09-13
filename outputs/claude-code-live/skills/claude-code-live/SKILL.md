@@ -79,6 +79,8 @@ Quando o usuario aprovar selecao automatica por quota, omita `model` e use `mode
 
 Esses percentuais representam limites de uso da assinatura, nao saldo monetario de creditos pre-pagos. Para saldo financeiro, encaminhar o usuario ao painel Usage da conta; nunca inferir um valor em dinheiro a partir dos percentuais do CLI.
 
+No runtime v2, acompanhe o bloco **Consumo por fonte**. Ele separa tokens Claude reportados, estimativa da tarefa Codex, limites e atividade Codex; nunca some provedores ou trate estimativa como medicao. Para atualizar sob pedido, use `codeorquestra_usage_refresh` com o `taskHandle`. A ferramenta e somente leitura e uma falha nela nao autoriza reduzir esforco, trocar modelo ou interromper Claude.
+
 O gerenciamento nativo do CLI em segundo plano continua disponivel fora do runtime v2, mas nao substitui o painel obrigatorio nas execucoes CodeOrquestra v2. Segundo plano nao amplia permissoes: mantenha o mesmo perfil e a mesma allowlist.
 
 ## Trabalho em equipe Codex-Claude

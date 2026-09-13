@@ -67,6 +67,7 @@ O adaptador stdio (`mcp-stdio.mjs`) se conecta ao broker ja em execucao — nunc
 | `codeorquestra_set_model` | troca o modelo entre turnos, com motivo |
 | `codeorquestra_inventory` | inventaria personalizacoes do projeto e mostra o estado de confianca |
 | `codeorquestra_trust` | registra a aprovacao do usuario para as personalizacoes inventariadas |
+| `codeorquestra_usage_refresh` | atualiza limites, atividade e estimativa da tarefa pelo Codex App Server, somente leitura |
 | `codeorquestra_dashboard_url` | link de uso unico do painel, limitado aquela tarefa |
 
 A presenca do coordenador vem de `codeorquestra_wait` e do heartbeat reais. Sem isso, o painel mostra "aguardando coordenador" em vez de fingir um Codex sempre ativo.
@@ -137,3 +138,11 @@ Fechar o navegador nao encerra nada: o painel e uma visualizacao.
 Portugues, tema grafite/azul escuro com acento violeta, React + Vite em bundle estatico servido pelo proprio broker, sem CDN nem recursos de rede. Mostra a lista de tarefas, o feed publico cronologico, o inspetor e os controles nativos: enfileirar orientacao, responder, **interromper turno** e **encerrar sessao** (acoes separadas, com confirmacao vinculada a tarefa e execucao exatas).
 
 O painel nunca mostra porcentagem de progresso inventada nem raciocinio interno, e separa "arquivos alterados observados" (pelo git do workspace) de "autoria do Claude comprovada" (registrada pelas ferramentas).
+
+### Consumo por fonte
+
+Quatro cartoes permanecem independentes: Claude nesta tarefa, Codex nesta tarefa, limites Codex e atividade Codex. O Claude CLI reporta entrada, saida, leitura e criacao de cache; campos omitidos tornam o total `parcial`, nao zero. Os turnos sao identificados por execucao + numero do turno, portanto replay, reconexao e retomada nao contam o mesmo evento duas vezes. Ha subtotais por modelo.
+
+O broker mantem uma conexao local `stdio` com `codex app-server` e emite somente `account/rateLimits/read` e `account/usage/read` depois do handshake. O recorte por `threadId`, quando aceito, e rotulado `estimado`; limites e atividade sao `reportados`. O adaptador nao le arquivos de autenticacao, nao inicia turno, nao resgata credito e descarta campos financeiros. Falha de autenticacao, versao ou transporte apenas deixa a fonte indisponivel e nunca interfere na sessao Claude.
+
+A coleta acontece ao carregar o painel, depois dos turnos e por atualizacao explicita, com intervalo minimo para leituras automaticas. O painel e os arquivos derivados mostram o horario e a qualidade (`reportado`, `estimado`, `parcial`, `indisponivel`). Claude e Codex nunca sao somados como custo ou apresentados como economia percentual.

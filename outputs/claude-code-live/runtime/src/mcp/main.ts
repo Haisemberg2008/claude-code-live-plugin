@@ -172,6 +172,11 @@ server.registerTool('codeorquestra_trust', { description: 'Registra a aprovaçã
   return call('POST', `/api/tasks/${taskId}/trust`, { taskHandle, ...rest });
 }));
 
+server.registerTool('codeorquestra_usage_refresh', { description: 'Atualiza, sem iniciar inferência nem consumir créditos, os limites e a atividade que o Codex App Server disponibiliza para esta tarefa.', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call('POST', `/api/tasks/${taskId}/usage-refresh`, { taskHandle });
+}));
+
 server.registerTool('codeorquestra_dashboard_url', { description: 'Gera um link de uso único do painel limitado a esta tarefa (o painel com todas as tarefas é uma ação local do usuário: "codeorquestra dashboard").', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => call('POST', '/api/dashboard-url', { taskHandle })));
 
 const transport = new StdioServerTransport();

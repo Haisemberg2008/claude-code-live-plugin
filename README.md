@@ -202,7 +202,7 @@ No runner legado, o preflight valida o contrato antes de preparar o painel e o p
 
 Cada tarefa Codex possui diretório de estado, painel e mutex próprios; jobs da mesma tarefa são serializados, enquanto tarefas diferentes podem executar simultaneamente. A consulta de quota continua protegida por um mutex global porque os limites pertencem à conta, não à tarefa.
 
-O painel mostra modo, perfil, modelo efetivo, fase, escopo, revisão aprovada, resumo do plano, responsáveis, limites de uso sanitizados, política de tempo, renovações, ferramentas e mudanças de estado.
+O painel mostra modo, perfil, modelo efetivo, fase, escopo, revisão aprovada, resumo do plano, responsáveis, limites de uso sanitizados, política de tempo, renovações, ferramentas e mudanças de estado. A área **Consumo por fonte** mantém quatro cartões independentes: tokens Claude reportados pelo CLI, estimativa da tarefa Codex quando oferecida pelo App Server, limites Codex e atividade Codex. Cada valor é marcado como reportado, estimado, parcial ou indisponível; os dois provedores nunca são somados como custo financeiro.
 
 Pressione `Q` para solicitar parada. `X` ou fechar o painel encerra apenas a visualização. `Ctrl+C` no executor tenta encerrar o processo filho e seus descendentes.
 
@@ -295,6 +295,8 @@ O smoke test valida contrato, parser de uso, presença do Claude CLI e opções 
 O executor grava `STARTING` antes das consultas externas. Falhas de preparação produzem resultado terminal sanitizado com `failureStage`; não substituem o ponteiro da última sessão confirmada pelo CLI. `startedAt` permite que o painel calcule o tempo decorrido mesmo sem eventos novos.
 
 `usageCheckedAt` registra o horário da tentativa de consulta inicial. A capacidade não é monitorada continuamente: é reavaliada em cada início ou retomada, sem interromper uma execução longa para trocar de modelo. O painel identifica a tarefa no título e lê somente novos bytes do log, preservando caracteres UTF-8 e reiniciando a leitura na troca de execução ou truncamento detectado.
+
+No runtime v2, o resultado de cada turno também preserva os contadores numéricos que o Claude CLI realmente forneceu (`input`, `output`, leitura e criação de cache). Campo ausente significa **dados parciais**, nunca zero inventado. O broker mantém uma única conexão local `stdio` com `codex app-server` e usa somente `account/rateLimits/read` e `account/usage/read`; não lê arquivos de autenticação, não inicia inferência e não resgata créditos. A consulta acontece ao carregar o painel, depois de turnos e sob pedido explícito pelo botão ou por `codeorquestra_usage_refresh`, com intervalo mínimo entre leituras automáticas. Falha de telemetria não bloqueia, reduz nem troca o modelo Claude.
 
 Os parâmetros `TestAdapter`, `TestStateRoot` e `NoPanel` são exclusivos do harness de testes. O adaptador é um script local confiável executado pelo coordenador, nunca um campo do job. O harness usa processos simulados e estado temporário; `TestStateRoot` e `NoPanel` exigem adaptador explícito.
 

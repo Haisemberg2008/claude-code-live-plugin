@@ -215,6 +215,7 @@ export class Broker {
 
     if (parts[1] === 'health' && method === 'GET') return sendJson(res, 200, { pid: process.pid, product: BRAND.name, version: RUNTIME_VERSION, startedAt: this.startedAt, tasks: this.tasks.tasks.size, cursorEpoch: this.cursorEpoch });
     if (parts[1] === 'status' && method === 'GET') {
+      if (identity.source === 'browser') this.tasks.refreshAllUsage();
       return sendJson(res, 200, {
         broker: { version: RUNTIME_VERSION, tagline: BRAND.tagline, startedAt: this.startedAt, pid: process.pid, simulatedAdapter: this.options.harness },
         identity: { source: identity.source, taskScope: identity.taskScope },
@@ -278,6 +279,7 @@ export class Broker {
       const task = this.scopedTask(identity, taskId);
       if (!action && method === 'GET') {
         if (identity.source === 'mcp') this.bindHandle(identity, task, body, url);
+        if (identity.source === 'browser') void this.tasks.refreshUsage(task);
         const view = this.tasks.view(task);
         view.changedFiles = await this.tasks.changedFiles(task);
         return sendJson(res, 200, view);
@@ -357,6 +359,8 @@ export class Broker {
           if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
           this.tasks.touchCoordinator(task);
           return sendJson(res, 200, { present: true });
+        case 'usage-refresh':
+          return sendJson(res, 200, { usage: await this.tasks.refreshUsage(task, true) });
         case 'acknowledge-review':
           if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
           await this.tasks.acknowledgeReview(task, typeof body.note === 'string' ? body.note : null, source);

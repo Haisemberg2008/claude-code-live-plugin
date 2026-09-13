@@ -58,6 +58,10 @@ interface TaskView {
   pendingRequests: Array<{ requestId: string; runId: string; kind: 'permission' | 'question'; tool: string; state: string }>;
   queue: Array<{ messageId: string; source: string; state: 'queued' | 'delivered' | 'requires_review'; receivedAt: string; deliveredAt: string | null }>;
   quota: { observedAt: string | null; attemptedAt: string | null; recommendation: string };
+  usage: {
+    claude: { quality: string; turns: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number; totalObservedTokens: number };
+    codex: { quality: string; failure: { code: string } | null };
+  };
   changedFiles: { observed: string[]; claudeAuthored: string[] };
   reviewPending: boolean;
 }
@@ -323,6 +327,13 @@ describe('trust gating and run with exact model, Extra effort and a durable sess
     assert.equal(idle.reviewPending, true);
     assert.equal(idle.quota.recommendation, 'ok', 'the fake launcher served /usage');
     assert.match(idle.quota.observedAt ?? '', /^\d{4}-/);
+    assert.equal(idle.usage.claude.quality, 'reported');
+    assert.equal(idle.usage.claude.turns, 1);
+    assert.equal(idle.usage.claude.inputTokens, 10);
+    assert.equal(idle.usage.claude.outputTokens, 10);
+    assert.equal(idle.usage.claude.cachedInputTokens, 5);
+    assert.equal(idle.usage.claude.cacheWriteInputTokens, 2);
+    assert.equal(idle.usage.claude.totalObservedTokens, 27);
 
     const trace = await readTrace(idle.currentRun!.workerPid!);
     const query = trace.find((entry) => entry.kind === 'query')!;
@@ -374,10 +385,14 @@ describe('trust gating and run with exact model, Extra effort and a durable sess
     }, { timeoutMs: 10000, description: 'derived status.json' });
     assert.equal(status.model, FABLE);
     assert.equal(status.requestedModel, FABLE);
+    assert.equal(status.llmUsage.claude.quality, 'reported');
+    assert.equal(status.llmUsage.claude.totalObservedTokens, 27);
+    assert.equal(status.llmUsage.codex.quality, 'unavailable');
     const acompanhamento = await readFile(path.join(runDir, 'acompanhamento.txt'), 'utf8');
     assert.equal(acompanhamento.split('Olá mundo').length - 1, 1, 'deltas are not double counted');
     const resultado = JSON.parse(await readFile(path.join(runDir, 'resultado.json'), 'utf8'));
     assert.equal(resultado.status, 'COMPLETED');
+    assert.equal(resultado.llmUsage.claude.totalObservedTokens, 27);
     const pointer = JSON.parse(await readFile(path.join(broker.stateRoot, 'tasks', taskId, 'session.json'), 'utf8'));
     assert.equal(pointer.sessionId, done.currentRun?.sessionId);
     const launcher = await launcherTrace();

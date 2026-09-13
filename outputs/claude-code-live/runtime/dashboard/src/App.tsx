@@ -43,6 +43,18 @@ function formatElapsed(seconds: number): string {
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+function formatCount(value: number | null): string {
+  return value === null ? '—' : new Intl.NumberFormat('pt-BR').format(value);
+}
+
+function qualityLabel(value: string): string {
+  return value === 'reported' ? 'reportado' : value === 'estimated' ? 'estimado' : value === 'partial' ? 'parcial' : 'indisponível';
+}
+
+function formatReset(value: number | null): string {
+  return value === null ? '—' : new Date(value * 1000).toLocaleString('pt-BR');
+}
+
 function isActive(task: TaskView): boolean {
   return Boolean(task.currentRun && !TERMINAL_STATUSES.has(task.currentRun.status));
 }
@@ -519,6 +531,8 @@ function DecisionRow({ row, task, onAnswer }: { row: Extract<Row, { kind: 'decis
 function Inspector({ task, now }: { task: TaskView; now: number }) {
   const run = task.currentRun;
   const quota = task.quota;
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const liveElapsed = run ? Math.max(0, Math.round(((run.endedAt ? Date.parse(run.endedAt) : now) - Date.parse(run.startedAt)) / 1000)) : 0;
   const presenceAge = task.coordinatorLastSeenAt ? Math.round((now - Date.parse(task.coordinatorLastSeenAt)) / 1000) : null;
   return (
@@ -564,6 +578,58 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
           <dt>Uso</dt><dd className="wrap">Indisponível{quota.attemptedAt ? ` (tentativa ${formatTime(quota.attemptedAt)}${quota.failure ? `, ${quota.failure.code}` : ''})` : ''}</dd>
         </dl>
       )}
+      <div className="section-heading-row">
+        <h2 className="section-title">Consumo por fonte</h2>
+        <button type="button" className="ghost small" disabled={refreshing} onClick={async () => {
+          setRefreshing(true);
+          setRefreshError(null);
+          try {
+            await postAction(task.taskId, 'usage-refresh', {});
+          } catch (error) {
+            setRefreshError(error instanceof ApiError ? error.code : 'Falha ao atualizar');
+          } finally {
+            setRefreshing(false);
+          }
+        }}>{refreshing ? 'Atualizando…' : 'Atualizar consumo'}</button>
+      </div>
+      <p className="muted small">Fontes independentes. Os valores não são somados como custo e estimativas nunca são tratadas como medição exata.</p>
+      <div className="usage-grid">
+        <section className="usage-card usage-card-claude" data-testid="usage-claude">
+          <div className="usage-card-head"><h3>Claude nesta tarefa</h3><span className={`badge usage-${task.usage.claude.quality}`}>{qualityLabel(task.usage.claude.quality)}</span></div>
+          <dl>
+            <dt>Entrada</dt><dd>{formatCount(task.usage.claude.inputTokens)}</dd>
+            <dt>Saída</dt><dd>{formatCount(task.usage.claude.outputTokens)}</dd>
+            <dt>Cache lido</dt><dd>{formatCount(task.usage.claude.cachedInputTokens)}</dd>
+            <dt>Cache criado</dt><dd>{formatCount(task.usage.claude.cacheWriteInputTokens)}</dd>
+            <dt>Total observado</dt><dd>{formatCount(task.usage.claude.totalObservedTokens)}</dd>
+            <dt>Turnos</dt><dd>{task.usage.claude.turns}</dd>
+            <dt>Último registro</dt><dd>{formatTime(task.usage.claude.observedAt)}</dd>
+          </dl>
+          {task.usage.claude.byModel.length ? <ul className="usage-models">{task.usage.claude.byModel.map((item) => <li key={item.model}><span className="mono wrap">{item.model}</span><span>{formatCount(item.totalObservedTokens)} · {item.turns} turno(s)</span></li>)}</ul> : null}
+        </section>
+        <section className="usage-card usage-card-codex" data-testid="usage-codex-task">
+          <div className="usage-card-head"><h3>Codex nesta tarefa</h3><span className={`badge usage-${task.usage.codex.task.quality}`}>{qualityLabel(task.usage.codex.task.quality)}</span></div>
+          {task.usage.codex.task.groups.length ? <ul className="usage-models">{task.usage.codex.task.groups.map((item, index) => <li key={`${item.model ?? 'modelo'}-${index}`}><span className="mono wrap">{item.model ?? 'modelo não informado'} · {item.reasoningEffort ?? 'esforço não informado'}</span><span>{formatCount(item.totalTokens)} tokens estimados</span></li>)}</ul> : <p className="muted small">Estimativa por tarefa não disponibilizada por esta versão ou conta.</p>}
+          <p className="muted small">Consulta: {formatTime(task.usage.codex.queriedAt)}</p>
+        </section>
+        <section className="usage-card" data-testid="usage-codex-limits">
+          <div className="usage-card-head"><h3>Limites Codex</h3><span className={`badge usage-${task.usage.codex.limits.quality}`}>{qualityLabel(task.usage.codex.limits.quality)}</span></div>
+          {task.usage.codex.limits.buckets.length ? task.usage.codex.limits.buckets.map((bucket) => <dl key={bucket.id}>
+            <dt>Limite</dt><dd>{bucket.name ?? bucket.id}</dd>
+            {bucket.primary ? <><dt>Janela principal</dt><dd>{bucket.primary.usedPercent}% usado · {bucket.primary.remainingPercent}% restante</dd><dt>Renovação</dt><dd>{formatReset(bucket.primary.resetsAt)}</dd></> : null}
+            {bucket.secondary ? <><dt>Janela secundária</dt><dd>{bucket.secondary.usedPercent}% usado · {bucket.secondary.remainingPercent}% restante</dd><dt>Renovação</dt><dd>{formatReset(bucket.secondary.resetsAt)}</dd></> : null}
+          </dl>) : <p className="muted small">Limites da conta indisponíveis.</p>}
+        </section>
+        <section className="usage-card" data-testid="usage-codex-activity">
+          <div className="usage-card-head"><h3>Atividade Codex</h3><span className={`badge usage-${task.usage.codex.activity.quality}`}>{qualityLabel(task.usage.codex.activity.quality)}</span></div>
+          <dl>
+            <dt>Acumulado</dt><dd>{formatCount(task.usage.codex.activity.lifetimeTokens)}</dd>
+            <dt>Pico diário</dt><dd>{formatCount(task.usage.codex.activity.peakDailyTokens)}</dd>
+            <dt>Hoje</dt><dd>{formatCount(task.usage.codex.activity.daily.at(-1)?.tokens ?? null)}</dd>
+          </dl>
+        </section>
+      </div>
+      {refreshError ? <p className="warn-text small">Atualização indisponível: {refreshError}</p> : null}
       <h2 className="section-title">Arquivos alterados observados</h2>
       <p className="muted small">Observado pelo git do workspace; não é prova de autoria do Claude.</p>
       <ul className="files">{task.changedFiles.observed.length ? task.changedFiles.observed.slice(0, 50).map((file) => <li key={file} className="mono wrap">{file}</li>) : <li className="muted">nenhum observado</li>}</ul>

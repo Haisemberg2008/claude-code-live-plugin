@@ -34,6 +34,8 @@ O runtime v2 nunca ativa cobranca por API sozinho. Antes de lancar, ele avalia o
 
 A avaliacao e refeita a cada execucao; apenas a evidencia da sondagem do CLI e reaproveitada dentro do mesmo processo do broker.
 
+O medidor Codex e uma integracao separada e somente leitura: abre uma unica conexao local `stdio` com `codex app-server` e chama exclusivamente `account/rateLimits/read` e `account/usage/read`. Ele nao abre `auth.json` nem outro arquivo de autenticacao, nao chama login/logout, nao inicia inferencia e nao consome reset de limite. A resposta bruta nao e persistida; apenas numeros de tokens/percentuais, modelo/esforco informados, qualidade e horario entram em `llmUsage`. Campos de creditos e valores financeiros sao descartados. Falha ou incompatibilidade deixa o medidor indisponivel sem bloquear Claude.
+
 ## Confianca em personalizacoes (runtime v2)
 
 Antes de qualquer execucao, o runtime **inventaria** o que o CLI carregaria: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` (ancestrais, projeto e subpastas), regras, `settings.json`/`settings.local.json`, hooks e os scripts locais que eles apontam, agentes, skills e servidores MCP. Cada item e identificado por hash do proprio conteudo.

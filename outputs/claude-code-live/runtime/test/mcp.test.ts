@@ -30,6 +30,7 @@ const EXPECTED_TOOLS = [
   'codeorquestra_start',
   'codeorquestra_status',
   'codeorquestra_trust',
+  'codeorquestra_usage_refresh',
   'codeorquestra_wait',
 ];
 
@@ -128,6 +129,9 @@ describe('stdio adapter', () => {
       assert.match(dashboard.url, /^http:\/\/127\.0\.0\.1:\d+\/bootstrap\?token=/);
       assert.equal(dashboard.scope, taskId, 'the MCP dashboard link is scoped to the task');
       assert.equal(dashboard.note, 'Link de uso único; abra no navegador desta máquina.');
+      const usage = parse(await client.callTool({ name: 'codeorquestra_usage_refresh', arguments: { taskHandle } })) as { usage: { quality: string; failure: { code: string } } };
+      assert.equal(usage.usage.quality, 'unavailable');
+      assert.equal(usage.usage.failure.code, 'CODEX_USAGE_DISABLED_IN_HARNESS');
       const foreign = await client.callTool({ name: 'codeorquestra_wait', arguments: { taskHandle: otherTask.taskHandle, cursor: 0, waitMs: 10 } }) as ToolResult;
       const foreignBody = parse(foreign) as { events: Array<{ taskId: string; type: string }> };
       assert.ok(foreignBody.events.length >= 1 && foreignBody.events.every((event) => event.taskId === otherTask.taskId), 'the other task handle only sees its own task');

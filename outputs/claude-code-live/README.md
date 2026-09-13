@@ -119,7 +119,9 @@ pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' 
   -RunDirectory '<pasta-nova>'
 ```
 
-No runner legado, o contrato é validado antes de preparar o painel e o processo; o handshake de prontidão do painel precisa terminar antes de o processo Claude começar. No runtime v2, o Codex abre ou reutiliza uma única aba, confirma visualmente a tarefa selecionada e somente então chama `codeorquestra_start`. Se essa confirmação falhar, o Claude não é iniciado silenciosamente. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo, responsáveis e renovações do tempo adaptativo.
+No runner legado, o contrato é validado antes de preparar o painel e o processo; o handshake de prontidão do painel precisa terminar antes de o processo Claude começar. No runtime v2, o Codex abre ou reutiliza uma única aba, confirma visualmente a tarefa selecionada e somente então chama `codeorquestra_start`. Se essa confirmação falhar, o Claude não é iniciado silenciosamente. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo, responsáveis, renovações do tempo adaptativo e consumo separado por fonte.
+
+O medidor híbrido do runtime v2 mostra tokens Claude reportados pelo CLI (inclusive leitura e criação de cache), estimativa da tarefa Codex quando disponível, limites Codex e atividade da conta. Dados ausentes aparecem como `parcial` ou `indisponível`; estimativas permanecem identificadas e nunca são somadas ao Claude como custo. O acesso ao Codex é somente leitura por uma conexão local com o App Server, sem abrir arquivos de autenticação, iniciar inferência ou resgatar créditos. Atualize pelo painel ou por `codeorquestra_usage_refresh`; uma falha nesse medidor não interfere no trabalho Claude.
 
 Cada tarefa Codex usa `CODEX_THREAD_ID` para manter diretório, painel, mutex e sessão Claude próprios. Jobs da mesma tarefa são serializados; tarefas diferentes podem executar ao mesmo tempo. A leitura de quota permanece globalmente serializada. Fora do Codex, `codexThreadId` fornece uma identidade estável opcional; sem identidade, cada chamada recebe uma chave isolada de uso único.
 

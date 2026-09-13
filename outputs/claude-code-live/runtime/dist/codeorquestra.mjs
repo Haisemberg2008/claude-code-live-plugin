@@ -337,10 +337,10 @@ var StateWriter = class {
     this.createDirectory = options.createDirectory !== false;
     this.onTelemetryFailure = options.onTelemetryFailure;
   }
-  async writeTelemetry(fileName, record) {
+  async writeTelemetry(fileName, record2) {
     const target = path.join(this.directory, fileName);
     try {
-      await writeFileAtomic(target, JSON.stringify(record, null, 2), { maxWaitMs: this.telemetryMaxWaitMs, createDirectory: this.createDirectory });
+      await writeFileAtomic(target, JSON.stringify(record2, null, 2), { maxWaitMs: this.telemetryMaxWaitMs, createDirectory: this.createDirectory });
       return { ok: true, file: fileName };
     } catch (error) {
       const code = error instanceof StateFileError ? error.code : "STATE_FILE_WRITE_FAILED";
@@ -350,19 +350,19 @@ var StateWriter = class {
       return { ok: false, file: fileName, code };
     }
   }
-  writeStatus(record) {
-    return this.writeTelemetry("status.json", record);
+  writeStatus(record2) {
+    return this.writeTelemetry("status.json", record2);
   }
-  async writeFinalResult(record, fileName = "resultado.json") {
+  async writeFinalResult(record2, fileName = "resultado.json") {
     const primary = path.join(this.directory, fileName);
     try {
-      const outcome = await writeFileAtomic(primary, JSON.stringify(record, null, 2), { maxWaitMs: this.finalMaxWaitMs, createDirectory: this.createDirectory });
+      const outcome = await writeFileAtomic(primary, JSON.stringify(record2, null, 2), { maxWaitMs: this.finalMaxWaitMs, createDirectory: this.createDirectory });
       return { ok: true, path: primary, fallback: false, attempts: outcome.attempts };
     } catch (primaryError) {
       const primaryCode = primaryError instanceof StateFileError ? primaryError.code : "STATE_FILE_WRITE_FAILED";
       const fallbackPath = path.join(this.directory, this.fallbackFileName);
       const fallbackRecord = {
-        ...record,
+        ...record2,
         persistence: {
           primaryFile: fileName,
           code: primaryCode,
@@ -480,19 +480,19 @@ var IdentityRegistry = class {
     }
   }
   mintBootstrapToken(taskScope) {
-    const token = randomToken(32);
+    const token2 = randomToken(32);
     this.pruneBootstrapTokens();
-    this.bootstrapTokens.set(token, { taskScope, createdAt: Date.now(), used: false });
-    return token;
+    this.bootstrapTokens.set(token2, { taskScope, createdAt: Date.now(), used: false });
+    return token2;
   }
   /** Single use AND time limited: an old unused link stops working on its own. */
-  redeemBootstrapToken(token, now = Date.now()) {
-    this.pruneBootstrapTokens(now, token);
-    const entry = this.bootstrapTokens.get(token);
+  redeemBootstrapToken(token2, now = Date.now()) {
+    this.pruneBootstrapTokens(now, token2);
+    const entry = this.bootstrapTokens.get(token2);
     if (!entry) return { ok: false, code: "BOOTSTRAP_TOKEN_INVALID" };
     if (entry.used) return { ok: false, code: "BOOTSTRAP_TOKEN_USED" };
     if (now - entry.createdAt > BOOTSTRAP_TOKEN_TTL_MS) {
-      this.bootstrapTokens.delete(token);
+      this.bootstrapTokens.delete(token2);
       return { ok: false, code: "BOOTSTRAP_TOKEN_EXPIRED" };
     }
     entry.used = true;
@@ -569,8 +569,8 @@ function parseCookies(header) {
 function resolveIdentity(req, registry) {
   const authorization = req.headers.authorization;
   if (typeof authorization === "string" && authorization.startsWith("Bearer ")) {
-    const token = authorization.slice("Bearer ".length).trim();
-    if (registry.verifySecret(token)) {
+    const token2 = authorization.slice("Bearer ".length).trim();
+    if (registry.verifySecret(token2)) {
       const client = String(req.headers[CLIENT_HEADER] ?? "").toLowerCase();
       return { source: client === "mcp" ? "mcp" : "local-secret", taskScope: null, sessionId: null };
     }
@@ -794,7 +794,7 @@ data: ${JSON.stringify(frame)}
 };
 
 // src/broker/task-manager.ts
-import { spawn as spawn5 } from "node:child_process";
+import { spawn as spawn6 } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs12, realpathSync as realpathSync2 } from "node:fs";
 import path11 from "node:path";
@@ -1401,9 +1401,9 @@ function scanForbidden(value, trail = []) {
     return null;
   }
   if (value && typeof value === "object") {
-    const record = value;
-    if (typeof record.type === "string" && HIDDEN_BLOCK_TYPES.has(record.type)) return [...trail, `type=${record.type}`].join(".");
-    for (const [key, child] of Object.entries(record)) {
+    const record2 = value;
+    if (typeof record2.type === "string" && HIDDEN_BLOCK_TYPES.has(record2.type)) return [...trail, `type=${record2.type}`].join(".");
+    for (const [key, child] of Object.entries(record2)) {
       if (FORBIDDEN_KEYS.has(key.toLowerCase())) return [...trail, key].join(".");
       const hit = scanForbidden(child, [...trail, key]);
       if (hit) return hit;
@@ -1434,8 +1434,8 @@ var EventLog = class _EventLog {
   get lastSeq() {
     return this.nextSeq - 1;
   }
-  pushCache(record, bytes) {
-    this.cache.push(record);
+  pushCache(record2, bytes) {
+    this.cache.push(record2);
     this.cacheBytes += bytes;
     while (this.cache.length > CACHE_MAX_RECORDS || this.cacheBytes > CACHE_MAX_BYTES && this.cache.length > 1) {
       const dropped = this.cache.shift();
@@ -1443,7 +1443,7 @@ var EventLog = class _EventLog {
       this.cacheBytes -= Buffer.byteLength(JSON.stringify(dropped), "utf8");
       this.cacheStartSeq = this.cache[0]?.seq ?? this.nextSeq;
     }
-    if (this.cache.length === 1) this.cacheStartSeq = record.seq;
+    if (this.cache.length === 1) this.cacheStartSeq = record2.seq;
   }
   async load() {
     let handle;
@@ -1565,7 +1565,7 @@ var EventLog = class _EventLog {
       const data = JSON.parse(JSON.stringify(input.data ?? {}));
       const forbidden = scanForbidden(data);
       if (forbidden) throw new EventLogError("EVENT_FORBIDDEN_FIELD", `Conte\xFAdo oculto ou sens\xEDvel em evento: ${forbidden}`);
-      const record = {
+      const record2 = {
         seq: this.nextSeq,
         ...input.gseq !== void 0 ? { gseq: input.gseq } : {},
         ts: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1576,7 +1576,7 @@ var EventLog = class _EventLog {
         ...input.toolUseId !== void 0 ? { toolUseId: input.toolUseId } : {},
         data
       };
-      const serialized = JSON.stringify(record);
+      const serialized = JSON.stringify(record2);
       const bytes = Buffer.byteLength(serialized, "utf8");
       if (bytes > MAX_RECORD_BYTES) {
         throw new EventLogError("EVENT_RECORD_TOO_LARGE", `Evento ${input.type} com ${bytes} bytes excede o limite de ${MAX_RECORD_BYTES}; use uma pr\xE9via limitada com armazenamento externo.`);
@@ -1585,14 +1585,14 @@ var EventLog = class _EventLog {
 `, "utf8");
       this.needsSeparator = false;
       this.nextSeq += 1;
-      this.pushCache(record, bytes);
+      this.pushCache(record2, bytes);
       for (const listener of this.listeners) {
         try {
-          listener(structuredClone(record));
+          listener(structuredClone(record2));
         } catch {
         }
       }
-      return structuredClone(record);
+      return structuredClone(record2);
     };
     const next = this.chain.then(run2, run2);
     this.chain = next.catch(() => void 0);
@@ -1609,9 +1609,9 @@ var EventLog = class _EventLog {
    */
   async readPage(cursor, limit = 2e3, byteBudget = REPLAY_MAX_BYTES) {
     await this.chain.catch(() => void 0);
-    const window = new RollingWindow(limit, byteBudget);
+    const window2 = new RollingWindow(limit, byteBudget);
     if (cursor + 1 >= this.cacheStartSeq) {
-      for (const event of this.cache) if (event.seq > cursor) window.push(structuredClone(event));
+      for (const event of this.cache) if (event.seq > cursor) window2.push(structuredClone(event));
     } else {
       const reader = readline.createInterface({ input: createReadStream(this.file, { encoding: "utf8" }), crlfDelay: Infinity });
       try {
@@ -1619,7 +1619,7 @@ var EventLog = class _EventLog {
           if (!line) continue;
           try {
             const parsed = JSON.parse(line);
-            if (parsed.seq > cursor) window.push(parsed);
+            if (parsed.seq > cursor) window2.push(parsed);
           } catch {
           }
         }
@@ -1627,8 +1627,8 @@ var EventLog = class _EventLog {
         reader.close();
       }
     }
-    const page = window.events;
-    return { events: page, gapped: window.dropped, firstSeq: page[0]?.seq ?? null };
+    const page = window2.events;
+    return { events: page, gapped: window2.dropped, firstSeq: page[0]?.seq ?? null };
   }
   /**
    * Reads the page immediately BEFORE `seq`, so a client can walk backwards
@@ -1638,12 +1638,12 @@ var EventLog = class _EventLog {
   async readBefore(seq, limit = 200, byteBudget = REPLAY_MAX_BYTES) {
     await this.chain.catch(() => void 0);
     if (seq <= 1) return { events: [], more: false };
-    const window = new RollingWindow(limit, byteBudget);
+    const window2 = new RollingWindow(limit, byteBudget);
     let oldestSeen = null;
     const consider = (event) => {
       if (event.seq >= seq) return;
       if (oldestSeen === null || event.seq < oldestSeen) oldestSeen = event.seq;
-      window.push(event);
+      window2.push(event);
     };
     if (this.cacheStartSeq <= 1 || seq > this.cacheStartSeq) {
       for (const event of this.cache) consider(structuredClone(event));
@@ -1668,7 +1668,7 @@ var EventLog = class _EventLog {
       }
       if (disk.events.length) return { events: disk.events, more: (disk.events[0]?.seq ?? 1) > 1 };
     }
-    const events = window.events;
+    const events = window2.events;
     return { events, more: (events[0]?.seq ?? 1) > 1 };
   }
   subscribe(listener) {
@@ -1855,12 +1855,12 @@ function mcpDetails(config) {
   return { transport: "stdio", command: typeof config.command === "string" ? path6.basename(config.command) : null };
 }
 function commandTokens(command) {
-  return command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+  return command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token2) => token2.replace(/^["']|["']$/g, "")) ?? [];
 }
 var VARIABLE_PATTERN = /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?|%([A-Za-z_][A-Za-z0-9_]*)%/g;
-function expandHookVariables(token, workspace) {
+function expandHookVariables(token2, workspace) {
   const unresolved = [];
-  const value = token.replace(VARIABLE_PATTERN, (match, dollar, percent) => {
+  const value = token2.replace(VARIABLE_PATTERN, (match, dollar, percent) => {
     const name = dollar ?? percent ?? "";
     if (name === "CLAUDE_PROJECT_DIR") return workspace;
     unresolved.push(name);
@@ -1872,15 +1872,15 @@ async function collectHookScripts(collector, command, root, rootCanonical, scope
   const scripts = [];
   for (const rawToken of commandTokens(command)) {
     const expansion = expandHookVariables(rawToken, workspace);
-    const token = expansion.value;
-    const looksLikeScript = SCRIPT_EXTENSIONS.test(token) || token.includes("/") || token.includes("\\");
-    if (!looksLikeScript || /^https?:\/\//i.test(token)) continue;
+    const token2 = expansion.value;
+    const looksLikeScript = SCRIPT_EXTENSIONS.test(token2) || token2.includes("/") || token2.includes("\\");
+    if (!looksLikeScript || /^https?:\/\//i.test(token2)) continue;
     if (expansion.unresolved.length > 0) {
       collector.skipped.push({ path: `${referencedBy} -> ${rawToken}`, reason: `UNRESOLVED_HOOK_ENTRYPOINT:${expansion.unresolved.join(",")}` });
       collector.incomplete = true;
       continue;
     }
-    const absolute = path6.resolve(root, token);
+    const absolute = path6.resolve(root, token2);
     let real;
     try {
       real = realpathNative(absolute);
@@ -1889,7 +1889,7 @@ async function collectHookScripts(collector, command, root, rootCanonical, scope
     }
     const canonical = canonicalizeWorkspace(real);
     if (canonical !== rootCanonical && !canonical.startsWith(`${rootCanonical}/`)) {
-      collector.skipped.push({ path: token, reason: "HOOK_SCRIPT_OUTSIDE_ROOT" });
+      collector.skipped.push({ path: token2, reason: "HOOK_SCRIPT_OUTSIDE_ROOT" });
       collector.incomplete = true;
       continue;
     }
@@ -2228,7 +2228,7 @@ var TrustStore = class {
       if (name && name !== "parse-error") mcpServers[name] = { approved: true, externalMutations: "escalate" };
     }
     const file = this.fileFor(input.inventory.canonicalWorkspace);
-    const record = {
+    const record2 = {
       canonicalWorkspace: input.inventory.canonicalWorkspace,
       fingerprint: input.inventory.fingerprint,
       identity: input.identity,
@@ -2240,8 +2240,8 @@ var TrustStore = class {
       file
     };
     await fs7.mkdir(path7.dirname(file), { recursive: true });
-    await writeFileAtomic(file, JSON.stringify(record, null, 2));
-    return record;
+    await writeFileAtomic(file, JSON.stringify(record2, null, 2));
+    return record2;
   }
   async load(canonicalWorkspace) {
     const read = await readJsonShared(this.fileFor(canonicalWorkspace));
@@ -2250,12 +2250,12 @@ var TrustStore = class {
   async check(inventory) {
     const all = inventory.items.map((item) => item.relativePath).sort();
     if (inventory.incomplete) return { trusted: false, reason: "INVENTORY_INCOMPLETE", changed: [], pending: all };
-    const record = await this.load(inventory.canonicalWorkspace);
-    if (!record) {
+    const record2 = await this.load(inventory.canonicalWorkspace);
+    if (!record2) {
       if (all.length === 0) return { trusted: true, approvalRevision: null, pending: [], changed: [], reason: "NO_CUSTOMIZATIONS" };
       return { trusted: false, reason: "NOT_APPROVED", changed: [], pending: all };
     }
-    const approved = new Map(record.approvedItems.map((item) => [item.relativePath, item.sha256]));
+    const approved = new Map(record2.approvedItems.map((item) => [item.relativePath, item.sha256]));
     const current = new Map(inventory.items.map((item) => [item.relativePath, item.sha256]));
     const changed = [...current.entries()].filter(([key, hash]) => approved.has(key) && approved.get(key) !== hash).map(([key]) => key);
     for (const key of approved.keys()) if (!current.has(key)) changed.push(key);
@@ -2263,7 +2263,7 @@ var TrustStore = class {
     const pending = [...current.keys()].filter((key) => !approved.has(key)).sort();
     if (changed.length) return { trusted: false, reason: "FINGERPRINT_CHANGED", changed, pending };
     if (pending.length) return { trusted: false, reason: "PENDING_RESOURCES", changed: [], pending };
-    return { trusted: true, approvalRevision: record.approvalRevision, pending: [], changed: [], reason: "TRUSTED" };
+    return { trusted: true, approvalRevision: record2.approvalRevision, pending: [], changed: [], reason: "TRUSTED" };
   }
   async revoke(canonicalWorkspace) {
     await fs7.rm(this.fileFor(canonicalWorkspace), { force: true });
@@ -2309,6 +2309,355 @@ function envName(name) {
 function isHarness(env = process.env) {
   return readEnv("TEST_HARNESS", env) === "1";
 }
+
+// src/usage/claude-usage.ts
+function token(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function sanitizeClaudeUsageReport(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const usage2 = value;
+  const report = {
+    input_tokens: token(usage2.input_tokens ?? usage2.inputTokens ?? usage2.input),
+    output_tokens: token(usage2.output_tokens ?? usage2.outputTokens ?? usage2.output),
+    cache_read_input_tokens: token(usage2.cache_read_input_tokens ?? usage2.cachedInputTokens ?? usage2.cacheRead),
+    cache_creation_input_tokens: token(usage2.cache_creation_input_tokens ?? usage2.cacheWriteInputTokens ?? usage2.cacheWrite)
+  };
+  return Object.values(report).some((item) => item !== null) ? report : null;
+}
+function normalizeClaudeUsage(value) {
+  const usage2 = sanitizeClaudeUsageReport(value);
+  if (!usage2) return null;
+  const inputTokens = usage2.input_tokens;
+  const outputTokens = usage2.output_tokens;
+  const cachedInputTokens = usage2.cache_read_input_tokens;
+  const cacheWriteInputTokens = usage2.cache_creation_input_tokens;
+  const totalInputTokens = (inputTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheWriteInputTokens ?? 0);
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    totalInputTokens,
+    totalObservedTokens: totalInputTokens + (outputTokens ?? 0),
+    quality: [inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens].every((item) => item !== null) ? "reported" : "partial"
+  };
+}
+function emptyTotal() {
+  return { turns: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalInputTokens: 0, totalObservedTokens: 0, partial: false };
+}
+function add(total, usage2) {
+  total.turns += 1;
+  total.inputTokens += usage2.inputTokens ?? 0;
+  total.outputTokens += usage2.outputTokens ?? 0;
+  total.cachedInputTokens += usage2.cachedInputTokens ?? 0;
+  total.cacheWriteInputTokens += usage2.cacheWriteInputTokens ?? 0;
+  total.totalInputTokens += usage2.totalInputTokens;
+  total.totalObservedTokens += usage2.totalObservedTokens;
+  total.partial ||= usage2.quality === "partial";
+}
+var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
+  seen = /* @__PURE__ */ new Set();
+  total = emptyTotal();
+  models = /* @__PURE__ */ new Map();
+  lastObservedAt = null;
+  static fromEvents(events) {
+    const accumulator = new _ClaudeUsageAccumulator();
+    for (const event of events) accumulator.addEvent(event);
+    return accumulator;
+  }
+  addEvent(event) {
+    if (!["turn_completed", "turn_interrupted", "turn_failed"].includes(event.type)) return false;
+    const turn = token(event.data.turn);
+    if (turn === null) return false;
+    const key = `${event.runId}:${turn}`;
+    if (this.seen.has(key)) return false;
+    const usage2 = normalizeClaudeUsage(event.data.usage ?? event.data.tokens);
+    if (!usage2) return false;
+    this.seen.add(key);
+    const model = typeof event.data.model === "string" && event.data.model.trim() ? event.data.model.trim() : "desconhecido";
+    add(this.total, usage2);
+    const modelTotal = this.models.get(model) ?? emptyTotal();
+    add(modelTotal, usage2);
+    this.models.set(model, modelTotal);
+    this.lastObservedAt = event.ts;
+    return true;
+  }
+  snapshot(observedAt = this.lastObservedAt) {
+    const quality = this.total.turns === 0 ? "unavailable" : this.total.partial ? "partial" : "reported";
+    return {
+      quality,
+      observedAt: this.total.turns === 0 ? null : observedAt,
+      turns: this.total.turns,
+      inputTokens: this.total.inputTokens,
+      outputTokens: this.total.outputTokens,
+      cachedInputTokens: this.total.cachedInputTokens,
+      cacheWriteInputTokens: this.total.cacheWriteInputTokens,
+      totalInputTokens: this.total.totalInputTokens,
+      totalObservedTokens: this.total.totalObservedTokens,
+      byModel: [...this.models.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([model, total]) => ({
+        model,
+        turns: total.turns,
+        inputTokens: total.inputTokens,
+        outputTokens: total.outputTokens,
+        cachedInputTokens: total.cachedInputTokens,
+        cacheWriteInputTokens: total.cacheWriteInputTokens,
+        totalInputTokens: total.totalInputTokens,
+        totalObservedTokens: total.totalObservedTokens,
+        quality: total.partial ? "partial" : "reported"
+      }))
+    };
+  }
+};
+
+// src/usage/codex-usage.ts
+import { spawn as spawn2 } from "node:child_process";
+import readline2 from "node:readline";
+function integer(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function boundedText(value, max = 80) {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, max) : null;
+}
+function record(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+function unavailableCodexUsage(code = null, queriedAt = null) {
+  return {
+    quality: "unavailable",
+    queriedAt,
+    limits: { quality: "unavailable", buckets: [] },
+    activity: { quality: "unavailable", lifetimeTokens: null, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null, daily: [] },
+    task: { quality: "unavailable", groups: [] },
+    failure: code ? { code } : null
+  };
+}
+function window(value) {
+  const item = record(value);
+  const used = integer(item?.usedPercent);
+  if (used === null) return null;
+  const usedPercent = Math.min(100, used);
+  return {
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    windowDurationMins: integer(item?.windowDurationMins),
+    resetsAt: integer(item?.resetsAt)
+  };
+}
+function limits(value) {
+  const response = record(value);
+  const multiple = record(response?.rateLimitsByLimitId);
+  const candidates = multiple && Object.keys(multiple).length ? Object.entries(multiple).slice(0, 16) : [["codex", response?.rateLimits]];
+  const buckets = candidates.flatMap(([fallbackId, raw]) => {
+    const item = record(raw);
+    if (!item) return [];
+    const primary = window(item.primary);
+    const secondary = window(item.secondary);
+    if (!primary && !secondary) return [];
+    return [{
+      id: boundedText(item.limitId) ?? fallbackId.slice(0, 80),
+      name: boundedText(item.limitName),
+      planType: boundedText(item.planType),
+      primary,
+      secondary
+    }];
+  });
+  return { quality: buckets.length ? "reported" : "unavailable", buckets };
+}
+function activity(value) {
+  const response = record(value);
+  const summary = record(response?.summary);
+  const daily = Array.isArray(response?.dailyUsageBuckets) ? response.dailyUsageBuckets.slice(0, 400).flatMap((raw) => {
+    const item = record(raw);
+    const startDate = boundedText(item?.startDate, 20);
+    const tokens = integer(item?.tokens);
+    return startDate && tokens !== null ? [{ startDate, tokens }] : [];
+  }) : [];
+  const result = {
+    quality: "unavailable",
+    lifetimeTokens: integer(summary?.lifetimeTokens),
+    peakDailyTokens: integer(summary?.peakDailyTokens),
+    longestRunningTurnSec: integer(summary?.longestRunningTurnSec),
+    currentStreakDays: integer(summary?.currentStreakDays),
+    longestStreakDays: integer(summary?.longestStreakDays),
+    daily
+  };
+  const fields = [result.lifetimeTokens, result.peakDailyTokens, result.longestRunningTurnSec, result.currentStreakDays, result.longestStreakDays];
+  if (fields.some((item) => item !== null) || daily.length) result.quality = fields.every((item) => item !== null) ? "reported" : "partial";
+  return result;
+}
+function taskUsage(value) {
+  const response = record(value);
+  const usage2 = record(response?.threadUsage);
+  if (!usage2 || !Array.isArray(usage2.groups)) return { quality: "unavailable", groups: [] };
+  const groups = usage2.groups.slice(0, 32).flatMap((raw) => {
+    const item = record(raw);
+    if (!item) return [];
+    return [{
+      model: boundedText(item.model),
+      reasoningEffort: boundedText(item.reasoningEffort),
+      inputTokens: integer(item.inputTokens),
+      cachedInputTokens: integer(item.cachedInputTokens),
+      netNewInputTokens: integer(item.netNewInputTokens),
+      outputTokens: integer(item.outputTokens),
+      totalTokens: integer(item.totalTokens)
+    }];
+  });
+  if (!groups.length) return { quality: "unavailable", groups: [] };
+  const complete = groups.every((group) => group.inputTokens !== null && group.outputTokens !== null && group.totalTokens !== null);
+  return { quality: complete ? "estimated" : "partial", groups };
+}
+var CodexUsageService = class {
+  command;
+  args;
+  minRefreshMs;
+  requestTimeoutMs;
+  child = null;
+  ready = null;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  cache = /* @__PURE__ */ new Map();
+  refreshes = /* @__PURE__ */ new Map();
+  constructor(options = {}) {
+    this.command = options.command ?? "codex";
+    this.args = options.args ?? ["app-server", "--listen", "stdio://"];
+    this.minRefreshMs = Math.max(0, options.minRefreshMs ?? 3e4);
+    this.requestTimeoutMs = Math.max(100, options.requestTimeoutMs ?? 5e3);
+  }
+  async refresh(threadId, options = {}) {
+    const key = threadId ?? "";
+    const cached = this.cache.get(key);
+    if (!options.force && cached && Date.now() - cached.at < this.minRefreshMs) return cached.value;
+    const active = this.refreshes.get(key);
+    if (active) return active;
+    const refresh = this.read(threadId).finally(() => this.refreshes.delete(key));
+    this.refreshes.set(key, refresh);
+    return refresh;
+  }
+  async read(threadId) {
+    try {
+      await this.ensureReady();
+      const [rateRead, activityRead, taskRead] = await Promise.all([
+        this.request("account/rateLimits/read", null).then((value2) => ({ ok: true, value: value2 }), () => ({ ok: false, value: null })),
+        this.request("account/usage/read", null).then((value2) => ({ ok: true, value: value2 }), () => ({ ok: false, value: null })),
+        threadId ? this.request("account/usage/read", { threadId }).then((value2) => ({ ok: true, value: value2 }), () => ({ ok: false, value: null })) : Promise.resolve({ ok: true, value: null })
+      ]);
+      const limitView = rateRead.ok ? limits(rateRead.value) : { quality: "unavailable", buckets: [] };
+      const activityView = activityRead.ok ? activity(activityRead.value) : unavailableCodexUsage().activity;
+      const taskView = threadId && taskRead.ok ? taskUsage(taskRead.value) : { quality: "unavailable", groups: [] };
+      const qualities = [limitView.quality, activityView.quality, taskView.quality];
+      const quality = qualities.every((item) => item === "reported" || item === "estimated") ? "reported" : qualities.some((item) => item !== "unavailable") ? "partial" : "unavailable";
+      const value = {
+        quality,
+        queriedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        limits: limitView,
+        activity: activityView,
+        task: taskView,
+        failure: [rateRead, activityRead, taskRead].some((item) => !item.ok) ? { code: quality === "unavailable" ? "CODEX_USAGE_UNAVAILABLE" : "CODEX_USAGE_PARTIAL" } : null
+      };
+      this.cache.set(threadId ?? "", { at: Date.now(), value });
+      return value;
+    } catch (error) {
+      const code = error instanceof Error && error.message.startsWith("CODEX_USAGE_") ? error.message.split(":", 1)[0] ?? "CODEX_USAGE_UNAVAILABLE" : "CODEX_USAGE_UNAVAILABLE";
+      const value = unavailableCodexUsage(code, (/* @__PURE__ */ new Date()).toISOString());
+      this.cache.set(threadId ?? "", { at: Date.now(), value });
+      return value;
+    }
+  }
+  ensureReady() {
+    if (this.ready) return this.ready;
+    this.ready = new Promise((resolve, reject) => {
+      const child = spawn2(this.command, this.args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+      this.child = child;
+      child.stderr.resume();
+      const reader = readline2.createInterface({ input: child.stdout, crlfDelay: Infinity });
+      reader.on("line", (line) => this.onLine(line));
+      const fail = (code) => {
+        const error = new Error(code);
+        for (const pending of this.pending.values()) {
+          clearTimeout(pending.timer);
+          pending.reject(error);
+        }
+        this.pending.clear();
+        this.child = null;
+        this.ready = null;
+        reject(error);
+      };
+      child.once("error", () => fail("CODEX_USAGE_START_FAILED"));
+      child.once("exit", () => fail("CODEX_USAGE_APP_SERVER_EXITED"));
+      this.request("initialize", { clientInfo: { name: "codeorquestra", title: "CodeOrquestra", version: "0.1.0" }, capabilities: null }, child).then(() => resolve(), () => {
+        this.breakConnection("CODEX_USAGE_INITIALIZE_FAILED");
+        reject(new Error("CODEX_USAGE_INITIALIZE_FAILED"));
+      });
+    });
+    return this.ready;
+  }
+  request(method, params, child = this.child) {
+    if (!child?.stdin.writable) return Promise.reject(new Error("CODEX_USAGE_NOT_CONNECTED"));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error("CODEX_USAGE_REQUEST_TIMEOUT"));
+      }, this.requestTimeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
+      child.stdin.write(`${JSON.stringify({ id, method, params })}
+`, (error) => {
+        if (!error) return;
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(new Error("CODEX_USAGE_WRITE_FAILED"));
+      });
+    });
+  }
+  onLine(line) {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      this.breakConnection("CODEX_USAGE_INVALID_RESPONSE");
+      return;
+    }
+    if (typeof message.id !== "number") return;
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pending.delete(message.id);
+    if (message.error) pending.reject(new Error("CODEX_USAGE_REQUEST_REJECTED"));
+    else pending.resolve(message.result);
+  }
+  breakConnection(code) {
+    const error = new Error(code);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.child?.kill();
+    this.child = null;
+    this.ready = null;
+  }
+  async stop() {
+    const child = this.child;
+    this.child = null;
+    this.ready = null;
+    this.cache.clear();
+    this.breakConnection("CODEX_USAGE_STOPPED");
+    if (!child || child.exitCode !== null) return;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 2e3);
+      timer.unref?.();
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      child.kill();
+    });
+  }
+};
 
 // src/broker/runtime-paths.ts
 import { promises as fs8, existsSync, readFileSync } from "node:fs";
@@ -2360,7 +2709,7 @@ async function findClaudeLauncher(env = process.env) {
 }
 
 // src/quota/global-mutex.ts
-import { spawn as spawn2 } from "node:child_process";
+import { spawn as spawn3 } from "node:child_process";
 import { promises as fs9 } from "node:fs";
 import os3 from "node:os";
 import path9 from "node:path";
@@ -2388,7 +2737,7 @@ var HOLDER_SCRIPT = [
 var localChain = Promise.resolve();
 function acquireWindows(name, waitMs, attemptedAt) {
   return new Promise((resolve, reject) => {
-    const child = spawn2("pwsh", ["-NoProfile", "-NonInteractive", "-Command", HOLDER_SCRIPT], {
+    const child = spawn3("pwsh", ["-NoProfile", "-NonInteractive", "-Command", HOLDER_SCRIPT], {
       env: { ...process.env, CODEORQUESTRA_MUTEX_NAME: name, CODEORQUESTRA_MUTEX_WAIT_MS: String(waitMs) },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
@@ -2605,20 +2954,20 @@ var QuotaService = class {
 };
 
 // src/broker/process-tree.ts
-import { spawn as spawn4 } from "node:child_process";
+import { spawn as spawn5 } from "node:child_process";
 import { closeSync, openSync, statSync, unlinkSync, utimesSync, writeFileSync, readFileSync as readFileSync2, mkdirSync } from "node:fs";
 import { promises as fs11 } from "node:fs";
 import path10 from "node:path";
 
 // src/broker/process-identity.ts
-import { spawn as spawn3 } from "node:child_process";
+import { spawn as spawn4 } from "node:child_process";
 import { promises as fs10 } from "node:fs";
 var PROBE_TIMEOUT_MS = 1e4;
 function runCapture(command, args, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn3(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+      child = spawn4(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     } catch {
       resolve(null);
       return;
@@ -2823,7 +3172,7 @@ async function verifyWorkerLiveness(runDir, expected) {
 function terminateTree(pid) {
   return new Promise((resolve) => {
     if (process.platform === "win32") {
-      const killer = spawn4("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      const killer = spawn5("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       const timer = setTimeout(() => {
         killer.kill();
         resolve();
@@ -3006,6 +3355,7 @@ var TaskManager = class {
   tasks = /* @__PURE__ */ new Map();
   trustStore;
   quota;
+  codexUsage;
   locks = /* @__PURE__ */ new Map();
   options;
   globalSeq = 0;
@@ -3026,6 +3376,10 @@ var TaskManager = class {
     this.stateRoot = options.stateRoot;
     this.trustStore = new TrustStore(options.stateRoot);
     this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 3e4 });
+    this.codexUsage = options.codexUsage ?? (options.harness ? {
+      refresh: async () => unavailableCodexUsage("CODEX_USAGE_DISABLED_IN_HARNESS", (/* @__PURE__ */ new Date()).toISOString()),
+      stop: async () => void 0
+    } : new CodexUsageService());
   }
   get thresholds() {
     return this.options.supervision ?? SUPERVISION;
@@ -3068,6 +3422,8 @@ var TaskManager = class {
     this.stopping = true;
     if (this.supervisionTimer) clearInterval(this.supervisionTimer);
     if (this.derivedTimer) clearInterval(this.derivedTimer);
+    await this.codexUsage.stop();
+    await Promise.allSettled([...this.tasks.values()].flatMap((task) => task.usageRefresh ? [task.usageRefresh] : []));
     await this.settlePreparations();
     for (const task of this.tasks.values()) {
       if (task.run && !task.run.finalized) {
@@ -3110,10 +3466,10 @@ var TaskManager = class {
     for (const taskId of entries) {
       this.assertOperational();
       const dir = path11.join(this.tasksDir(), taskId);
-      const record = await readJsonShared(path11.join(dir, "task.json"));
+      const record2 = await readJsonShared(path11.join(dir, "task.json"));
       this.assertOperational();
-      if (record.status !== "ok") continue;
-      opened.push(await this.openTask(normalizeRecord(record.value), dir));
+      if (record2.status !== "ok") continue;
+      opened.push(await this.openTask(normalizeRecord(record2.value), dir));
       this.assertOperational();
     }
     for (const task of opened) {
@@ -3208,14 +3564,15 @@ var TaskManager = class {
       this.assertOperational();
     }
   }
-  async openTask(record, dir) {
-    const existing = this.tasks.get(record.taskId);
+  async openTask(record2, dir) {
+    const existing = this.tasks.get(record2.taskId);
     if (existing) return existing;
     const log = await EventLog.open(path11.join(dir, "events.jsonl"));
+    const history = await log.readFrom(0);
     const queue = await this.loadQueue(dir);
     const pointer = await readJsonShared(path11.join(dir, "session.json"));
     const task = {
-      record,
+      record: record2,
       dir,
       log,
       run: null,
@@ -3230,10 +3587,13 @@ var TaskManager = class {
       pending: /* @__PURE__ */ new Map(),
       resolvedRequests: /* @__PURE__ */ new Set(),
       alertsRaised: /* @__PURE__ */ new Set(),
-      uncertain: record.requiresReview,
+      uncertain: record2.requiresReview,
       disconnected: false,
       previousSessionId: pointer.status === "ok" && typeof pointer.value.sessionId === "string" ? pointer.value.sessionId : null,
       quota: null,
+      claudeUsage: ClaudeUsageAccumulator.fromEvents(history),
+      codexUsage: unavailableCodexUsage(),
+      usageRefresh: null,
       writer: null,
       derivedDirty: false,
       lastTelemetryEventAt: 0,
@@ -3242,7 +3602,7 @@ var TaskManager = class {
       updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
       chain: Promise.resolve()
     };
-    this.tasks.set(record.taskId, task);
+    this.tasks.set(record2.taskId, task);
     return task;
   }
   async persistRecord(task) {
@@ -3256,14 +3616,15 @@ var TaskManager = class {
     await fs12.mkdir(dir, { recursive: true });
     const existing = this.tasks.get(taskId) ?? null;
     const { handle, hash } = mintTaskHandle();
-    const record = existing ? { ...existing.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() } : { taskId, threadId, createdAt: (/* @__PURE__ */ new Date()).toISOString(), handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString(), workspace: null, requiresReview: false, reviewReason: null };
-    const task = await this.openTask(record, dir);
-    task.record = record;
+    const record2 = existing ? { ...existing.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() } : { taskId, threadId, createdAt: (/* @__PURE__ */ new Date()).toISOString(), handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString(), workspace: null, requiresReview: false, reviewReason: null };
+    const task = await this.openTask(record2, dir);
+    task.record = record2;
     await this.persistRecord(task);
     await this.append(task, task.run?.runId ?? "none", "task_registered", { source, rotated: Boolean(existing) });
     this.options.log(`task ${taskId} registered (${source})`);
     this.changed(task);
-    return { taskId, taskHandle: handle, created: !existing, requiresReview: record.requiresReview };
+    if (!this.options.harness) void this.refreshUsage(task);
+    return { taskId, taskHandle: handle, created: !existing, requiresReview: record2.requiresReview };
   }
   resolveHandle(handle) {
     if (typeof handle !== "string" || !handle) throw new HttpError(403, "TASK_HANDLE_REQUIRED");
@@ -3376,12 +3737,12 @@ var TaskManager = class {
     const run2 = async () => {
       this.globalSeq += 1;
       const gseq = this.globalSeq;
-      const record = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...toolUseId ? { toolUseId } : {}, data, gseq });
+      const record2 = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...toolUseId ? { toolUseId } : {}, data, gseq });
       task.lastActivityAt = Date.now();
       task.derivedDirty = true;
-      task.updatedAt = record.ts;
-      this.options.onEvent(record);
-      return record;
+      task.updatedAt = record2.ts;
+      this.options.onEvent(record2);
+      return record2;
     };
     const next = this.appendChain.then(run2, run2);
     this.appendChain = next.catch(() => void 0);
@@ -3653,8 +4014,8 @@ var TaskManager = class {
       if (!trust.trusted) {
         throw new HttpError(409, "WORKSPACE_NOT_TRUSTED", { reason: trust.reason, pending: trust.pending, changed: trust.changed, fingerprint: inventory.fingerprint, incomplete: inventory.incomplete });
       }
-      const record = await this.trustStore.load(inventory.canonicalWorkspace);
-      const launch = resolveLaunchCustomizations({ inventory, trust, record });
+      const record2 = await this.trustStore.load(inventory.canonicalWorkspace);
+      const launch = resolveLaunchCustomizations({ inventory, trust, record: record2 });
       task.writer = new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15e3, onTelemetryFailure: (failure) => {
         run2.telemetryFailures += 1;
         void this.reportTelemetryFailure(task, run2, failure.file, failure.code);
@@ -3806,7 +4167,7 @@ var TaskManager = class {
       const descriptorFile = path11.join(descriptor.runDir, "worker-descriptor.json");
       await writeFileAtomic(descriptorFile, JSON.stringify(descriptor, null, 2));
       if (this.stopping || task.run !== run2 || run2.finalized) return;
-      const child = spawn5(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
+      const child = spawn6(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
         cwd: run2.contract.workspace,
         env: { ...process.env, [envName("TASK_ID")]: task.record.taskId, [envName("RUN_ID")]: run2.runId, [envName("RUN_TOKEN")]: run2.runToken },
         stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -3868,7 +4229,8 @@ var TaskManager = class {
         break;
       }
       case "event": {
-        await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
+        const event = await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
+        task.claudeUsage.addEvent(event);
         this.applyEvent(task, run2, message.type, message.data, message.toolUseId);
         if (message.type === "permission_requested" || message.type === "question_asked") this.changed(task);
         break;
@@ -3911,6 +4273,7 @@ var TaskManager = class {
         await this.observeBetweenTurns(task, run2);
         await this.deliverNext(task);
         this.changed(task);
+        void this.refreshUsage(task);
         break;
       }
       case "preparation_failed": {
@@ -4169,7 +4532,8 @@ var TaskManager = class {
     const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
     if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: "run_ended", taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
     const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
-    const status = { ...derived.status, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
+    const llmUsage = this.usageView(task);
+    const status = { ...derived.status, llmUsage, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
     await writer.writeStatus(status);
     try {
       await writeFileAtomic(path11.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
@@ -4177,7 +4541,7 @@ var TaskManager = class {
     }
     if (final) {
       try {
-        const outcome = await writer.writeFinalResult({ ...derived.result, telemetryFailures: status.telemetryFailures });
+        const outcome = await writer.writeFinalResult({ ...derived.result, llmUsage, telemetryFailures: status.telemetryFailures });
         if (outcome.fallback) await this.append(task, runId, "final_result_fallback", { path: outcome.path });
       } catch (error) {
         await this.append(task, runId, "final_result_not_persisted", { code: error.code ?? "FINAL_RESULT_NOT_PERSISTED", message: redactSensitiveText(error.message).slice(0, 300) }).catch(() => void 0);
@@ -4211,6 +4575,29 @@ var TaskManager = class {
     }
   }
   // ------------------------------------------------------------------ views
+  usageView(task) {
+    return { claude: task.claudeUsage.snapshot(), codex: task.codexUsage };
+  }
+  async refreshUsage(task, force = false) {
+    if (task.usageRefresh) return task.usageRefresh;
+    if (this.stopping) return task.codexUsage;
+    const pending = (async () => {
+      const snapshot = await this.codexUsage.refresh(task.record.threadId, { force });
+      if (this.stopping) return snapshot;
+      task.codexUsage = snapshot;
+      await this.append(task, task.run?.runId ?? "none", "codex_usage_observed", { snapshot });
+      this.changed(task);
+      if (task.run) await this.writeDerivedNow(task, task.run.runId, task.run.finalized);
+      return snapshot;
+    })().finally(() => {
+      task.usageRefresh = null;
+    });
+    task.usageRefresh = pending;
+    return pending;
+  }
+  refreshAllUsage() {
+    for (const task of this.tasks.values()) void this.refreshUsage(task);
+  }
   async changedFiles(task) {
     const workspace = task.record.workspace;
     if (!workspace) return { observed: [], claudeAuthored: [], observedAt: null };
@@ -4282,6 +4669,7 @@ var TaskManager = class {
       pendingRequests: [...task.pending.values()],
       queue: task.queue.map((entry) => this.queueView(entry)),
       quota: task.quota ?? this.quota.view(run2?.requestedModel ?? "claude-fable-5-1"),
+      usage: this.usageView(task),
       changedFiles: { observed: task.changedFilesCache?.observed ?? [], claudeAuthored: run2 ? [...run2.claudeAuthored] : [], observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null },
       reviewPending: true,
       createdAt: task.record.createdAt,
@@ -4338,11 +4726,11 @@ var TaskManager = class {
     return { events: collected, gapped };
   }
 };
-function normalizeRecord(record) {
+function normalizeRecord(record2) {
   return {
-    ...record,
-    requiresReview: record.requiresReview === true,
-    reviewReason: typeof record.reviewReason === "string" ? record.reviewReason : null
+    ...record2,
+    requiresReview: record2.requiresReview === true,
+    reviewReason: typeof record2.reviewReason === "string" ? record2.reviewReason : null
   };
 }
 async function gitStatus(workspace) {
@@ -4352,7 +4740,7 @@ async function gitStatus(workspace) {
     return [];
   }
   return new Promise((resolve) => {
-    const child = spawn5("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: workspace, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    const child = spawn6("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: workspace, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -4375,7 +4763,7 @@ async function gitStatus(workspace) {
 
 // src/broker/singleton.ts
 import { closeSync as closeSync2, openSync as openSync2, readFileSync as readFileSync3, renameSync, statSync as statSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2, mkdirSync as mkdirSync2 } from "node:fs";
-import { spawn as spawn6 } from "node:child_process";
+import { spawn as spawn7 } from "node:child_process";
 import { createHash as createHash4 } from "node:crypto";
 import path12 from "node:path";
 function readOwner(file) {
@@ -4493,7 +4881,7 @@ async function acquireWindowsMutex(stateRoot) {
     "try{$m.ReleaseMutex()}catch{}",
     "$m.Dispose()"
   ].join(";");
-  const child = spawn6("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+  const child = spawn7("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
     stdio: ["pipe", "pipe", "ignore"],
     windowsHide: true
   });
@@ -4705,8 +5093,8 @@ var Broker = class {
     }
   }
   bootstrap(url, res) {
-    const token = url.searchParams.get("token") ?? "";
-    const outcome = this.identity.redeemBootstrapToken(token);
+    const token2 = url.searchParams.get("token") ?? "";
+    const outcome = this.identity.redeemBootstrapToken(token2);
     if (!outcome.ok) throw new HttpError(403, outcome.code);
     res.statusCode = 303;
     res.setHeader("set-cookie", `${SESSION_COOKIE}=${outcome.session.cookie}; HttpOnly; SameSite=Strict; Path=/`);
@@ -4750,6 +5138,7 @@ var Broker = class {
     const body = method === "POST" ? await readJsonBody(req) : {};
     if (parts[1] === "health" && method === "GET") return sendJson(res, 200, { pid: process.pid, product: BRAND.name, version: RUNTIME_VERSION, startedAt: this.startedAt, tasks: this.tasks.tasks.size, cursorEpoch: this.cursorEpoch });
     if (parts[1] === "status" && method === "GET") {
+      if (identity.source === "browser") this.tasks.refreshAllUsage();
       return sendJson(res, 200, {
         broker: { version: RUNTIME_VERSION, tagline: BRAND.tagline, startedAt: this.startedAt, pid: process.pid, simulatedAdapter: this.options.harness },
         identity: { source: identity.source, taskScope: identity.taskScope },
@@ -4769,8 +5158,8 @@ var Broker = class {
       if (typeof body.taskHandle === "string") scope = this.tasks.resolveHandle(body.taskHandle).record.taskId;
       else if (identity.source === "mcp") throw new HttpError(403, "TASK_HANDLE_REQUIRED");
       else this.requireAdministrative(identity);
-      const token = this.identity.mintBootstrapToken(scope);
-      return sendJson(res, 200, { url: `${this.baseUrl}/bootstrap?token=${token}`, scope, note: "Link de uso \xFAnico; abra no navegador desta m\xE1quina." });
+      const token2 = this.identity.mintBootstrapToken(scope);
+      return sendJson(res, 200, { url: `${this.baseUrl}/bootstrap?token=${token2}`, scope, note: "Link de uso \xFAnico; abra no navegador desta m\xE1quina." });
     }
     if (parts[1] === "locks" && parts[2] && parts[3] === "release" && method === "POST") {
       this.requireAdministrative(identity);
@@ -4809,6 +5198,7 @@ var Broker = class {
       const task = this.scopedTask(identity, taskId);
       if (!action && method === "GET") {
         if (identity.source === "mcp") this.bindHandle(identity, task, body, url);
+        if (identity.source === "browser") void this.tasks.refreshUsage(task);
         const view = this.tasks.view(task);
         view.changedFiles = await this.tasks.changedFiles(task);
         return sendJson(res, 200, view);
@@ -4897,6 +5287,8 @@ var Broker = class {
           if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
           this.tasks.touchCoordinator(task);
           return sendJson(res, 200, { present: true });
+        case "usage-refresh":
+          return sendJson(res, 200, { usage: await this.tasks.refreshUsage(task, true) });
         case "acknowledge-review":
           if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
           await this.tasks.acknowledgeReview(task, typeof body.note === "string" ? body.note : null, source);
@@ -4937,7 +5329,7 @@ var Broker = class {
 };
 
 // src/broker/client.ts
-import { spawn as spawn7 } from "node:child_process";
+import { spawn as spawn8 } from "node:child_process";
 import { promises as fs14 } from "node:fs";
 import path14 from "node:path";
 async function readBrokerInfo(stateRoot) {
@@ -4957,7 +5349,7 @@ async function readBrokerInfo(stateRoot) {
 async function ensureBroker(stateRoot) {
   const existing = await readBrokerInfo(stateRoot);
   if (existing) return { baseUrl: existing.baseUrl, secret: (await fs14.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
-  const child = spawn7(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
+  const child = spawn8(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,

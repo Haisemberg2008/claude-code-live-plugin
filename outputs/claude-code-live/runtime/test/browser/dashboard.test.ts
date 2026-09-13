@@ -201,6 +201,23 @@ describe('dashboard', () => {
     await inspector.getByRole('heading', { name: 'Capacidade' }).waitFor();
     // Anchored and case-sensitive: the effort line also ends in "indisponível".
     await inspector.getByText(/^Indisponível/).waitFor();
+    await inspector.getByRole('heading', { name: 'Consumo por fonte' }).waitFor();
+    const claudeUsage = inspector.locator('[data-testid="usage-claude"]');
+    await claudeUsage.getByText('Claude nesta tarefa').waitFor();
+    await claudeUsage.getByText('reportado').waitFor();
+    await claudeUsage.getByText('Entrada').waitFor();
+    await claudeUsage.getByText('Saída').waitFor();
+    await claudeUsage.getByText('Cache lido').waitFor();
+    const codexUsage = inspector.locator('[data-testid="usage-codex-task"]');
+    await codexUsage.getByText('Codex nesta tarefa').waitFor();
+    await codexUsage.getByText('indisponível').waitFor();
+    const refreshUsage = inspector.getByRole('button', { name: 'Atualizar consumo' });
+    await refreshUsage.waitFor();
+    const [refreshResponse] = await Promise.all([
+      page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/usage-refresh`) && response.request().method() === 'POST'),
+      refreshUsage.click(),
+    ]);
+    assert.equal(refreshResponse.status(), 200);
     await inspector.getByText('Revisão independente pendente').waitFor();
     await inspector.getByRole('heading', { name: 'Arquivos alterados observados' }).waitFor();
     assert.equal(await page.locator('[data-testid="progress-percent"]').count(), 0, 'no fake progress percentage');

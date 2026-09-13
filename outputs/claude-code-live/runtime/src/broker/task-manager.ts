@@ -27,7 +27,9 @@ import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
 import { isHarness, envName } from '../shared/env.ts';
-import type { ActionSource, AuthorizedModel, EventRecord, PendingRequestView, QueueEntryView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import type { ActionSource, AuthorizedModel, CodexUsageView, EventRecord, PendingRequestView, QueueEntryView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import { ClaudeUsageAccumulator } from '../usage/claude-usage.ts';
+import { CodexUsageService, type CodexUsageReader, unavailableCodexUsage } from '../usage/codex-usage.ts';
 import { sha256, mintTaskHandle, verifyTaskHandle, taskIdForThread, THREAD_ID_PATTERN } from './identity.ts';
 import { HttpError } from './http.ts';
 import { findClaudeLauncher, nodeExecArgv, engineInfo, workerEntry } from './runtime-paths.ts';
@@ -130,6 +132,9 @@ export interface TaskState {
   disconnected: boolean;
   previousSessionId: string | null;
   quota: ReturnType<QuotaService['view']> | null;
+  claudeUsage: ClaudeUsageAccumulator;
+  codexUsage: CodexUsageView;
+  usageRefresh: Promise<CodexUsageView> | null;
   writer: StateWriter | null;
   derivedDirty: boolean;
   lastTelemetryEventAt: number;
@@ -150,6 +155,8 @@ export interface TaskManagerOptions {
   quotaWaitMs?: number;
   /** Harness-only scheduling seam used to prove recovery cancellation. */
   recoveryCheckpoint?: () => Promise<void>;
+  /** Test seam; production uses one read-only App Server connection. */
+  codexUsage?: CodexUsageReader;
 }
 
 const WORKER_END_GRACE_MS = 15000;
@@ -163,6 +170,7 @@ export class TaskManager {
   readonly tasks = new Map<string, TaskState>();
   readonly trustStore: TrustStore;
   readonly quota: QuotaService;
+  readonly codexUsage: CodexUsageReader;
   readonly locks = new Map<string, LockRecord>();
   private readonly options: TaskManagerOptions;
   private globalSeq = 0;
@@ -185,6 +193,10 @@ export class TaskManager {
     this.stateRoot = options.stateRoot;
     this.trustStore = new TrustStore(options.stateRoot);
     this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 30000 });
+    this.codexUsage = options.codexUsage ?? (options.harness ? {
+      refresh: async () => unavailableCodexUsage('CODEX_USAGE_DISABLED_IN_HARNESS', new Date().toISOString()),
+      stop: async () => undefined,
+    } : new CodexUsageService());
   }
 
   get thresholds(): SupervisionThresholds {
@@ -232,6 +244,8 @@ export class TaskManager {
     this.stopping = true;
     if (this.supervisionTimer) clearInterval(this.supervisionTimer);
     if (this.derivedTimer) clearInterval(this.derivedTimer);
+    await this.codexUsage.stop();
+    await Promise.allSettled([...this.tasks.values()].flatMap((task) => task.usageRefresh ? [task.usageRefresh] : []));
     await this.settlePreparations();
     for (const task of this.tasks.values()) {
       if (task.run && !task.run.finalized) {
@@ -387,6 +401,7 @@ export class TaskManager {
     const existing = this.tasks.get(record.taskId);
     if (existing) return existing;
     const log = await EventLog.open(path.join(dir, 'events.jsonl'));
+    const history = await log.readFrom(0);
     const queue = await this.loadQueue(dir);
     const pointer = await readJsonShared<{ sessionId?: string }>(path.join(dir, 'session.json'));
     const task: TaskState = {
@@ -409,6 +424,9 @@ export class TaskManager {
       disconnected: false,
       previousSessionId: pointer.status === 'ok' && typeof pointer.value.sessionId === 'string' ? pointer.value.sessionId : null,
       quota: null,
+      claudeUsage: ClaudeUsageAccumulator.fromEvents(history),
+      codexUsage: unavailableCodexUsage(),
+      usageRefresh: null,
       writer: null,
       derivedDirty: false,
       lastTelemetryEventAt: 0,
@@ -443,6 +461,7 @@ export class TaskManager {
     await this.append(task, task.run?.runId ?? 'none', 'task_registered', { source, rotated: Boolean(existing) });
     this.options.log(`task ${taskId} registered (${source})`);
     this.changed(task);
+    if (!this.options.harness) void this.refreshUsage(task);
     return { taskId, taskHandle: handle, created: !existing, requiresReview: record.requiresReview };
   }
 
@@ -1113,7 +1132,8 @@ export class TaskManager {
         break;
       }
       case 'event': {
-        await this.append(task, run.runId, message.type, message.data, message.toolUseId);
+        const event = await this.append(task, run.runId, message.type, message.data, message.toolUseId);
+        task.claudeUsage.addEvent(event);
         this.applyEvent(task, run, message.type, message.data, message.toolUseId);
         if (message.type === 'permission_requested' || message.type === 'question_asked') this.changed(task);
         break;
@@ -1159,6 +1179,7 @@ export class TaskManager {
         await this.observeBetweenTurns(task, run);
         await this.deliverNext(task);
         this.changed(task);
+        void this.refreshUsage(task);
         break;
       }
       case 'preparation_failed': {
@@ -1432,7 +1453,8 @@ export class TaskManager {
     const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
     if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: 'run_ended', taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
     const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
-    const status = { ...derived.status, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
+    const llmUsage = this.usageView(task);
+    const status = { ...derived.status, llmUsage, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
     await writer.writeStatus(status);
     try {
       await writeFileAtomic(path.join(runDir, 'acompanhamento.txt'), derived.acompanhamento, { maxWaitMs: 1500 });
@@ -1441,7 +1463,7 @@ export class TaskManager {
     }
     if (final) {
       try {
-        const outcome = await writer.writeFinalResult({ ...derived.result, telemetryFailures: status.telemetryFailures });
+        const outcome = await writer.writeFinalResult({ ...derived.result, llmUsage, telemetryFailures: status.telemetryFailures });
         if (outcome.fallback) await this.append(task, runId, 'final_result_fallback', { path: outcome.path });
       } catch (error) {
         await this.append(task, runId, 'final_result_not_persisted', { code: (error as { code?: string }).code ?? 'FINAL_RESULT_NOT_PERSISTED', message: redactSensitiveText((error as Error).message).slice(0, 300) }).catch(() => undefined);
@@ -1478,6 +1500,30 @@ export class TaskManager {
   }
 
   // ------------------------------------------------------------------ views
+
+  usageView(task: TaskState): TaskView['usage'] {
+    return { claude: task.claudeUsage.snapshot(), codex: task.codexUsage };
+  }
+
+  async refreshUsage(task: TaskState, force = false): Promise<CodexUsageView> {
+    if (task.usageRefresh) return task.usageRefresh;
+    if (this.stopping) return task.codexUsage;
+    const pending = (async () => {
+      const snapshot = await this.codexUsage.refresh(task.record.threadId, { force });
+      if (this.stopping) return snapshot;
+      task.codexUsage = snapshot;
+      await this.append(task, task.run?.runId ?? 'none', 'codex_usage_observed', { snapshot });
+      this.changed(task);
+      if (task.run) await this.writeDerivedNow(task, task.run.runId, task.run.finalized);
+      return snapshot;
+    })().finally(() => { task.usageRefresh = null; });
+    task.usageRefresh = pending;
+    return pending;
+  }
+
+  refreshAllUsage(): void {
+    for (const task of this.tasks.values()) void this.refreshUsage(task);
+  }
 
   async changedFiles(task: TaskState): Promise<{ observed: string[]; claudeAuthored: string[]; observedAt: string | null }> {
     const workspace = task.record.workspace;
@@ -1557,6 +1603,7 @@ export class TaskManager {
       pendingRequests: [...task.pending.values()],
       queue: task.queue.map((entry) => this.queueView(entry)),
       quota: task.quota ?? this.quota.view((run?.requestedModel as AuthorizedModel | undefined) ?? 'claude-fable-5-1'),
+      usage: this.usageView(task),
       changedFiles: { observed: task.changedFilesCache?.observed ?? [], claudeAuthored: run ? [...run.claudeAuthored] : [], observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null },
       reviewPending: true,
       createdAt: task.record.createdAt,
