@@ -814,6 +814,13 @@ export class TaskManager {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, 'LEGACY_CONTRACT_USE_LEGACY_RUNNER', { message: 'Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2.' });
+    // The contract accepts and validates a worktree target before the broker can
+    // provision one. Refusing here, rather than silently running in the declared
+    // checkout, keeps the job's meaning honest: a caller that asked for an
+    // isolated tree never gets the shared one without being told.
+    if (contract.execution.mode === 'worktree') {
+      throw new HttpError(501, 'WORKTREE_NOT_IMPLEMENTED', { message: 'execution.mode "worktree" já é validado pelo contrato, mas o provisionamento ainda não existe neste broker. Use "checkout".' });
+    }
     // Admission stops the moment shutdown begins, before any reservation.
     if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker está encerrando; nenhuma execução nova é aceita.' });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {

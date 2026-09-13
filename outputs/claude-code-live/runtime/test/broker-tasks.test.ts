@@ -662,6 +662,25 @@ describe('supervision alerts and coordinator presence', () => {
 });
 
 describe('locks and scoped termination', () => {
+  test('a worktree target is refused before any reservation, so no lock is left behind', async () => {
+    const { taskId, taskHandle } = await register('thread-worktree-unimplemented');
+    await approveTrust(taskId, workspaceA);
+    const job = devJob(workspaceA, 'say: nao deve iniciar', { execution: { mode: 'worktree' } });
+    const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job }) });
+    assert.equal(response.status, 501, response.text);
+    assert.equal((response.body as { error?: string }).error, 'WORKTREE_NOT_IMPLEMENTED');
+    // The refusal must happen before the synchronous critical section. If it
+    // ever moves below the reservation, this task would hold the checkout and
+    // the next start would fail with WORKSPACE_WRITER_LOCKED instead.
+    const locks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
+    assert.equal(locks.status, 200, locks.text);
+    assert.deepEqual(locks.body, [], 'nenhuma trava pode sobrar de um job recusado');
+    const view = await task(taskId);
+    assert.equal(view.currentRun, null, 'nenhuma execução pode ter sido registrada');
+    // The same task can still start a normal run: nothing was consumed.
+    await startRun(taskId, taskHandle, devJob(workspaceA, 'say: agora com checkout'));
+  });
+
   test('same-task runs serialize, and the workspace writer lock spans tasks while reads coexist', async () => {
     const first = await register('thread-lock-1');
     await startRun(first.taskId, first.taskHandle, devJob(workspaceB, script(['say: editando', 'sleep: 3000'])));

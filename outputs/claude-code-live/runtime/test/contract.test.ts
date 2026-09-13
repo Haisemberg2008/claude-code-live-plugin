@@ -32,6 +32,9 @@ describe('v2 development job', () => {
     assert.equal(contract.coordination.planApproved, true);
     assert.deepEqual(contract.coordination.responsibilities, responsibilities());
     assert.deepEqual(contract.scope, { summary: 'Runtime v2 em outputs/claude-code-live/runtime', paths: ['outputs/claude-code-live/runtime/'], wholeWorkspace: false });
+    // A job that never mentions `execution` keeps running in its declared
+    // checkout. This is the whole backward-compatibility story for the field.
+    assert.deepEqual(contract.execution, { mode: 'checkout', worktree: null });
     assert.equal(contract.legacy, null);
   });
 
@@ -140,6 +143,76 @@ describe('v2 development job', () => {
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { profile: 'diagnostic' })), 'PROFILE_INVALID');
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { contractVersion: 3 })), 'CONTRACT_VERSION_UNSUPPORTED');
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { contractVersion: '2' })), 'CONTRACT_VERSION_UNSUPPORTED');
+  });
+});
+
+describe('v2 execution target', () => {
+  const worktreeJob = (worktree?: unknown, overrides: Record<string, unknown> = {}) =>
+    jobV2(workspace, { execution: { mode: 'worktree', ...(worktree === undefined ? {} : { worktree }) }, ...overrides });
+
+  test('an absent, null or explicit checkout target all resolve to the declared checkout', () => {
+    const expected = { mode: 'checkout', worktree: null };
+    assert.deepEqual(resolveJobContract(jobV2(workspace)).execution, expected);
+    assert.deepEqual(resolveJobContract(jobV2(workspace, { execution: null })).execution, expected);
+    assert.deepEqual(resolveJobContract(jobV2(workspace, { execution: { mode: 'checkout' } })).execution, expected);
+  });
+
+  test('a worktree target resolves with broker-derived defaults, and names when given', () => {
+    assert.deepEqual(resolveJobContract(worktreeJob()).execution, {
+      mode: 'worktree',
+      worktree: { branch: null, baseRef: null, onExistingWork: 'refuse' },
+    });
+    assert.deepEqual(resolveJobContract(worktreeJob({ branch: 'codeorquestra/task-1', baseRef: 'main' })).execution, {
+      mode: 'worktree',
+      worktree: { branch: 'codeorquestra/task-1', baseRef: 'main', onExistingWork: 'refuse' },
+    });
+  });
+
+  test('unexpected fields are refused rather than ignored, at both levels', () => {
+    for (const job of [
+      jobV2(workspace, { execution: 'worktree' }),
+      jobV2(workspace, { execution: { mode: 'worktree', unexpected: 1 } }),
+      jobV2(workspace, { execution: { mode: 'branch' } }),
+      worktreeJob({ branch: 'main', unexpected: 1 }),
+      // A worktree payload only means something in worktree mode; accepting it
+      // beside `checkout` would silently discard what the caller asked for.
+      jobV2(workspace, { execution: { mode: 'checkout', worktree: { branch: 'x' } } }),
+      // Reserved for a future contract change, never a silent behaviour shift.
+      worktreeJob({ onExistingWork: 'reuse' }),
+    ]) {
+      assertThrowsCode(() => resolveJobContract(job), 'EXECUTION_INVALID', JSON.stringify(job.execution));
+    }
+  });
+
+  test('ref names are validated here, because they become git arguments', () => {
+    for (const branch of ['-force', '..', 'a..b', 'feature/', 'feature/.hidden', 'feature/x.lock', 'x.lock', 'feature//x', 'trailing.', '.leading', 'com espaço', 'semi;colon', 'til~de', 'a'.repeat(102), 42]) {
+      assertThrowsCode(() => resolveJobContract(worktreeJob({ branch })), 'EXECUTION_BRANCH_INVALID', `branch ${String(branch)}`);
+    }
+    // baseRef goes through the same gate, not a laxer one.
+    assertThrowsCode(() => resolveJobContract(worktreeJob({ baseRef: 'origin/main;rm -rf' })), 'EXECUTION_BRANCH_INVALID');
+    for (const branch of ['main', 'codeorquestra/task-4f2a', 'release-1.2.3', 'a_b', 'x']) {
+      assert.equal(resolveJobContract(worktreeJob({ branch })).execution.worktree?.branch, branch);
+    }
+  });
+
+  test('a worktree is only provisioned for an assigned implementation actually about to run', () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      // Nothing writes in a read run, so it must see the tree the human sees.
+      ['profile read', { profile: 'read' }],
+      // Planning has no approved work to isolate yet.
+      ['planning phase', { coordination: coordination({ phase: 'planning', planApproved: false, planSummary: 'Inspecionar antes de propor.' }) }],
+      // Claude is not the one editing, so an isolated tree would stay empty.
+      ['implementation not claude', { coordination: coordination({ responsibilities: responsibilities({ implementation: 'codex' }) }) }],
+    ];
+    for (const [label, overrides] of cases) {
+      assertThrowsCode(() => resolveJobContract(worktreeJob(undefined, overrides)), 'WORKTREE_NOT_APPLICABLE', label);
+    }
+  });
+
+  test('execution belongs to v2 only and is refused in a legacy job instead of ignored', () => {
+    const job = legacyJob(workspace, 'C:\execucoes\prompt.md');
+    job.execution = { mode: 'worktree' };
+    assertThrowsCode(() => resolveJobContract(job), 'V2_FIELD_IN_LEGACY');
   });
 });
 

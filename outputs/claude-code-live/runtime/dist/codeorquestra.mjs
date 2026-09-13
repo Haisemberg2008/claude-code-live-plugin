@@ -967,6 +967,56 @@ function resolveAuth(job) {
   for (const key of Object.keys(raw)) if (key !== "allowApiBilling") throw new ContractError("AUTH_INVALID", `auth cont\xE9m o campo inesperado ${key}.`);
   return { allowApiBilling: allow === true };
 }
+var REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/;
+function resolveRefName(value, field) {
+  if (value === void 0 || value === null) return null;
+  if (typeof value !== "string") throw new ContractError("EXECUTION_BRANCH_INVALID", `execution.worktree.${field} deve ser texto ou null.`);
+  const invalid = (why) => {
+    throw new ContractError("EXECUTION_BRANCH_INVALID", `execution.worktree.${field} ${why}`);
+  };
+  if (!REF_NAME.test(value)) invalid("aceita apenas letras, d\xEDgitos, ponto, h\xEDfen, barra e sublinhado, come\xE7ando por letra ou d\xEDgito, com no m\xE1ximo 101 caracteres.");
+  if (value.includes("..")) invalid('n\xE3o pode conter "..".');
+  if (value.endsWith("/") || value.endsWith(".")) invalid('n\xE3o pode terminar em "/" nem ".".');
+  for (const part of value.split("/")) {
+    if (part === "") invalid('n\xE3o pode conter componentes vazios ("//").');
+    if (part.startsWith(".")) invalid('n\xE3o pode ter componente come\xE7ando com ".".');
+    if (part.endsWith(".lock")) invalid('n\xE3o pode ter componente terminando em ".lock".');
+  }
+  return value;
+}
+function resolveExecution(job, coordination, profile) {
+  const raw = own(job, "execution");
+  if (raw === void 0 || raw === null) return { mode: "checkout", worktree: null };
+  if (!isDict(raw)) throw new ContractError("EXECUTION_INVALID", "execution deve ser um objeto.");
+  for (const key of Object.keys(raw)) {
+    if (key !== "mode" && key !== "worktree") throw new ContractError("EXECUTION_INVALID", `execution cont\xE9m o campo inesperado ${key}.`);
+  }
+  const mode = own(raw, "mode");
+  if (mode !== "checkout" && mode !== "worktree") throw new ContractError("EXECUTION_INVALID", "execution.mode deve ser checkout ou worktree.");
+  const worktreeRaw = own(raw, "worktree");
+  if (mode === "checkout") {
+    if (worktreeRaw !== void 0 && worktreeRaw !== null) throw new ContractError("EXECUTION_INVALID", "execution.worktree s\xF3 \xE9 aceito quando execution.mode \xE9 worktree.");
+    return { mode: "checkout", worktree: null };
+  }
+  if (profile === "read") throw new ContractError("WORKTREE_NOT_APPLICABLE", "O perfil read n\xE3o toma trava de escrita e deve inspecionar a mesma \xE1rvore que o usu\xE1rio v\xEA.");
+  if (coordination.phase !== "execution") throw new ContractError("WORKTREE_NOT_APPLICABLE", "Um worktree s\xF3 \xE9 provisionado na fase de execu\xE7\xE3o.");
+  if (coordination.responsibilities.implementation !== "claude") throw new ContractError("WORKTREE_NOT_APPLICABLE", "Um worktree s\xF3 \xE9 provisionado quando implementation pertence ao Claude.");
+  if (worktreeRaw === void 0 || worktreeRaw === null) return { mode: "worktree", worktree: { branch: null, baseRef: null, onExistingWork: "refuse" } };
+  if (!isDict(worktreeRaw)) throw new ContractError("EXECUTION_INVALID", "execution.worktree deve ser um objeto ou null.");
+  for (const key of Object.keys(worktreeRaw)) {
+    if (key !== "branch" && key !== "baseRef" && key !== "onExistingWork") throw new ContractError("EXECUTION_INVALID", `execution.worktree cont\xE9m o campo inesperado ${key}.`);
+  }
+  const onExistingWork = own(worktreeRaw, "onExistingWork");
+  if (onExistingWork !== void 0 && onExistingWork !== "refuse") throw new ContractError("EXECUTION_INVALID", 'execution.worktree.onExistingWork aceita apenas "refuse".');
+  return {
+    mode: "worktree",
+    worktree: {
+      branch: resolveRefName(own(worktreeRaw, "branch"), "branch"),
+      baseRef: resolveRefName(own(worktreeRaw, "baseRef"), "baseRef"),
+      onExistingWork: "refuse"
+    }
+  };
+}
 function resolveV2(job) {
   for (const legacyField of ["mode", "allowedCommands", "modelPolicy", "timeoutPolicy", "timeoutSeconds"]) {
     if (Object.prototype.hasOwnProperty.call(job, legacyField)) throw new ContractError("LEGACY_FIELD_IN_V2", `O campo legado ${legacyField} n\xE3o existe no contrato v2.`);
@@ -980,6 +1030,7 @@ function resolveV2(job) {
   const model = resolveModelV2(own(job, "model"));
   const effort = resolveEffortV2(own(job, "effort"));
   const scope = resolveScope(own(job, "scope"), coordination.phase);
+  const execution = resolveExecution(job, coordination, profileRaw);
   const codexThreadId = resolveThreadId(own(job, "codexThreadId"));
   const auth = resolveAuth(job);
   const resumeFrom = stringField(own(job, "resumeFrom"));
@@ -999,6 +1050,7 @@ function resolveV2(job) {
     effort,
     coordination,
     scope,
+    execution,
     launch: { permissionMode: "default", safeMode: false, permissionPromptsDisabled: false, restricted: false, strictMcpConfig: true },
     capabilities,
     limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
@@ -1048,6 +1100,9 @@ function resolveLegacyTimeoutPolicy(policy, timeoutSeconds) {
   return { mode: "adaptive", renewEverySeconds: renew, idleAfterSeconds: idle, hardStopAfterSeconds: hard };
 }
 function resolveLegacy(job) {
+  if (Object.prototype.hasOwnProperty.call(job, "execution")) {
+    throw new ContractError("V2_FIELD_IN_LEGACY", "O campo execution pertence ao contrato v2 (contractVersion: 2); o runner legado executa sempre no checkout declarado.");
+  }
   const workspace = resolveWorkspace(own(job, "workspace"));
   const { prompt, promptFile } = resolvePrompt(job);
   const coordination = resolveCoordination(own(job, "coordination"));
@@ -1099,6 +1154,10 @@ function resolveLegacy(job) {
     effort,
     coordination,
     scope: { summary: coordination.planSummary, paths: [], wholeWorkspace: false },
+    // The legacy runner has no worktree provisioning; a v1 job always runs in
+    // the declared checkout. An `execution` field here is refused above rather
+    // than ignored, so it can never look accepted.
+    execution: { mode: "checkout", worktree: null },
     launch: { permissionMode: "dontAsk", safeMode: true, permissionPromptsDisabled: true, restricted: profileRaw === "restricted", strictMcpConfig: true },
     capabilities,
     limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
@@ -3934,6 +3993,9 @@ var TaskManager = class {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, "LEGACY_CONTRACT_USE_LEGACY_RUNNER", { message: "Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2." });
+    if (contract.execution.mode === "worktree") {
+      throw new HttpError(501, "WORKTREE_NOT_IMPLEMENTED", { message: 'execution.mode "worktree" j\xE1 \xE9 validado pelo contrato, mas o provisionamento ainda n\xE3o existe neste broker. Use "checkout".' });
+    }
     if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker est\xE1 encerrando; nenhuma execu\xE7\xE3o nova \xE9 aceita." });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
       throw new HttpError(409, "REQUIRES_REVIEW", { message: "A \xFAltima execu\xE7\xE3o ficou incerta ou desconectada; confirme a revis\xE3o (acknowledgeReview: true) antes de iniciar outra.", reason: task.record.reviewReason });
