@@ -243,7 +243,11 @@ export function App() {
           {ordered.length === 0 ? <p className="empty">Nenhuma tarefa ativa. Registre uma tarefa no terminal do Codex e inicie uma execução.</p> : null}
         </nav>
         <main className="room">
-          {task ? (
+          {/* A task-scoped panel never sees the fleet: the toggle itself is
+              hidden, not just the data, so the surface matches the scope. */}
+          {!identity?.taskScope && active.length > 1 && !task ? (
+            <FleetBoard tasks={active} now={now} onSelect={select} />
+          ) : task ? (
             <Room
               key={task.taskId}
               task={task}
@@ -268,6 +272,21 @@ export function App() {
   );
 }
 
+/** The badges a task carries, in one place so the list and the board agree. */
+function TaskBadges({ task }: { task: TaskView }) {
+  return (
+    <span className="task-meta">
+      <span className={`state state-${task.state}`}>{STATE_LABELS[task.state] ?? task.state}</span>
+      {task.simulated ? <span className="badge">Simulado</span> : null}
+      {task.currentRun && TERMINAL_STATUSES.has(task.currentRun.status)
+        ? <span className={`badge ${task.currentRun.status === 'COMPLETED' ? 'ok' : task.currentRun.status === 'CANCELLED' ? '' : 'error'}`} data-testid="run-outcome">{OUTCOME_LABELS[task.currentRun.status] ?? task.currentRun.status}</span>
+        : null}
+      {task.pendingRequests.length ? <span className="badge warn">{task.pendingRequests.length} decisão(ões)</span> : null}
+      {task.requiresReview ? <span className="badge error">revisão</span> : null}
+    </span>
+  );
+}
+
 function TaskList({ title, tasks, selected, onSelect }: { title: string; tasks: TaskView[]; selected: string | null; onSelect: (id: string) => void }) {
   return (
     <section className="task-section">
@@ -277,20 +296,49 @@ function TaskList({ title, tasks, selected, onSelect }: { title: string; tasks: 
           <li key={task.taskId}>
             <button type="button" data-testid="task-item" className={`task-item ${task.taskId === selected ? 'selected' : ''}`} onClick={() => onSelect(task.taskId)} aria-pressed={task.taskId === selected}>
               <span className="task-thread" title={task.threadId}>{task.threadId}</span>
-              <span className="task-meta">
-                <span className={`state state-${task.state}`}>{STATE_LABELS[task.state] ?? task.state}</span>
-                {task.simulated ? <span className="badge">Simulado</span> : null}
-                {task.currentRun && TERMINAL_STATUSES.has(task.currentRun.status)
-                  ? <span className={`badge ${task.currentRun.status === 'COMPLETED' ? 'ok' : task.currentRun.status === 'CANCELLED' ? '' : 'error'}`} data-testid="run-outcome">{OUTCOME_LABELS[task.currentRun.status] ?? task.currentRun.status}</span>
-                  : null}
-                {task.pendingRequests.length ? <span className="badge warn">{task.pendingRequests.length} decisão(ões)</span> : null}
-                {task.requiresReview ? <span className="badge error">revisão</span> : null}
-              </span>
+              <TaskBadges task={task} />
             </button>
           </li>
         ))}
       </ul>
     </section>
+  );
+}
+
+/**
+ * Every active task at once, for when several are running in parallel.
+ *
+ * Shows what a coordinator has to decide between: who is blocked on a decision,
+ * who is writing where, and which branch each one is on.
+ */
+function FleetBoard({ tasks, now, onSelect }: { tasks: TaskView[]; now: number; onSelect: (id: string) => void }) {
+  return (
+    <div className="fleet" data-testid="fleet-board">
+      <h1 className="fleet-title">Frota <span className="count">{tasks.length}</span></h1>
+      <p className="muted">Cada tarefa Codex trabalha na própria árvore. Clique para abrir a conversa completa.</p>
+      <div className="fleet-grid">
+        {tasks.map((task) => {
+          const run = task.currentRun;
+          const elapsed = run ? Math.max(0, Math.round(((run.endedAt ? Date.parse(run.endedAt) : now) - Date.parse(run.startedAt)) / 1000)) : 0;
+          return (
+            <button key={task.taskId} type="button" className={`fleet-card ${task.pendingRequests.length ? 'needs-decision' : ''}`} data-testid="fleet-card" onClick={() => onSelect(task.taskId)}>
+              <span className="fleet-thread" title={task.threadId}>{task.threadId}</span>
+              <TaskBadges task={task} />
+              <dl className="fleet-facts">
+                <dt>Árvore</dt>
+                <dd className="mono wrap">{task.worktree ? task.worktree.branch : 'checkout declarado'}</dd>
+                <dt>Ferramenta</dt>
+                <dd>{run?.currentTool ?? 'nenhuma'}</dd>
+                <dt>Arquivos</dt>
+                <dd>{task.changedFiles.claudeAuthored.length} do Claude · {task.changedFiles.observed.length} observados</dd>
+                <dt>Tempo</dt>
+                <dd>{run ? formatElapsed(elapsed) : '—'}</dd>
+              </dl>
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -542,6 +590,12 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
         <dt>Identificador</dt><dd className="mono" title={task.taskId}>{abbreviate(task.taskId)}</dd>
         <dt>Thread Codex</dt><dd className="mono" title={task.threadId}>{abbreviate(task.threadId, 12)}</dd>
         <dt>Workspace</dt><dd className="mono wrap" title={task.workspace ?? ''}>{task.workspace ?? '—'}</dd>
+        {task.worktree ? (
+          <>
+            <dt>Worktree</dt><dd className="mono wrap">{task.worktree.branch}</dd>
+            <dt>Declarado</dt><dd className="mono wrap" title={task.worktree.declaredWorkspace ?? ''}>{task.worktree.declaredWorkspace ?? '—'}</dd>
+          </>
+        ) : null}
         <dt>Estado</dt><dd>{STATE_LABELS[task.state] ?? task.state}</dd>
         <dt>Coordenador</dt><dd>{task.coordinatorPresence === 'present' ? `presente (há ${presenceAge ?? 0}s)` : 'aguardando coordenador'}</dd>
         {task.requiresReview ? <><dt>Revisão</dt><dd className="warn-text">Execução incerta ou desconectada: revise antes de retomar.</dd></> : null}

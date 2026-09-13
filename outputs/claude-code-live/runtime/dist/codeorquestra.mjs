@@ -5349,7 +5349,16 @@ var TaskManager = class {
       queue: task.queue.map((entry) => this.queueView(entry)),
       quota: task.quota ?? this.quota.view(run2?.requestedModel ?? "claude-fable-5-1"),
       usage: this.usageView(task),
-      changedFiles: { observed: task.changedFilesCache?.observed ?? [], claudeAuthored: run2 ? [...run2.claudeAuthored] : [], observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null },
+      // Relative, like changedFiles() already returns. They disagreed before —
+      // view() emitted absolute paths and only the single-task GET overwrote
+      // them — which a fleet of worktrees would have made unreadable: two
+      // absolute paths from two checkouts look nearly identical.
+      changedFiles: {
+        observed: task.changedFilesCache?.observed ?? [],
+        claudeAuthored: run2 && task.record.workspace ? [...run2.claudeAuthored].map((file) => path13.relative(task.record.workspace, file).replace(/\\/g, "/")).filter((file) => file && !file.startsWith("..")) : [],
+        observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null
+      },
+      worktree: run2?.worktree ? { path: run2.worktree.path, branch: run2.worktree.branch, baseRef: run2.worktree.baseRef, repoKey: run2.worktree.repository.repoKey, declaredWorkspace: run2.declaredWorkspace } : null,
       reviewPending: true,
       createdAt: task.record.createdAt,
       updatedAt: task.updatedAt,

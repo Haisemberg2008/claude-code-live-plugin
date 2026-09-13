@@ -156,3 +156,20 @@ input.note { background: var(--bg); color: var(--text); border: 1px solid var(--
   .mobile-only { display: inline-block; }
   .feed { padding: 10px; }
 }
+
+/* Fleet board: one card per active task, so several parallel runs are
+   comparable at a glance instead of one at a time. */
+.fleet { padding: 16px 20px; overflow-y: auto; }
+.fleet-title { font-size: 20px; margin: 0 0 4px; }
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 14px; }
+.fleet-card {
+  display: flex; flex-direction: column; gap: 8px; text-align: left;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: inherit; font: inherit; cursor: pointer;
+}
+.fleet-card:hover { border-color: var(--accent); }
+.fleet-card.needs-decision { border-left: 3px solid var(--warn); }
+.fleet-thread { font-weight: 600; overflow-wrap: anywhere; }
+.fleet-facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; font-size: 12.5px; }
+.fleet-facts dt { color: var(--muted); }
+.fleet-facts dd { margin: 0; overflow-wrap: anywhere; }

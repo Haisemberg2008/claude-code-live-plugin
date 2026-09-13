@@ -221,6 +221,8 @@ export interface TaskView {
   quota: QuotaView;
   usage: HybridUsageView;
   changedFiles: { observed: string[]; claudeAuthored: string[]; observedAt: string | null };
+  /** Set when the run executes in a provisioned worktree instead of the declared checkout. */
+  worktree: { path: string; branch: string; baseRef: string | null; repoKey: string; declaredWorkspace: string | null } | null;
   reviewPending: boolean;
   createdAt: string;
   updatedAt: string;
