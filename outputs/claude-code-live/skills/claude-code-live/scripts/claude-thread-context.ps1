@@ -83,6 +83,30 @@ function Write-ClaudeLiveSessionPointer {
     [IO.File]::Move($temp, $PointerFile, $true)
 }
 
+function Wait-ClaudeLivePanelReady {
+    param(
+        [Parameter(Mandatory)][string]$RegistrationFile,
+        [Parameter(Mandatory)][Diagnostics.Process]$PanelProcess,
+        [int]$TimeoutMilliseconds = 5000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        try {
+            $PanelProcess.Refresh()
+            if ($PanelProcess.HasExited) { return $false }
+            if (Test-Path -LiteralPath $RegistrationFile) {
+                $panelInfo = Get-Content -LiteralPath $RegistrationFile -Raw -Encoding utf8 | ConvertFrom-Json
+                if ([int]$panelInfo.pid -eq $PanelProcess.Id -and
+                    [long]$panelInfo.started -eq $PanelProcess.StartTime.ToUniversalTime().Ticks) {
+                    return $true
+                }
+            }
+        } catch { }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
 function ConvertTo-ClaudeLiveCommandRecord {
     param($Commands)
     @($Commands | ForEach-Object {

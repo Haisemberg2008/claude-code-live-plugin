@@ -65,7 +65,11 @@ Nao entregar credenciais, perfil real do owner, arquivos de ambiente, provider r
 
 ## Executar e acompanhar
 
+Para toda execucao v2, o acompanhamento visivel e uma pre-condicao: registre a tarefa, obtenha `codeorquestra_dashboard_url`, abra ou reutilize **uma unica aba** do painel no navegador integrado do Codex e confirme no estado visivel que o titulo e CodeOrquestra e que a tarefa atual aparece no painel antes de chamar `codeorquestra_start`. Se a pagina nao puder ser aberta ou confirmada, nao inicie Claude silenciosamente; informe o bloqueio. Use somente um mecanismo de abertura e aguarde seu resultado — nao tente um segundo navegador enquanto a primeira abertura estiver pendente. Uma aba ja aberta para a mesma tarefa deve ser reutilizada, nunca duplicada.
+
 Execute `scripts/start-live.ps1 -JobFile <job.json> -RunDirectory <pasta-nova>` com PowerShell 7 pelo terminal do Codex. O executor usa `CODEX_THREAD_ID` para abrir ou reutilizar um painel, mutex e estado exclusivos da tarefa Codex atual. Jobs da mesma tarefa sao serializados; tarefas Codex diferentes podem executar simultaneamente e recebem sessoes Claude independentes. A consulta `/usage` continua serializada globalmente porque a quota pertence a conta. Comandos longos retornam uma sessao observavel; acompanhe com write_stdin. O usuario ja autorizou essa janela; nao pedir novamente.
+
+No runner legado v1, `start-live.ps1` abre ou reutiliza o painel antes de chamar o processo Claude. Nunca use `-NoPanel` fora do harness de testes; essa opcao exige adaptador simulado e nao pertence a uma execucao real.
 
 Antes de cada execucao local, o executor consulta `/usage` sem ferramentas e mostra no painel o restante da sessao, da semana geral e da semana do Fable, com os respectivos horarios de renovacao. A consulta tambem fica registrada de forma sanitizada em `status.json` e `resultado.json`; nao persistir a resposta bruta, identificadores de MCP ou diagnosticos detalhados. Restante de 20% ou menos gera alerta; 5% ou menos gera alerta critico. A consulta nao autoriza compra de creditos, troca de modelo ou reducao de effort. Se ela falhar, mostrar `INDISPONIVEL` e deixar claro que o limite nao foi confirmado.
 
@@ -75,7 +79,7 @@ Quando o usuario aprovar selecao automatica por quota, omita `model` e use `mode
 
 Esses percentuais representam limites de uso da assinatura, nao saldo monetario de creditos pre-pagos. Para saldo financeiro, encaminhar o usuario ao painel Usage da conta; nunca inferir um valor em dinheiro a partir dos percentuais do CLI.
 
-Quando nao for necessario painel ao vivo, use o gerenciamento nativo do CLI para iniciar em segundo plano, listar tarefas, ler logs, anexar, interromper ou remover. Antes de iniciar, confirme que a tarefa pode continuar sem acompanhamento visivel. Segundo plano nao amplia permissoes: mantenha o mesmo perfil e a mesma allowlist.
+O gerenciamento nativo do CLI em segundo plano continua disponivel fora do runtime v2, mas nao substitui o painel obrigatorio nas execucoes CodeOrquestra v2. Segundo plano nao amplia permissoes: mantenha o mesmo perfil e a mesma allowlist.
 
 ## Trabalho em equipe Codex-Claude
 

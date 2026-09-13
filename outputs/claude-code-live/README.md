@@ -121,6 +121,8 @@ O contrato é validado antes de abrir o painel ou iniciar o Claude. O painel mos
 
 Cada tarefa Codex usa `CODEX_THREAD_ID` para manter diretório, painel, mutex e sessão Claude próprios. Jobs da mesma tarefa são serializados; tarefas diferentes podem executar ao mesmo tempo. A leitura de quota permanece globalmente serializada. Fora do Codex, `codexThreadId` fornece uma identidade estável opcional; sem identidade, cada chamada recebe uma chave isolada de uso único.
 
+Antes de toda execução v2, o Codex gera o link limitado da tarefa, abre ou reutiliza uma única aba do painel integrado e confirma que ela carregou antes de iniciar Claude. Se o painel não abrir, a execução não começa silenciosamente. Uma segunda estratégia de abertura não é disparada enquanto a primeira estiver pendente, evitando abas duplicadas.
+
 Cada execução preserva `acompanhamento.txt`, `status.json` e `resultado.json`. Pressione `Q` para interromper; `X` fecha apenas o painel. `COMPLETED` indica término do CLI, não aceite técnico.
 
 ## Retomar

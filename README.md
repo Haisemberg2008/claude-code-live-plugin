@@ -262,6 +262,8 @@ O Codex instala plugins por marketplace. Este projeto não altera marketplaces a
 
 Na tarefa nova, o Codex passa a enxergar as ferramentas `codeorquestra_*`. O adaptador MCP inicia ou reutiliza o broker local; cada tarefa precisa registrar sua identidade uma vez para obter o `taskHandle` privado que limita todas as ações daquela sessão. O painel é aberto por um link local de uso único e continua funcionando mesmo que a aba seja fechada.
 
+Toda execução v2 abre ou reutiliza uma única aba do painel integrado e confirma a tarefa visível antes de iniciar Claude. Se o painel não puder ser confirmado, a execução não começa silenciosamente. O coordenador aguarda a primeira abertura em vez de tentar outro mecanismo e criar uma aba duplicada.
+
 O marketplace pessoal padrão em `~/.agents/plugins/marketplace.json` é descoberto implicitamente e não exige `marketplace add`.
 
 ## Atualização

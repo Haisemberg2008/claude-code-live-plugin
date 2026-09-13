@@ -114,6 +114,27 @@ if (Test-ClaudeLiveAutomaticResume -CurrentContract $contract -Workspace 'C:\wor
     throw 'A prior run without a Claude session id cannot resume automatically.'
 }
 
+if (-not (Get-Command Wait-ClaudeLivePanelReady -ErrorAction SilentlyContinue)) {
+    throw 'Legacy execution must have a readiness handshake before starting Claude.'
+}
+$panelProbeDirectory = Join-Path ([IO.Path]::GetTempPath()) ('claude-live-panel-probe-' + [guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($panelProbeDirectory) | Out-Null
+try {
+    $registration = Join-Path $panelProbeDirectory 'panel.json'
+    $self = Get-Process -Id $PID
+    [IO.File]::WriteAllText($registration, ([pscustomobject]@{pid=$PID;started=$self.StartTime.ToUniversalTime().Ticks} | ConvertTo-Json -Compress))
+    if (-not (Wait-ClaudeLivePanelReady -RegistrationFile $registration -PanelProcess $self -TimeoutMilliseconds 250)) {
+        throw 'A matching live panel registration must satisfy the readiness handshake.'
+    }
+    $exited = [Diagnostics.Process]::Start((Get-Command pwsh).Source, '-NoProfile -Command exit')
+    $exited.WaitForExit()
+    if (Wait-ClaudeLivePanelReady -RegistrationFile (Join-Path $panelProbeDirectory 'missing.json') -PanelProcess $exited -TimeoutMilliseconds 250) {
+        throw 'An exited panel process must block legacy execution.'
+    }
+} finally {
+    Remove-Item -LiteralPath $panelProbeDirectory -Recurse -Force
+}
+
 $stateDirectory = Join-Path ([IO.Path]::GetTempPath()) ('claude-live-thread-test-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
 try {

@@ -71,6 +71,10 @@ O adaptador stdio (`mcp-stdio.mjs`) se conecta ao broker ja em execucao — nunc
 
 A presenca do coordenador vem de `codeorquestra_wait` e do heartbeat reais. Sem isso, o painel mostra "aguardando coordenador" em vez de fingir um Codex sempre ativo.
 
+## Ordem obrigatoria de abertura
+
+Uma execucao v2 segue esta ordem: registrar a tarefa, gerar o link limitado com `codeorquestra_dashboard_url`, abrir ou reutilizar uma unica aba no navegador integrado, confirmar no estado visivel o titulo CodeOrquestra e a tarefa atual listada ou selecionada, e somente entao chamar `codeorquestra_start`. Falha ao abrir ou confirmar o painel bloqueia o inicio; a execucao nao deve acontecer silenciosamente. Nao combine mecanismos de abertura em paralelo ou como fallback imediato, pois uma solicitacao ainda pendente pode criar uma aba duplicada.
+
 ## Contrato de job v2
 
 ```json

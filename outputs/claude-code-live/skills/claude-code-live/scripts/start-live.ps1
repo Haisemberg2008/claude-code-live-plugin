@@ -49,6 +49,10 @@ try {
         foreach ($pathValue in @($watcher,$stateDirectory)) { if ($pathValue.Contains('"')) { throw 'Invalid path.' } }
         $launchArgs = @('-NoProfile','-File',('"' + $watcher + '"'),'-StateDirectory',('"' + $stateDirectory + '"'),'-PanelKey',$panelKey)
         $panelProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList $launchArgs -WindowStyle Normal -PassThru
+        if (-not (Wait-ClaudeLivePanelReady -RegistrationFile $registration -PanelProcess $panelProcess)) {
+            try { if (-not $panelProcess.HasExited) { Stop-Process -Id $panelProcess.Id -Force } } catch { }
+            throw 'The visible panel did not become ready; Claude was not started.'
+        }
     }
     if (-not $NoPanel) { Write-Host ('[Painel] ' + $(if ($panelAlive) {'Reutilizado'} else {'Aberto'}) + ' | PID: ' + $panelProcess.Id) }
     & (Join-Path $PSScriptRoot 'run-live.ps1') -JobFile $jobPath -RunDirectory $runPath `
