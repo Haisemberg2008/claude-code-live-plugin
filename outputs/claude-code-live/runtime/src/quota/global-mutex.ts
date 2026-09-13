@@ -42,7 +42,12 @@ interface Holder {
 
 // Node-side serialization so two callers in the same process never race the
 // same named mutex holder.
-let localChain: Promise<unknown> = Promise.resolve();
+//
+// One chain PER NAME. A single shared chain would make every named mutex
+// serialize against every other one: a git lock on repository A would wait
+// behind a /usage observation, and two repositories would wait on each other,
+// which is the opposite of what parallel worktrees need.
+const localChains = new Map<string, Promise<unknown>>();
 
 function acquireWindows(name: string, waitMs: number, attemptedAt: string): Promise<Holder> {
   return new Promise((resolve, reject) => {
@@ -129,13 +134,24 @@ function isAlive(pid: number): boolean {
   }
 }
 
-export async function withGlobalQuotaMutex<T>(fn: () => Promise<T>, options: { waitMs?: number; name?: string } = {}): Promise<MutexOutcome<T>> {
+/**
+ * Runs `fn` while holding a cross-process named mutex.
+ *
+ * Windows uses a kernel mutex through a PowerShell holder, so the name is
+ * shared with the legacy runner; other platforms fall back to an exclusive lock
+ * file. Callers under different names never wait on each other.
+ */
+export async function withNamedMutex<T>(name: string, fn: () => Promise<T>, options: { waitMs?: number; transport?: 'auto' | 'file' } = {}): Promise<MutexOutcome<T>> {
   const waitMs = options.waitMs ?? 30000;
-  const name = options.name ?? QUOTA_MUTEX_NAME;
   const attemptedAt = new Date().toISOString();
   const started = Date.now();
+  // 'auto' uses the Windows kernel mutex, which exists so v1 and v2 can share
+  // the /usage name across processes — and which costs a hard dependency on
+  // PowerShell 7, absent from a stock Windows install. A lock with no v1
+  // counterpart should ask for 'file' and work everywhere.
+  const useKernelMutex = process.platform === 'win32' && (options.transport ?? 'auto') === 'auto';
   const run = async (): Promise<MutexOutcome<T>> => {
-    const holder = process.platform === 'win32' ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
+    const holder = useKernelMutex ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
     const waitedMs = Date.now() - started;
     try {
       const value = await fn();
@@ -144,7 +160,18 @@ export async function withGlobalQuotaMutex<T>(fn: () => Promise<T>, options: { w
       await holder.release();
     }
   };
-  const next = localChain.then(run, run);
-  localChain = next.catch(() => undefined);
+  const previous = localChains.get(name) ?? Promise.resolve();
+  const next = previous.then(run, run);
+  // Keep the map from growing without bound across many repositories: the
+  // entry is dropped once it is the last one queued under this name.
+  const settled = next.catch(() => undefined).then(() => {
+    if (localChains.get(name) === settled) localChains.delete(name);
+  });
+  localChains.set(name, settled);
   return next;
+}
+
+/** The /usage mutex, shared by name with the legacy runner. */
+export async function withGlobalQuotaMutex<T>(fn: () => Promise<T>, options: { waitMs?: number; name?: string } = {}): Promise<MutexOutcome<T>> {
+  return withNamedMutex(options.name ?? QUOTA_MUTEX_NAME, fn, options.waitMs === undefined ? {} : { waitMs: options.waitMs });
 }

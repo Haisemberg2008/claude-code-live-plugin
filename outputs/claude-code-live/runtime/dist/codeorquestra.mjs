@@ -202,14 +202,14 @@ var init_cli_resolver = __esm({
 });
 
 // src/cli/main.ts
-import { promises as fs15 } from "node:fs";
-import path15 from "node:path";
+import { promises as fs16 } from "node:fs";
+import path16 from "node:path";
 import { pathToFileURL } from "node:url";
 
 // src/broker/broker.ts
 import http from "node:http";
-import { promises as fs13 } from "node:fs";
-import path13 from "node:path";
+import { promises as fs14 } from "node:fs";
+import path14 from "node:path";
 import { randomUUID as randomUUID2 } from "node:crypto";
 
 // src/shared/types.ts
@@ -794,10 +794,10 @@ data: ${JSON.stringify(frame)}
 };
 
 // src/broker/task-manager.ts
-import { spawn as spawn6 } from "node:child_process";
+import { spawn as spawn7 } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs12, realpathSync as realpathSync2 } from "node:fs";
-import path11 from "node:path";
+import { promises as fs13, realpathSync as realpathSync3 } from "node:fs";
+import path12 from "node:path";
 
 // src/contract/job-contract.ts
 var CONTRACT_VERSION = 2;
@@ -2256,10 +2256,202 @@ function resolveLaunchCustomizations(input) {
   };
 }
 
+// src/broker/worktree.ts
+import { spawn as spawn3 } from "node:child_process";
+import { promises as fs8, realpathSync as realpathSync2 } from "node:fs";
+import path8 from "node:path";
+
+// src/quota/global-mutex.ts
+import { spawn as spawn2 } from "node:child_process";
+import { promises as fs7 } from "node:fs";
+import os2 from "node:os";
+import path7 from "node:path";
+var QUOTA_MUTEX_NAME = "Local\\ClaudeLiveQuota";
+var QuotaLockError = class extends Error {
+  code;
+  attemptedAt;
+  constructor(code, message, attemptedAt) {
+    super(message);
+    this.name = "QuotaLockError";
+    this.code = code;
+    this.attemptedAt = attemptedAt;
+  }
+};
+var HOLDER_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  "$mutex = [Threading.Mutex]::new($false, $env:CODEORQUESTRA_MUTEX_NAME)",
+  "try { $held = $mutex.WaitOne([int]$env:CODEORQUESTRA_MUTEX_WAIT_MS) } catch [Threading.AbandonedMutexException] { $held = $true }",
+  "if (-not $held) { [Console]::Out.WriteLine('TIMEOUT'); [Console]::Out.Flush(); exit 2 }",
+  "[Console]::Out.WriteLine('HELD'); [Console]::Out.Flush()",
+  "$null = [Console]::In.ReadLine()",
+  "$mutex.ReleaseMutex(); $mutex.Dispose()",
+  "[Console]::Out.WriteLine('RELEASED'); [Console]::Out.Flush()"
+].join("; ");
+var localChains = /* @__PURE__ */ new Map();
+function acquireWindows(name, waitMs, attemptedAt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn2("pwsh", ["-NoProfile", "-NonInteractive", "-Command", HOLDER_SCRIPT], {
+      env: { ...process.env, CODEORQUESTRA_MUTEX_NAME: name, CODEORQUESTRA_MUTEX_WAIT_MS: String(waitMs) },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const exited = new Promise((done) => child.on("exit", () => done()));
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      if (child.exitCode === null) child.kill();
+      reject(error);
+    };
+    const timer = setTimeout(() => fail(new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o mutex global de quota.", attemptedAt)), waitMs + 2e4);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      fail(new QuotaLockError("QUOTA_LOCK_UNAVAILABLE", `pwsh indispon\xEDvel para o mutex global: ${error.message}`, attemptedAt));
+    });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (settled) return;
+      if (stdout.includes("HELD")) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          async release() {
+            if (child.exitCode === null) {
+              child.stdin.write("release\n");
+              child.stdin.end();
+              const killer = setTimeout(() => child.kill(), 5e3);
+              await exited;
+              clearTimeout(killer);
+            }
+          }
+        });
+      } else if (stdout.includes("TIMEOUT")) {
+        clearTimeout(timer);
+        fail(new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o mutex global de quota (v1 ou outra consulta v2 em andamento).", attemptedAt));
+      }
+    });
+    void exited.then(() => {
+      if (!settled) {
+        clearTimeout(timer);
+        fail(new QuotaLockError("QUOTA_LOCK_UNAVAILABLE", `O processo do mutex encerrou antes de adquirir (${stderr.trim().slice(0, 200)}).`, attemptedAt));
+      }
+    });
+  });
+}
+async function acquireLockFile(name, waitMs, attemptedAt) {
+  const file = path7.join(os2.tmpdir(), `${name.replace(/[^A-Za-z0-9]/g, "_")}.lock`);
+  const deadline = Date.now() + waitMs;
+  for (; ; ) {
+    try {
+      const handle = await fs7.open(file, "wx");
+      await handle.writeFile(String(process.pid));
+      await handle.close();
+      return { async release() {
+        await fs7.rm(file, { force: true });
+      } };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        const pid = Number(await fs7.readFile(file, "utf8"));
+        if (pid && !isAlive(pid)) {
+          await fs7.rm(file, { force: true });
+          continue;
+        }
+      } catch {
+      }
+      if (Date.now() >= deadline) throw new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o lock global de quota.", attemptedAt);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function withNamedMutex(name, fn, options = {}) {
+  const waitMs = options.waitMs ?? 3e4;
+  const attemptedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const started = Date.now();
+  const useKernelMutex = process.platform === "win32" && (options.transport ?? "auto") === "auto";
+  const run2 = async () => {
+    const holder = useKernelMutex ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
+    const waitedMs = Date.now() - started;
+    try {
+      const value = await fn();
+      return { value, waitedMs, attemptedAt };
+    } finally {
+      await holder.release();
+    }
+  };
+  const previous = localChains.get(name) ?? Promise.resolve();
+  const next = previous.then(run2, run2);
+  const settled = next.catch(() => void 0).then(() => {
+    if (localChains.get(name) === settled) localChains.delete(name);
+  });
+  localChains.set(name, settled);
+  return next;
+}
+async function withGlobalQuotaMutex(fn, options = {}) {
+  return withNamedMutex(options.name ?? QUOTA_MUTEX_NAME, fn, options.waitMs === void 0 ? {} : { waitMs: options.waitMs });
+}
+
+// src/broker/worktree.ts
+var GIT_TIMEOUT_MS = 2e4;
+var MAX_CHANGED_FILES = 500;
+function git(args, cwd, timeoutMs = GIT_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const child = spawn3("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ code: null, stdout, stderr: String(error), timedOut });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr, timedOut });
+    });
+  });
+}
+async function gitStatus(workspace) {
+  try {
+    await fs8.access(path8.join(workspace, ".git"));
+  } catch {
+    return [];
+  }
+  const result = await git(["status", "--porcelain", "--untracked-files=all"], workspace, 5e3);
+  if (result.code !== 0) return [];
+  return result.stdout.split("\n").map((line) => line.slice(3).trim()).filter(Boolean).slice(0, MAX_CHANGED_FILES);
+}
+
 // src/trust/trust-store.ts
 import { createHash as createHash3 } from "node:crypto";
-import { promises as fs7 } from "node:fs";
-import path7 from "node:path";
+import { promises as fs9 } from "node:fs";
+import path9 from "node:path";
 var TrustStoreError = class extends Error {
   code;
   constructor(code, message) {
@@ -2274,7 +2466,7 @@ var TrustStore = class {
     this.root = root;
   }
   fileFor(canonicalWorkspace) {
-    return path7.join(this.root, "trust", `${createHash3("sha256").update(canonicalWorkspace).digest("hex")}.json`);
+    return path9.join(this.root, "trust", `${createHash3("sha256").update(canonicalWorkspace).digest("hex")}.json`);
   }
   async approve(input) {
     if (input.inventory.incomplete) throw new TrustStoreError("INVENTORY_INCOMPLETE", "O invent\xE1rio est\xE1 incompleto; aprove somente ap\xF3s a descoberta completa.");
@@ -2298,7 +2490,7 @@ var TrustStore = class {
       mcpServers,
       file
     };
-    await fs7.mkdir(path7.dirname(file), { recursive: true });
+    await fs9.mkdir(path9.dirname(file), { recursive: true });
     await writeFileAtomic(file, JSON.stringify(record2, null, 2));
     return record2;
   }
@@ -2325,7 +2517,7 @@ var TrustStore = class {
     return { trusted: true, approvalRevision: record2.approvalRevision, pending: [], changed: [], reason: "TRUSTED" };
   }
   async revoke(canonicalWorkspace) {
-    await fs7.rm(this.fileFor(canonicalWorkspace), { force: true });
+    await fs9.rm(this.fileFor(canonicalWorkspace), { force: true });
   }
 };
 
@@ -2470,7 +2662,7 @@ var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
 };
 
 // src/usage/codex-usage.ts
-import { spawn as spawn2 } from "node:child_process";
+import { spawn as spawn4 } from "node:child_process";
 import readline2 from "node:readline";
 function integer(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -2626,7 +2818,7 @@ var CodexUsageService = class {
   ensureReady() {
     if (this.ready) return this.ready;
     this.ready = new Promise((resolve, reject) => {
-      const child = spawn2(this.command, this.args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+      const child = spawn4(this.command, this.args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
       this.child = child;
       child.stderr.resume();
       const reader = readline2.createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -2719,18 +2911,18 @@ var CodexUsageService = class {
 };
 
 // src/broker/runtime-paths.ts
-import { promises as fs8, existsSync, readFileSync } from "node:fs";
-import os2 from "node:os";
-import path8 from "node:path";
+import { promises as fs10, existsSync, readFileSync } from "node:fs";
+import os3 from "node:os";
+import path10 from "node:path";
 import { fileURLToPath } from "node:url";
 var here = fileURLToPath(import.meta.url);
 var SOURCE_MODE = here.endsWith(".ts");
-var RUNTIME_BASE = SOURCE_MODE ? path8.resolve(path8.dirname(here), "..", "..") : path8.dirname(here);
+var RUNTIME_BASE = SOURCE_MODE ? path10.resolve(path10.dirname(here), "..", "..") : path10.dirname(here);
 function workerEntry() {
-  return readEnv("WORKER_ENTRY") ?? (SOURCE_MODE ? path8.join(RUNTIME_BASE, "src", "worker", "main.ts") : path8.join(RUNTIME_BASE, "worker.mjs"));
+  return readEnv("WORKER_ENTRY") ?? (SOURCE_MODE ? path10.join(RUNTIME_BASE, "src", "worker", "main.ts") : path10.join(RUNTIME_BASE, "worker.mjs"));
 }
 function cliEntry() {
-  return SOURCE_MODE ? path8.join(RUNTIME_BASE, "src", "cli", "main.ts") : path8.join(RUNTIME_BASE, "codeorquestra.mjs");
+  return SOURCE_MODE ? path10.join(RUNTIME_BASE, "src", "cli", "main.ts") : path10.join(RUNTIME_BASE, "codeorquestra.mjs");
 }
 function nodeExecArgv() {
   return SOURCE_MODE ? ["--experimental-strip-types", "--disable-warning=ExperimentalWarning"] : [];
@@ -2738,14 +2930,14 @@ function nodeExecArgv() {
 function dashboardDir() {
   const candidates = [
     readEnv("DASHBOARD_DIR"),
-    SOURCE_MODE ? path8.join(RUNTIME_BASE, "dist", "dashboard") : path8.join(RUNTIME_BASE, "dashboard")
+    SOURCE_MODE ? path10.join(RUNTIME_BASE, "dist", "dashboard") : path10.join(RUNTIME_BASE, "dashboard")
   ].filter((candidate) => Boolean(candidate));
-  for (const candidate of candidates) if (existsSync(path8.join(candidate, "index.html"))) return candidate;
+  for (const candidate of candidates) if (existsSync(path10.join(candidate, "index.html"))) return candidate;
   return null;
 }
 function defaultStateRoot() {
-  const base = process.platform === "win32" ? process.env.LOCALAPPDATA ?? path8.join(os2.homedir(), "AppData", "Local") : path8.join(os2.homedir(), ".local", "state");
-  return path8.join(base, "CodexClaudeLive", "v2");
+  const base = process.platform === "win32" ? process.env.LOCALAPPDATA ?? path10.join(os3.homedir(), "AppData", "Local") : path10.join(os3.homedir(), ".local", "state");
+  return path10.join(base, "CodexClaudeLive", "v2");
 }
 function engineInfo() {
   return { runtimeVersion: RUNTIME_VERSION, productName: BRAND.name };
@@ -2754,155 +2946,17 @@ async function findClaudeLauncher(env = process.env) {
   const override = readEnv("TEST_CLI", env) ?? readEnv("CLAUDE_LAUNCHER", env);
   if (override) return override;
   const names = process.platform === "win32" ? ["claude.ps1", "claude.cmd", "claude.exe", "claude"] : ["claude"];
-  for (const dir of (env.PATH ?? "").split(path8.delimiter).filter(Boolean)) {
+  for (const dir of (env.PATH ?? "").split(path10.delimiter).filter(Boolean)) {
     for (const name of names) {
-      const candidate = path8.join(dir, name);
+      const candidate = path10.join(dir, name);
       try {
-        await fs8.access(candidate);
+        await fs10.access(candidate);
         return candidate;
       } catch {
       }
     }
   }
   return null;
-}
-
-// src/quota/global-mutex.ts
-import { spawn as spawn3 } from "node:child_process";
-import { promises as fs9 } from "node:fs";
-import os3 from "node:os";
-import path9 from "node:path";
-var QUOTA_MUTEX_NAME = "Local\\ClaudeLiveQuota";
-var QuotaLockError = class extends Error {
-  code;
-  attemptedAt;
-  constructor(code, message, attemptedAt) {
-    super(message);
-    this.name = "QuotaLockError";
-    this.code = code;
-    this.attemptedAt = attemptedAt;
-  }
-};
-var HOLDER_SCRIPT = [
-  "$ErrorActionPreference = 'Stop'",
-  "$mutex = [Threading.Mutex]::new($false, $env:CODEORQUESTRA_MUTEX_NAME)",
-  "try { $held = $mutex.WaitOne([int]$env:CODEORQUESTRA_MUTEX_WAIT_MS) } catch [Threading.AbandonedMutexException] { $held = $true }",
-  "if (-not $held) { [Console]::Out.WriteLine('TIMEOUT'); [Console]::Out.Flush(); exit 2 }",
-  "[Console]::Out.WriteLine('HELD'); [Console]::Out.Flush()",
-  "$null = [Console]::In.ReadLine()",
-  "$mutex.ReleaseMutex(); $mutex.Dispose()",
-  "[Console]::Out.WriteLine('RELEASED'); [Console]::Out.Flush()"
-].join("; ");
-var localChain = Promise.resolve();
-function acquireWindows(name, waitMs, attemptedAt) {
-  return new Promise((resolve, reject) => {
-    const child = spawn3("pwsh", ["-NoProfile", "-NonInteractive", "-Command", HOLDER_SCRIPT], {
-      env: { ...process.env, CODEORQUESTRA_MUTEX_NAME: name, CODEORQUESTRA_MUTEX_WAIT_MS: String(waitMs) },
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    const exited = new Promise((done) => child.on("exit", () => done()));
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      if (child.exitCode === null) child.kill();
-      reject(error);
-    };
-    const timer = setTimeout(() => fail(new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o mutex global de quota.", attemptedAt)), waitMs + 2e4);
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      fail(new QuotaLockError("QUOTA_LOCK_UNAVAILABLE", `pwsh indispon\xEDvel para o mutex global: ${error.message}`, attemptedAt));
-    });
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      if (settled) return;
-      if (stdout.includes("HELD")) {
-        settled = true;
-        clearTimeout(timer);
-        resolve({
-          async release() {
-            if (child.exitCode === null) {
-              child.stdin.write("release\n");
-              child.stdin.end();
-              const killer = setTimeout(() => child.kill(), 5e3);
-              await exited;
-              clearTimeout(killer);
-            }
-          }
-        });
-      } else if (stdout.includes("TIMEOUT")) {
-        clearTimeout(timer);
-        fail(new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o mutex global de quota (v1 ou outra consulta v2 em andamento).", attemptedAt));
-      }
-    });
-    void exited.then(() => {
-      if (!settled) {
-        clearTimeout(timer);
-        fail(new QuotaLockError("QUOTA_LOCK_UNAVAILABLE", `O processo do mutex encerrou antes de adquirir (${stderr.trim().slice(0, 200)}).`, attemptedAt));
-      }
-    });
-  });
-}
-async function acquireLockFile(name, waitMs, attemptedAt) {
-  const file = path9.join(os3.tmpdir(), `${name.replace(/[^A-Za-z0-9]/g, "_")}.lock`);
-  const deadline = Date.now() + waitMs;
-  for (; ; ) {
-    try {
-      const handle = await fs9.open(file, "wx");
-      await handle.writeFile(String(process.pid));
-      await handle.close();
-      return { async release() {
-        await fs9.rm(file, { force: true });
-      } };
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      try {
-        const pid = Number(await fs9.readFile(file, "utf8"));
-        if (pid && !isAlive(pid)) {
-          await fs9.rm(file, { force: true });
-          continue;
-        }
-      } catch {
-      }
-      if (Date.now() >= deadline) throw new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o lock global de quota.", attemptedAt);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-}
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-async function withGlobalQuotaMutex(fn, options = {}) {
-  const waitMs = options.waitMs ?? 3e4;
-  const name = options.name ?? QUOTA_MUTEX_NAME;
-  const attemptedAt = (/* @__PURE__ */ new Date()).toISOString();
-  const started = Date.now();
-  const run2 = async () => {
-    const holder = process.platform === "win32" ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
-    const waitedMs = Date.now() - started;
-    try {
-      const value = await fn();
-      return { value, waitedMs, attemptedAt };
-    } finally {
-      await holder.release();
-    }
-  };
-  const next = localChain.then(run2, run2);
-  localChain = next.catch(() => void 0);
-  return next;
 }
 
 // src/quota/usage-parser.ts
@@ -3013,20 +3067,20 @@ var QuotaService = class {
 };
 
 // src/broker/process-tree.ts
-import { spawn as spawn5 } from "node:child_process";
+import { spawn as spawn6 } from "node:child_process";
 import { closeSync, openSync, statSync, unlinkSync, utimesSync, writeFileSync, readFileSync as readFileSync2, mkdirSync } from "node:fs";
-import { promises as fs11 } from "node:fs";
-import path10 from "node:path";
+import { promises as fs12 } from "node:fs";
+import path11 from "node:path";
 
 // src/broker/process-identity.ts
-import { spawn as spawn4 } from "node:child_process";
-import { promises as fs10 } from "node:fs";
+import { spawn as spawn5 } from "node:child_process";
+import { promises as fs11 } from "node:fs";
 var PROBE_TIMEOUT_MS = 1e4;
 function runCapture(command, args, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn4(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+      child = spawn5(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     } catch {
       resolve(null);
       return;
@@ -3077,7 +3131,7 @@ async function windowsCreationTime(pid) {
 async function linuxCreationTime(pid) {
   let raw;
   try {
-    raw = await fs10.readFile(`/proc/${pid}/stat`, "utf8");
+    raw = await fs11.readFile(`/proc/${pid}/stat`, "utf8");
   } catch (error) {
     return error.code === "ENOENT" ? "" : null;
   }
@@ -3118,7 +3172,7 @@ function parsePipeTable(text) {
 async function linuxProcessTable() {
   let names;
   try {
-    names = await fs10.readdir("/proc");
+    names = await fs11.readdir("/proc");
   } catch {
     return null;
   }
@@ -3126,7 +3180,7 @@ async function linuxProcessTable() {
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      const raw = await fs10.readFile(`/proc/${name}/stat`, "utf8");
+      const raw = await fs11.readFile(`/proc/${name}/stat`, "utf8");
       const close = raw.lastIndexOf(")");
       if (close < 0) continue;
       const fields = raw.slice(close + 2).split(" ");
@@ -3192,10 +3246,10 @@ async function verifyProcessIdentity(pid, recorded) {
 
 // src/broker/process-tree.ts
 function holdFileFor(runDir) {
-  return path10.join(runDir, "worker.hold");
+  return path11.join(runDir, "worker.hold");
 }
 function identityFileFor(runDir) {
-  return path10.join(runDir, "worker-identity.json");
+  return path11.join(runDir, "worker-identity.json");
 }
 function readWorkerIdentity(runDir) {
   try {
@@ -3231,7 +3285,7 @@ async function verifyWorkerLiveness(runDir, expected) {
 function terminateTree(pid) {
   return new Promise((resolve) => {
     if (process.platform === "win32") {
-      const killer = spawn5("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      const killer = spawn6("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       const timer = setTimeout(() => {
         killer.kill();
         resolve();
@@ -3269,7 +3323,7 @@ function waitForExit(pid, timeoutMs) {
   });
 }
 function engineFileFor(runDir) {
-  return path10.join(runDir, "engine.json");
+  return path11.join(runDir, "engine.json");
 }
 function readEngineProcess(runDir) {
   try {
@@ -3334,7 +3388,7 @@ async function settleExitedTarget(name, pid, createdAt, abnormal = false) {
 }
 async function reconcileRunProcesses(runDir, workerPid, strictRecovery = false) {
   const targets = [];
-  const holdReleased = await fs11.access(holdFileFor(runDir)).then(() => false, () => true);
+  const holdReleased = await fs12.access(holdFileFor(runDir)).then(() => false, () => true);
   const workerCreatedAt = readWorkerIdentity(runDir)?.createdAt;
   if (workerPid !== null) {
     if (holdReleased) targets.push(await settleExitedTarget("worker", workerPid, workerCreatedAt));
@@ -3444,15 +3498,15 @@ var TaskManager = class {
     return this.options.supervision ?? SUPERVISION;
   }
   tasksDir() {
-    return path11.join(this.stateRoot, "tasks");
+    return path12.join(this.stateRoot, "tasks");
   }
   locksDir() {
-    return path11.join(this.stateRoot, "locks");
+    return path12.join(this.stateRoot, "locks");
   }
   async start() {
-    await fs12.mkdir(this.tasksDir(), { recursive: true });
+    await fs13.mkdir(this.tasksDir(), { recursive: true });
     this.assertOperational();
-    await fs12.mkdir(this.locksDir(), { recursive: true });
+    await fs13.mkdir(this.locksDir(), { recursive: true });
     this.assertOperational();
     this.launcherPath = await findClaudeLauncher();
     this.assertOperational();
@@ -3516,7 +3570,7 @@ var TaskManager = class {
     this.assertOperational();
     let entries = [];
     try {
-      entries = await fs12.readdir(this.tasksDir());
+      entries = await fs13.readdir(this.tasksDir());
       this.assertOperational();
     } catch {
       entries = [];
@@ -3524,8 +3578,8 @@ var TaskManager = class {
     const opened = [];
     for (const taskId of entries) {
       this.assertOperational();
-      const dir = path11.join(this.tasksDir(), taskId);
-      const record2 = await readJsonShared(path11.join(dir, "task.json"));
+      const dir = path12.join(this.tasksDir(), taskId);
+      const record2 = await readJsonShared(path12.join(dir, "task.json"));
       this.assertOperational();
       if (record2.status !== "ok") continue;
       opened.push(await this.openTask(normalizeRecord(record2.value), dir));
@@ -3543,11 +3597,11 @@ var TaskManager = class {
     }
     for (const task of opened) {
       this.assertOperational();
-      const current = await readJsonShared(path11.join(task.dir, "current-run.json"));
+      const current = await readJsonShared(path12.join(task.dir, "current-run.json"));
       this.assertOperational();
       if (current.status !== "ok") continue;
       if (current.value.status !== "RUNNING" && current.value.status !== "STARTING") continue;
-      const runDir = current.value.runDir || path11.join(task.dir, "runs", current.value.runId);
+      const runDir = current.value.runDir || path12.join(task.dir, "runs", current.value.runId);
       const identity = readWorkerIdentity(runDir);
       const verdict = await verifyWorkerLiveness(runDir, identity);
       this.assertOperational();
@@ -3589,7 +3643,7 @@ var TaskManager = class {
           quarantineNote
         };
         this.locks.set(lock.workspaceKey, lock);
-        await writeFileAtomic(path11.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path12.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
         this.assertOperational();
       }
       await this.writeCurrentRunBestEffort(task, { ...current.value, status: "UNCERTAIN", workerPid: null });
@@ -3599,7 +3653,7 @@ var TaskManager = class {
     }
     let lockFiles = [];
     try {
-      lockFiles = await fs12.readdir(this.locksDir());
+      lockFiles = await fs13.readdir(this.locksDir());
       this.assertOperational();
     } catch {
       lockFiles = [];
@@ -3608,10 +3662,10 @@ var TaskManager = class {
       this.assertOperational();
       const key = file.replace(/\.json$/, "");
       if (this.locks.has(key)) continue;
-      const read = await readJsonShared(path11.join(this.locksDir(), file));
+      const read = await readJsonShared(path12.join(this.locksDir(), file));
       this.assertOperational();
       if (read.status !== "ok") {
-        await fs12.rm(path11.join(this.locksDir(), file), { force: true });
+        await fs13.rm(path12.join(this.locksDir(), file), { force: true });
         this.assertOperational();
         continue;
       }
@@ -3619,17 +3673,17 @@ var TaskManager = class {
         this.locks.set(key, read.value);
         continue;
       }
-      await fs12.rm(path11.join(this.locksDir(), file), { force: true });
+      await fs13.rm(path12.join(this.locksDir(), file), { force: true });
       this.assertOperational();
     }
   }
   async openTask(record2, dir) {
     const existing = this.tasks.get(record2.taskId);
     if (existing) return existing;
-    const log = await EventLog.open(path11.join(dir, "events.jsonl"));
+    const log = await EventLog.open(path12.join(dir, "events.jsonl"));
     const history = await log.readFrom(0);
     const queue = await this.loadQueue(dir);
-    const pointer = await readJsonShared(path11.join(dir, "session.json"));
+    const pointer = await readJsonShared(path12.join(dir, "session.json"));
     const task = {
       record: record2,
       dir,
@@ -3665,14 +3719,14 @@ var TaskManager = class {
     return task;
   }
   async persistRecord(task) {
-    await writeFileAtomic(path11.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
+    await writeFileAtomic(path12.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
   }
   // ------------------------------------------------------------- registration
   async register(threadId, source) {
     if (typeof threadId !== "string" || !THREAD_ID_PATTERN.test(threadId)) throw new HttpError(400, "THREAD_ID_INVALID");
     const taskId = taskIdForThread(threadId);
-    const dir = path11.join(this.tasksDir(), taskId);
-    await fs12.mkdir(dir, { recursive: true });
+    const dir = path12.join(this.tasksDir(), taskId);
+    await fs13.mkdir(dir, { recursive: true });
     const existing = this.tasks.get(taskId) ?? null;
     const { handle, hash } = mintTaskHandle();
     const record2 = existing ? { ...existing.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() } : { taskId, threadId, createdAt: (/* @__PURE__ */ new Date()).toISOString(), handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString(), workspace: null, requiresReview: false, reviewReason: null };
@@ -3749,7 +3803,7 @@ var TaskManager = class {
     const historicalAncestryConclusive = false;
     try {
       if (this.options.harness) await new Promise((resolve) => setTimeout(resolve, 50));
-      const runDir = task ? path11.join(task.dir, "runs", lock.holderRunId) : null;
+      const runDir = task ? path12.join(task.dir, "runs", lock.holderRunId) : null;
       check = runDir ? await survivorCheck(runDir, lock.holderPid) : { releasable: false, livePids: [], note: "A execu\xE7\xE3o que det\xE9m a trava n\xE3o p\xF4de ser localizada no estado; a posse n\xE3o \xE9 liberada \xE0s cegas." };
       if (!check.releasable) {
         if (task) await this.append(task, lock.holderRunId, "lock_release_refused", { workspaceKey, source, livePids: check.livePids, note: check.note });
@@ -3767,12 +3821,12 @@ var TaskManager = class {
           ownership: { taskId: lock.holderTaskId, runId: lock.holderRunId }
         });
       }
-      const persisted = await readJsonShared(path11.join(this.locksDir(), `${workspaceKey}.json`));
+      const persisted = await readJsonShared(path12.join(this.locksDir(), `${workspaceKey}.json`));
       const current = this.locks.get(workspaceKey);
       if (current !== lock || persisted.status !== "ok" || persisted.value.holderTaskId !== lock.holderTaskId || persisted.value.holderRunId !== lock.holderRunId || !persisted.value.quarantined) {
         throw new HttpError(409, "LOCK_OWNERSHIP_CHANGED", { note: "A posse mudou durante a auditoria; nada foi liberado." });
       }
-      await fs12.rm(path11.join(this.locksDir(), `${workspaceKey}.json`));
+      await fs13.rm(path12.join(this.locksDir(), `${workspaceKey}.json`));
       this.locks.delete(workspaceKey);
       if (task) await this.append(task, lock.holderRunId, "lock_released", {
         workspaceKey,
@@ -3813,10 +3867,10 @@ var TaskManager = class {
   }
   // ---------------------------------------------------------------- queue
   async loadQueue(dir) {
-    const file = path11.join(dir, "queue.jsonl");
+    const file = path12.join(dir, "queue.jsonl");
     let text;
     try {
-      text = await fs12.readFile(file, "utf8");
+      text = await fs13.readFile(file, "utf8");
     } catch {
       return [];
     }
@@ -3833,7 +3887,7 @@ var TaskManager = class {
   }
   async persistQueue(task) {
     const lines = task.queue.map((entry) => JSON.stringify(entry)).join("\n");
-    await writeFileAtomic(path11.join(task.dir, "queue.jsonl"), lines ? `${lines}
+    await writeFileAtomic(path12.join(task.dir, "queue.jsonl"), lines ? `${lines}
 ` : "");
   }
   queueView(entry) {
@@ -4003,7 +4057,7 @@ var TaskManager = class {
     let workspace;
     let canonicalWorkspace;
     try {
-      workspace = realpathSync2.native(contract.workspace);
+      workspace = realpathSync3.native(contract.workspace);
       canonicalWorkspace = workspace.replace(/\\/g, "/").replace(/\/+$/, "");
       if (process.platform === "win32") canonicalWorkspace = canonicalWorkspace.toLowerCase();
     } catch {
@@ -4024,7 +4078,7 @@ var TaskManager = class {
     }
     const runId = `run-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     const runToken = randomUUID();
-    const runDir = path11.join(task.dir, "runs", runId);
+    const runDir = path12.join(task.dir, "runs", runId);
     const run2 = {
       runId,
       runToken,
@@ -4068,8 +4122,8 @@ var TaskManager = class {
     task.workerReady = false;
     task.record.workspace = workspace;
     try {
-      await fs12.mkdir(runDir, { recursive: true });
-      run2.prompt = contract.prompt ?? (contract.promptFile ? await fs12.readFile(contract.promptFile, "utf8") : "");
+      await fs13.mkdir(runDir, { recursive: true });
+      run2.prompt = contract.prompt ?? (contract.promptFile ? await fs13.readFile(contract.promptFile, "utf8") : "");
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
       const { inventory, trust } = await this.inventoryFor(workspace);
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
@@ -4085,7 +4139,7 @@ var TaskManager = class {
       await this.persistRecord(task);
       if (run2.writerLockKey) {
         const lock = this.locks.get(run2.writerLockKey);
-        await writeFileAtomic(path11.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path12.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       try {
         await this.writeCurrentRun(task, { runId, runToken, status: "STARTING", workerPid: null, workerStartedAt: null, startedAt: run2.startedAt, workspace, writerLockKey: run2.writerLockKey, runDir });
@@ -4113,8 +4167,8 @@ var TaskManager = class {
       });
       if (source !== "browser") this.touchCoordinator(task);
       this.changed(task);
-      const approvedAgents = inventory.items.filter((item) => item.kind === "agent").map((item) => path11.basename(item.relativePath, ".md"));
-      const approvedSkills = inventory.items.filter((item) => item.kind === "skill").map((item) => path11.basename(path11.dirname(item.relativePath)));
+      const approvedAgents = inventory.items.filter((item) => item.kind === "agent").map((item) => path12.basename(item.relativePath, ".md"));
+      const approvedSkills = inventory.items.filter((item) => item.kind === "skill").map((item) => path12.basename(path12.dirname(item.relativePath)));
       const preparation = this.prepareAndSpawn(task, run2, launch, approvedAgents, approvedSkills, harness).catch((error) => {
         this.options.log(`task ${task.record.taskId}: prepara\xE7\xE3o falhou inesperadamente (${error.name})`);
         void this.finalize(task, run2, "FAIL", "PREPARATION_CRASH", redactSensitiveText(String(error.message ?? error)).slice(0, 300), 1, "preparation");
@@ -4131,7 +4185,7 @@ var TaskManager = class {
       const lock = this.locks.get(run2.writerLockKey);
       if (lock && lock.holderRunId === run2.runId && !lock.quarantined) {
         this.locks.delete(run2.writerLockKey);
-        await fs12.rm(path11.join(this.locksDir(), `${run2.writerLockKey}.json`), { force: true });
+        await fs13.rm(path12.join(this.locksDir(), `${run2.writerLockKey}.json`), { force: true });
       }
       run2.writerLockKey = null;
     }
@@ -4207,7 +4261,7 @@ var TaskManager = class {
         threadId: task.record.threadId,
         stateRoot: this.stateRoot,
         taskDir: task.dir,
-        runDir: path11.join(task.dir, "runs", run2.runId),
+        runDir: path12.join(task.dir, "runs", run2.runId),
         contract: run2.contract,
         prompt: run2.prompt,
         resumeSessionId: run2.sessionId,
@@ -4226,10 +4280,10 @@ var TaskManager = class {
           ...typeof harness.setModelDelayMs === "number" ? { setModelDelayMs: harness.setModelDelayMs } : {}
         } : null
       };
-      const descriptorFile = path11.join(descriptor.runDir, "worker-descriptor.json");
+      const descriptorFile = path12.join(descriptor.runDir, "worker-descriptor.json");
       await writeFileAtomic(descriptorFile, JSON.stringify(descriptor, null, 2));
       if (this.stopping || task.run !== run2 || run2.finalized) return;
-      const child = spawn6(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
+      const child = spawn7(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
         cwd: run2.contract.workspace,
         env: { ...process.env, [envName("TASK_ID")]: task.record.taskId, [envName("RUN_ID")]: run2.runId, [envName("RUN_TOKEN")]: run2.runToken },
         stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -4243,7 +4297,7 @@ var TaskManager = class {
       const lock = run2.writerLockKey ? this.locks.get(run2.writerLockKey) : null;
       if (lock) {
         lock.holderPid = run2.workerPid;
-        await writeFileAtomic(path11.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path12.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       child.stderr?.setEncoding("utf8");
       child.stderr?.on("data", (chunk) => this.options.log(`worker ${run2.workerPid} stderr: ${redactSensitiveText(chunk).trim().slice(0, 500)}`));
@@ -4313,8 +4367,8 @@ var TaskManager = class {
         this.changed(task);
         break;
       case "blob":
-        await fs12.mkdir(path11.join(task.dir, "blobs"), { recursive: true });
-        await writeFileAtomic(path11.join(task.dir, "blobs", `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
+        await fs13.mkdir(path12.join(task.dir, "blobs"), { recursive: true });
+        await writeFileAtomic(path12.join(task.dir, "blobs", `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
         break;
       case "model_result": {
         task.modelTransition?.settle({ ok: message.ok, activeModel: message.activeModel, code: message.code });
@@ -4421,7 +4475,7 @@ var TaskManager = class {
     for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
     task.pending.clear();
     this.changed(task);
-    const runDir = path11.join(task.dir, "runs", run2.runId);
+    const runDir = path12.join(task.dir, "runs", run2.runId);
     const reconciliation = await reconcileRunProcesses(runDir, run2.workerPid, true);
     await this.append(task, run2.runId, "worker_disconnected", {
       workerPid: run2.workerPid,
@@ -4455,7 +4509,7 @@ var TaskManager = class {
     task.currentTool = null;
     for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
     task.pending.clear();
-    const runDir = path11.join(task.dir, "runs", run2.runId);
+    const runDir = path12.join(task.dir, "runs", run2.runId);
     try {
       if (task.worker?.pid) {
         const pid = task.worker.pid;
@@ -4477,7 +4531,7 @@ var TaskManager = class {
       }
       if (run2.sessionId && run2.sessionConfirmed) {
         task.previousSessionId = run2.sessionId;
-        await writeFileAtomic(path11.join(task.dir, "session.json"), JSON.stringify({ sessionId: run2.sessionId, runId: run2.runId, updatedAt: endedAt, resultFile: path11.join(runDir, "resultado.json") }, null, 2));
+        await writeFileAtomic(path12.join(task.dir, "session.json"), JSON.stringify({ sessionId: run2.sessionId, runId: run2.runId, updatedAt: endedAt, resultFile: path12.join(runDir, "resultado.json") }, null, 2));
       }
       await this.writeCurrentRunBestEffort(task, { runId: run2.runId, runToken: run2.runToken, status, workerPid: null, workerStartedAt: run2.workerStartedAt, startedAt: run2.startedAt, workspace: run2.contract.workspace, writerLockKey: null, runDir });
       await this.writeDerivedNow(task, run2.runId, true, { status, code, message, exitCode, endedAt, failureStage });
@@ -4532,11 +4586,11 @@ var TaskManager = class {
     }
     if (clean) {
       this.locks.delete(key);
-      await fs12.rm(path11.join(this.locksDir(), `${key}.json`), { force: true });
+      await fs13.rm(path12.join(this.locksDir(), `${key}.json`), { force: true });
     } else {
       holder.quarantined = true;
       holder.quarantineNote = note;
-      await writeFileAtomic(path11.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      await writeFileAtomic(path12.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
     }
     run2.writerLockKey = null;
   }
@@ -4550,7 +4604,7 @@ var TaskManager = class {
    * than release work against an unrecorded state.
    */
   async writeCurrentRun(task, value) {
-    await writeFileAtomic(path11.join(task.dir, "current-run.json"), JSON.stringify(value, null, 2), { maxWaitMs: 3e3 });
+    await writeFileAtomic(path12.join(task.dir, "current-run.json"), JSON.stringify(value, null, 2), { maxWaitMs: 3e3 });
   }
   /** Same record, on paths that are already finishing and cannot abort. */
   async writeCurrentRunBestEffort(task, value) {
@@ -4584,7 +4638,7 @@ var TaskManager = class {
     }
   }
   async writeDerivedNow(task, runId, final, terminal) {
-    const runDir = path11.join(task.dir, "runs", runId);
+    const runDir = path12.join(task.dir, "runs", runId);
     const writer = task.writer && task.writer.directory === runDir ? task.writer : new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15e3, onTelemetryFailure: (failure) => {
       if (task.run) {
         task.run.telemetryFailures += 1;
@@ -4598,7 +4652,7 @@ var TaskManager = class {
     const status = { ...derived.status, llmUsage, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
     await writer.writeStatus(status);
     try {
-      await writeFileAtomic(path11.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
+      await writeFileAtomic(path12.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
     } catch {
     }
     if (final) {
@@ -4669,7 +4723,7 @@ var TaskManager = class {
       observed = await gitStatus(workspace);
       task.changedFilesCache = { at: Date.now(), observed };
     }
-    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path11.relative(workspace, file).replace(/\\/g, "/")) : [];
+    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path12.relative(workspace, file).replace(/\\/g, "/")) : [];
     return { observed, claudeAuthored: authored, observedAt: new Date(task.changedFilesCache?.at ?? Date.now()).toISOString() };
   }
   view(task) {
@@ -4743,23 +4797,23 @@ var TaskManager = class {
     return [...this.tasks.values()].filter((task) => !scope || task.record.taskId === scope).map((task) => this.view(task));
   }
   async runsOf(task) {
-    const dir = path11.join(task.dir, "runs");
+    const dir = path12.join(task.dir, "runs");
     let entries = [];
     try {
-      entries = await fs12.readdir(dir);
+      entries = await fs13.readdir(dir);
     } catch {
       return [];
     }
     const runs = [];
     for (const runId of entries.sort()) {
-      const status = await readJsonShared(path11.join(dir, runId, "status.json"));
+      const status = await readJsonShared(path12.join(dir, runId, "status.json"));
       runs.push({ runId, status: status.status === "ok" ? status.value.status ?? "UNKNOWN" : "UNKNOWN", startedAt: status.status === "ok" ? status.value.startedAt ?? null : null, endedAt: status.status === "ok" ? status.value.endedAt ?? null : null });
     }
     return runs;
   }
   async blobPage(task, blobId, page) {
     if (!/^blob-[a-f0-9-]{36}$/.test(blobId)) return null;
-    const read = await readJsonShared(path11.join(task.dir, "blobs", `${blobId}.json`));
+    const read = await readJsonShared(path12.join(task.dir, "blobs", `${blobId}.json`));
     if (read.status !== "ok") return null;
     const paged = previewPage(read.value.text, page);
     return { ...paged, truncated: read.value.truncated, totalChars: read.value.totalChars };
@@ -4795,39 +4849,12 @@ function normalizeRecord(record2) {
     reviewReason: typeof record2.reviewReason === "string" ? record2.reviewReason : null
   };
 }
-async function gitStatus(workspace) {
-  try {
-    await fs12.access(path11.join(workspace, ".git"));
-  } catch {
-    return [];
-  }
-  return new Promise((resolve) => {
-    const child = spawn6("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: workspace, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-    let stdout = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve([]);
-    }, 5e3);
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve([]);
-    });
-    child.on("exit", () => {
-      clearTimeout(timer);
-      resolve(stdout.split("\n").map((line) => line.slice(3).trim()).filter(Boolean).slice(0, 500));
-    });
-  });
-}
 
 // src/broker/singleton.ts
 import { closeSync as closeSync2, openSync as openSync2, readFileSync as readFileSync3, renameSync, statSync as statSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2, mkdirSync as mkdirSync2 } from "node:fs";
-import { spawn as spawn7 } from "node:child_process";
+import { spawn as spawn8 } from "node:child_process";
 import { createHash as createHash4 } from "node:crypto";
-import path12 from "node:path";
+import path13 from "node:path";
 function readOwner(file) {
   try {
     const parsed = JSON.parse(readFileSync3(file, "utf8"));
@@ -4899,9 +4926,9 @@ var SingletonBusyError = class extends Error {
   }
 };
 function acquireFileSingleton(stateRoot) {
-  const dir = path12.join(stateRoot, "broker");
+  const dir = path13.join(stateRoot, "broker");
   mkdirSync2(dir, { recursive: true });
-  const file = path12.join(dir, "broker.lock");
+  const file = path13.join(dir, "broker.lock");
   if (heldByLiveProcess(file)) throw new SingletonBusyError(readOwner(file));
   let descriptor;
   try {
@@ -4930,10 +4957,10 @@ function acquireFileSingleton(stateRoot) {
   };
 }
 async function acquireWindowsMutex(stateRoot) {
-  const dir = path12.join(stateRoot, "broker");
+  const dir = path13.join(stateRoot, "broker");
   mkdirSync2(dir, { recursive: true });
-  const file = path12.join(dir, "broker.lock");
-  const key = createHash4("sha256").update(path12.resolve(stateRoot).toLowerCase()).digest("hex").slice(0, 32);
+  const file = path13.join(dir, "broker.lock");
+  const key = createHash4("sha256").update(path13.resolve(stateRoot).toLowerCase()).digest("hex").slice(0, 32);
   const mutexName = `Local\\CodeOrquestra-${key}`;
   const script = [
     `$m=[Threading.Mutex]::new($false,'${mutexName}')`,
@@ -4943,7 +4970,7 @@ async function acquireWindowsMutex(stateRoot) {
     "try{$m.ReleaseMutex()}catch{}",
     "$m.Dispose()"
   ].join(";");
-  const child = spawn7("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+  const child = spawn8("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
     stdio: ["pipe", "pipe", "ignore"],
     windowsHide: true
   });
@@ -5057,8 +5084,8 @@ var Broker = class {
   singleton = null;
   constructor(options) {
     this.options = options;
-    this.brokerDir = path13.join(options.stateRoot, "broker");
-    this.logFile = path13.join(this.brokerDir, "broker.log");
+    this.brokerDir = path14.join(options.stateRoot, "broker");
+    this.logFile = path14.join(this.brokerDir, "broker.log");
     this.identity = new IdentityRegistry(this.brokerDir);
     this.assets = new StaticAssets(dashboardDir());
     this.tasks = new TaskManager({
@@ -5078,7 +5105,7 @@ var Broker = class {
     void appendTextSafe(this.logFile, text).catch(() => void 0);
   }
   async start() {
-    await fs13.mkdir(this.brokerDir, { recursive: true });
+    await fs14.mkdir(this.brokerDir, { recursive: true });
     this.singleton = await acquireBrokerSingleton(this.options.stateRoot);
     void this.singleton.lost.then(async () => {
       this.log("broker singleton ownership was lost; shutting down to prevent a second owner");
@@ -5107,7 +5134,7 @@ var Broker = class {
     this.baseUrl = `http://127.0.0.1:${this.port}`;
     const bootstrapUrl = `${this.baseUrl}/bootstrap?token=${this.identity.mintBootstrapToken(null)}`;
     const announcement = { event: "broker_listening", address: "127.0.0.1", port: this.port, baseUrl: this.baseUrl, bootstrapUrl, secretFile: this.identity.secretPath, stateRoot: this.options.stateRoot, pid: process.pid, cursorEpoch: this.cursorEpoch };
-    await writeFileAtomic(path13.join(this.brokerDir, "broker.json"), JSON.stringify({ pid: process.pid, port: this.port, baseUrl: this.baseUrl, startedAt: this.startedAt, secretFile: this.identity.secretPath, version: RUNTIME_VERSION, product: BRAND.name }, null, 2));
+    await writeFileAtomic(path14.join(this.brokerDir, "broker.json"), JSON.stringify({ pid: process.pid, port: this.port, baseUrl: this.baseUrl, startedAt: this.startedAt, secretFile: this.identity.secretPath, version: RUNTIME_VERSION, product: BRAND.name }, null, 2));
     this.log(`broker listening on ${this.baseUrl} (pid ${process.pid}, painel ${this.assets.dir ? "compilado" : "n\xE3o compilado"})`);
     return announcement;
   }
@@ -5119,7 +5146,7 @@ var Broker = class {
     await this.tasks.stop();
     if (this.server) await new Promise((resolve) => this.server.close(() => resolve()));
     try {
-      await fs13.rm(path13.join(this.brokerDir, "broker.json"), { force: true });
+      await fs14.rm(path14.join(this.brokerDir, "broker.json"), { force: true });
     } catch {
     }
     await this.singleton?.release();
@@ -5391,14 +5418,14 @@ var Broker = class {
 };
 
 // src/broker/client.ts
-import { spawn as spawn8 } from "node:child_process";
-import { promises as fs14 } from "node:fs";
-import path14 from "node:path";
+import { spawn as spawn9 } from "node:child_process";
+import { promises as fs15 } from "node:fs";
+import path15 from "node:path";
 async function readBrokerInfo(stateRoot) {
-  const read = await readJsonShared(path14.join(stateRoot, "broker", "broker.json"));
+  const read = await readJsonShared(path15.join(stateRoot, "broker", "broker.json"));
   if (read.status !== "ok") return null;
   try {
-    const secret = (await fs14.readFile(read.value.secretFile, "utf8")).trim();
+    const secret = (await fs15.readFile(read.value.secretFile, "utf8")).trim();
     const response = await fetch(`${read.value.baseUrl}/api/health`, { headers: { authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(3e3) });
     if (!response.ok) return null;
     const health = await response.json();
@@ -5410,8 +5437,8 @@ async function readBrokerInfo(stateRoot) {
 }
 async function ensureBroker(stateRoot) {
   const existing = await readBrokerInfo(stateRoot);
-  if (existing) return { baseUrl: existing.baseUrl, secret: (await fs14.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
-  const child = spawn8(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
+  if (existing) return { baseUrl: existing.baseUrl, secret: (await fs15.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
+  const child = spawn9(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -5421,7 +5448,7 @@ async function ensureBroker(stateRoot) {
   const deadline = Date.now() + 2e4;
   while (Date.now() < deadline) {
     const info = await readBrokerInfo(stateRoot);
-    if (info) return { baseUrl: info.baseUrl, secret: (await fs14.readFile(info.secretFile, "utf8")).trim(), pid: info.pid, started: true };
+    if (info) return { baseUrl: info.baseUrl, secret: (await fs15.readFile(info.secretFile, "utf8")).trim(), pid: info.pid, started: true };
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error("O broker n\xE3o iniciou a tempo.");
@@ -5535,7 +5562,7 @@ async function main(argv = process.argv.slice(2)) {
 `);
     return 0;
   }
-  const stateRoot = typeof flags["state-root"] === "string" ? path15.resolve(flags["state-root"]) : defaultStateRoot();
+  const stateRoot = typeof flags["state-root"] === "string" ? path16.resolve(flags["state-root"]) : defaultStateRoot();
   const [command, sub] = positional;
   if (command === "broker" && sub === "start") {
     const supervision = parseSupervision();
@@ -5624,7 +5651,7 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
       process.stderr.write("Use: start --job <job.json> --task-handle <handle>\n");
       return 2;
     }
-    const job = JSON.parse(await fs15.readFile(flags.job, "utf8"));
+    const job = JSON.parse(await fs16.readFile(flags.job, "utf8"));
     const bound = await api(stateRoot, "POST", "/api/tasks/by-handle", { taskHandle: flags["task-handle"] });
     if (bound.status !== 200) {
       process.stdout.write(`${JSON.stringify(bound.body)}
@@ -5642,7 +5669,7 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
 `);
   return command ? 2 : 0;
 }
-var isEntry = process.argv[1] ? pathToFileURL(path15.resolve(process.argv[1])).href === import.meta.url : false;
+var isEntry = process.argv[1] ? pathToFileURL(path16.resolve(process.argv[1])).href === import.meta.url : false;
 if (isEntry) {
   main().then((code) => {
     if (code !== 0) process.exitCode = code;

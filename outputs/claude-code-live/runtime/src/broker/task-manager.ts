@@ -23,6 +23,7 @@ import { resolvePreflight, type PreflightResult, type ProbeResult, type Resolved
 import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
 import { inventoryCustomizations, type Inventory } from '../trust/inventory.ts';
 import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
+import { gitStatus } from './worktree.ts';
 import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
@@ -1683,24 +1684,5 @@ function normalizeRecord(record: TaskRecord): TaskRecord {
   };
 }
 
-async function gitStatus(workspace: string): Promise<string[]> {
-  try {
-    await fs.access(path.join(workspace, '.git'));
-  } catch {
-    return [];
-  }
-  return new Promise((resolve) => {
-    const child = spawn('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
-    let stdout = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
-    const timer = setTimeout(() => { child.kill(); resolve([]); }, 5000);
-    child.on('error', () => { clearTimeout(timer); resolve([]); });
-    child.on('exit', () => {
-      clearTimeout(timer);
-      resolve(stdout.split('\n').map((line) => line.slice(3).trim()).filter(Boolean).slice(0, 500));
-    });
-  });
-}
 
 export { isHarness };
