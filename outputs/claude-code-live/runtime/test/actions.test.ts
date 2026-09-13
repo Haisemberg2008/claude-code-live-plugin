@@ -50,6 +50,9 @@ describe('development profile classification', () => {
     assert.deepEqual(pick(classify('Bash', { command: 'git status --short' })), { decision: 'allow', reason: 'INSPECTION_COMMAND' });
     assert.deepEqual(pick(classify('Bash', { command: 'git -C src status' })), { decision: 'allow', reason: 'INSPECTION_COMMAND' });
     assert.deepEqual(pick(classify('Bash', { command: 'git diff -- src' })), { decision: 'allow', reason: 'INSPECTION_COMMAND' });
+    // Regression: `worktree` used to sit in GIT_STATE_RULES, which is tested
+    // before INSPECTION_RULES, so this inspection alternative was unreachable.
+    assert.deepEqual(pick(classify('Bash', { command: 'git worktree list' })), { decision: 'allow', reason: 'INSPECTION_COMMAND' });
     assert.deepEqual(pick(classify('Read', { file_path: 'C:\\ws\\projeto\\README.md' })), { decision: 'allow', reason: 'IN_WORKSPACE_READ' });
     assert.deepEqual(pick(classify('Grep', { pattern: 'x', path: 'C:\\ws\\projeto' })), { decision: 'allow', reason: 'IN_WORKSPACE_READ' });
     assert.deepEqual(pick(classify('Glob', { pattern: '**/*.ts' })), { decision: 'allow', reason: 'IN_WORKSPACE_READ' });
@@ -68,6 +71,9 @@ describe('development profile classification', () => {
       ['claude config set model opus', 'RESERVED_OPERATION_CONFIG'],
       ['npm install -g something', 'RESERVED_OPERATION_INSTALL'],
       ['npm --prefix runtime install -g something', 'RESERVED_OPERATION_INSTALL'],
+      ['git worktree add ../wt-a feature', 'RESERVED_OPERATION_WORKTREE'],
+      ['git worktree remove ../wt-a', 'RESERVED_OPERATION_WORKTREE'],
+      ['git worktree prune', 'RESERVED_OPERATION_WORKTREE'],
     ];
     for (const [command, reason] of cases) {
       const result = classify('Bash', { command });
@@ -86,6 +92,21 @@ describe('development profile classification', () => {
     assert.deepEqual(pick(classify('Bash', { command: 'cat C:/ws/projeto/.env' })), { decision: 'deny', reason: 'SENSITIVE_FILE' });
     assert.deepEqual(pick(classify('Bash', { command: 'sort < .env' })), { decision: 'deny', reason: 'SENSITIVE_FILE' });
     assert.deepEqual(pick(classify('Bash', { command: 'npm test -- --env=production' })), { decision: 'allow', reason: 'TESTING_COMMAND' }, 'an --env flag is not a .env file');
+  });
+
+  test('the git administrative area is not writable, but .git-prefixed project files are', () => {
+    // A hook written here runs on the next commit, and commit never belongs to
+    // Claude. Only .git/config and .git/credentials were sensitive by pattern.
+    for (const file of ['C:\\ws\\projeto\\.git\\hooks\\pre-commit', 'C:\\ws\\projeto\\.git', 'C:\\ws\\projeto\\.git\\info\\exclude', 'C:\\ws\\projeto\\src\\.git\\hooks\\post-merge']) {
+      assert.deepEqual(pick(classify('Write', { file_path: file, content: 'x' })), { decision: 'deny', reason: 'GIT_ADMIN_AREA' }, file);
+      assert.deepEqual(pick(classify('Edit', { file_path: file })), { decision: 'deny', reason: 'GIT_ADMIN_AREA' }, file);
+    }
+    assert.deepEqual(pick(classify('Bash', { command: 'echo x > .git/hooks/pre-commit' })), { decision: 'deny', reason: 'GIT_ADMIN_AREA' }, 'also through a shell redirect');
+    // `.gitignore`, `.gitattributes` and `.github/` are ordinary project files:
+    // they share a prefix with `.git` but are not that path segment.
+    assert.deepEqual(pick(classify('Write', { file_path: 'C:\\ws\\projeto\\src\\.gitignore', content: 'x' }, { scopePaths: [], wholeWorkspace: true })), { decision: 'allow', reason: 'IN_SCOPE_IMPLEMENTATION' });
+    assert.deepEqual(pick(classify('Write', { file_path: 'C:\\ws\\projeto\\src\\.gitattributes', content: 'x' }, { scopePaths: [], wholeWorkspace: true })), { decision: 'allow', reason: 'IN_SCOPE_IMPLEMENTATION' });
+    assert.deepEqual(pick(classify('Write', { file_path: 'C:\\ws\\projeto\\src\\.github\\workflows\\ci.yml', content: 'x' }, { scopePaths: [], wholeWorkspace: true })), { decision: 'allow', reason: 'IN_SCOPE_IMPLEMENTATION' });
   });
 
   test('workspace and scope boundaries, including prefix collisions', () => {

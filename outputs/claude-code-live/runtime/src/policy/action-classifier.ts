@@ -93,6 +93,11 @@ const RESERVED_RULES: Rule[] = [
   { pattern: /^git\b.*\bpush\b/i, reason: 'RESERVED_OPERATION_PUSH' },
   { pattern: /^gh\s+pr\s+(create|merge|close|ready|edit|reopen)\b/i, reason: 'RESERVED_OPERATION_PUSH' },
   { pattern: /^git\b.*\b(commit|merge|cherry-pick|revert)\b/i, reason: 'RESERVED_OPERATION_COMMIT' },
+  // Provisioning a worktree is the broker's job, never the agent's: a checkout
+  // created behind our back carries no writer lock, no trust record and no
+  // entry in the orphan sweep. `git worktree list` is inspection and is left to
+  // INSPECTION_RULES below.
+  { pattern: /^git\s+worktree\s+(add|remove|move|prune|lock|unlock|repair)\b/i, reason: 'RESERVED_OPERATION_WORKTREE' },
   { pattern: /^(npm|pnpm|yarn|bun)\s+(publish|deprecate|dist-tag|unpublish)\b/i, reason: 'RESERVED_OPERATION_DEPLOY' },
   { pattern: /^(docker\s+push|kubectl\s+(apply|delete|rollout|scale)|terraform\s+(apply|destroy)|pulumi\s+(up|destroy)|firebase\s+deploy|vercel\b|netlify\s+deploy|gh\s+release\b|helm\s+(install|upgrade|uninstall)|twine\s+upload|cargo\s+publish|dotnet\s+nuget\s+push|az\s+\S+.*\bdeploy\b|aws\s+\S+.*\bdeploy\b|gcloud\s+\S+.*\bdeploy\b|fly\s+deploy|heroku\s+)/i, reason: 'RESERVED_OPERATION_DEPLOY' },
   { pattern: /^(npm|pnpm|yarn|bun)\s+(i|install|add|uninstall|remove|update|link|rm|un)\b.*(\s|^)(-g|--global)\b/i, reason: 'RESERVED_OPERATION_INSTALL' },
@@ -159,7 +164,11 @@ const DEPENDENCY_RULES: RegExp[] = [
 
 const PROCESS_KILL_BROAD = /^(taskkill\b.*\/im\b|Stop-Process\b.*-Name\b|pkill\b|killall\b|Get-Process\b.*\|\s*Stop-Process)/i;
 const PROCESS_KILL = /^(taskkill|Stop-Process|kill|spps)\b/i;
-const GIT_STATE_RULES = /^git\s+(add|rm|mv|switch|checkout\s+(?![-.])|init|worktree|tag|notes|update-index|submodule|lfs)\b/i;
+// `worktree` is deliberately absent: its mutating subcommands are denied by
+// RESERVED_RULES, and `git worktree list` must reach INSPECTION_RULES. Listing
+// it here made that inspection alternative unreachable, because this test runs
+// first.
+const GIT_STATE_RULES = /^git\s+(add|rm|mv|switch|checkout\s+(?![-.])|init|tag|notes|update-index|submodule|lfs)\b/i;
 const ENV_DISCLOSURE = /^(env|printenv|set|Get-ChildItem\s+env:|gci\s+env:|ls\s+env:|dir\s+env:|\[Environment\]::GetEnvironmentVariables)\b/i;
 
 const INSPECTION_RULES: RegExp[] = [
@@ -190,6 +199,8 @@ const MESSAGES: Record<string, string> = {
   RESERVED_OPERATION_PUSH: 'Operação reservada: push, abertura ou merge de PR pertencem ao Codex ou ao usuário; o Claude não pode executá-los.',
   RESERVED_OPERATION_COMMIT: 'Operação reservada: commit, merge e reescrita de histórico pertencem ao Codex ou ao usuário.',
   RESERVED_OPERATION_DEPLOY: 'Operação reservada: publicação e deploy são mutações externas fora do escopo do Claude.',
+  RESERVED_OPERATION_WORKTREE: 'Operação reservada: criar, remover ou mover worktrees altera o repositório de forma persistente e é feito pelo broker, não pelo Claude. Listar worktrees é permitido.',
+  GIT_ADMIN_AREA: 'Escrita negada: o diretório administrativo .git contém hooks e referências que passam a valer no próximo commit, que não pertence ao Claude.',
   RESERVED_OPERATION_INSTALL: 'Operação reservada: instalação global, de plugins ou de gerenciadores de pacotes altera a máquina e exige ação do Codex ou do usuário.',
   RESERVED_OPERATION_CONFIG: 'Operação reservada: configuração instalada, autenticação e registro do sistema não podem ser alterados pelo Claude.',
   SENSITIVE_FILE: 'Arquivo sensível bloqueado: credenciais, chaves, variáveis de ambiente ou configuração de autenticação não são lidos nem escritos.',
@@ -301,6 +312,24 @@ export function isSensitivePath(candidate: string): boolean {
   return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+/** `.git` as a whole path segment. `.gitignore`, `.gitattributes` and
+ *  `.github` are ordinary project files and must not match. */
+const GIT_ADMIN_SEGMENT = /(^|[\\/])\.git([\\/]|$)/i;
+
+/**
+ * Whether a write lands anywhere in a git administrative area.
+ *
+ * Only `.git/config` and `.git/credentials` are sensitive by pattern, which
+ * left `.git/hooks/pre-commit` writable — arbitrary code that runs on the next
+ * commit, and commit always belongs to the coordinator or the user. Containment
+ * cannot catch it either: in a worktree `.git` is a *file* holding `gitdir: …`,
+ * so the resolved path stays inside the working tree while the write reaches
+ * the repository's shared admin directory.
+ */
+export function targetsGitAdminArea(candidate: string): boolean {
+  return GIT_ADMIN_SEGMENT.test(candidate.replace(/["']/g, ''));
+}
+
 function capabilitiesOf(context: ActionContext): ActionCapabilities {
   if (context.capabilities) return context.capabilities;
   if (context.profile === 'read') return { edit: false, test: false, commands: 'none' };
@@ -380,6 +409,11 @@ function checkWriteTarget(target: string, context: ActionContext): ActionResult 
   const resolved = resolveWorkspacePath(context.workspace, target);
   if (isSensitivePath(resolved.absolute)) return result('deny', 'SENSITIVE_FILE', { path: target });
   if (isSensitivePath(resolved.resolved)) return result('deny', resolved.redirected ? 'SENSITIVE_TARGET' : 'SENSITIVE_FILE', { path: target, resolved: resolved.resolved });
+  // Checked on both spellings: a symlink into `.git` redirects, and a worktree's
+  // `.git` file keeps the resolved path inside the working tree.
+  if (targetsGitAdminArea(target) || targetsGitAdminArea(resolved.absolute) || targetsGitAdminArea(resolved.resolved)) {
+    return result('deny', 'GIT_ADMIN_AREA', { path: target, ...(resolved.redirected ? { resolved: resolved.resolved } : {}) });
+  }
   if (!resolved.inside) return result('deny', 'OUTSIDE_WORKSPACE', { path: target, ...(resolved.redirected ? { resolved: resolved.resolved } : {}) });
   if (!scopeContains(context, resolved.resolved)) return result('escalate', 'OUTSIDE_SCOPE_PATH', { path: target, ...(resolved.redirected ? { resolved: resolved.resolved } : {}) });
   return null;

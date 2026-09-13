@@ -147,6 +147,11 @@ var RESERVED_RULES = [
   { pattern: /^git\b.*\bpush\b/i, reason: "RESERVED_OPERATION_PUSH" },
   { pattern: /^gh\s+pr\s+(create|merge|close|ready|edit|reopen)\b/i, reason: "RESERVED_OPERATION_PUSH" },
   { pattern: /^git\b.*\b(commit|merge|cherry-pick|revert)\b/i, reason: "RESERVED_OPERATION_COMMIT" },
+  // Provisioning a worktree is the broker's job, never the agent's: a checkout
+  // created behind our back carries no writer lock, no trust record and no
+  // entry in the orphan sweep. `git worktree list` is inspection and is left to
+  // INSPECTION_RULES below.
+  { pattern: /^git\s+worktree\s+(add|remove|move|prune|lock|unlock|repair)\b/i, reason: "RESERVED_OPERATION_WORKTREE" },
   { pattern: /^(npm|pnpm|yarn|bun)\s+(publish|deprecate|dist-tag|unpublish)\b/i, reason: "RESERVED_OPERATION_DEPLOY" },
   { pattern: /^(docker\s+push|kubectl\s+(apply|delete|rollout|scale)|terraform\s+(apply|destroy)|pulumi\s+(up|destroy)|firebase\s+deploy|vercel\b|netlify\s+deploy|gh\s+release\b|helm\s+(install|upgrade|uninstall)|twine\s+upload|cargo\s+publish|dotnet\s+nuget\s+push|az\s+\S+.*\bdeploy\b|aws\s+\S+.*\bdeploy\b|gcloud\s+\S+.*\bdeploy\b|fly\s+deploy|heroku\s+)/i, reason: "RESERVED_OPERATION_DEPLOY" },
   { pattern: /^(npm|pnpm|yarn|bun)\s+(i|install|add|uninstall|remove|update|link|rm|un)\b.*(\s|^)(-g|--global)\b/i, reason: "RESERVED_OPERATION_INSTALL" },
@@ -208,7 +213,7 @@ var DEPENDENCY_RULES = [
 ];
 var PROCESS_KILL_BROAD = /^(taskkill\b.*\/im\b|Stop-Process\b.*-Name\b|pkill\b|killall\b|Get-Process\b.*\|\s*Stop-Process)/i;
 var PROCESS_KILL = /^(taskkill|Stop-Process|kill|spps)\b/i;
-var GIT_STATE_RULES = /^git\s+(add|rm|mv|switch|checkout\s+(?![-.])|init|worktree|tag|notes|update-index|submodule|lfs)\b/i;
+var GIT_STATE_RULES = /^git\s+(add|rm|mv|switch|checkout\s+(?![-.])|init|tag|notes|update-index|submodule|lfs)\b/i;
 var ENV_DISCLOSURE = /^(env|printenv|set|Get-ChildItem\s+env:|gci\s+env:|ls\s+env:|dir\s+env:|\[Environment\]::GetEnvironmentVariables)\b/i;
 var INSPECTION_RULES = [
   /^git\s+(status|diff|log|show|blame|rev-parse|ls-files|describe|shortlog|cat-file|grep|reflog|stash\s+list|worktree\s+list|config\s+(--get|--list|-l)\b|branch(\s+(-a|-r|--list|-v|-vv|--show-current|--contains))*\s*$|remote(\s+-v)?\s*$)/i,
@@ -235,6 +240,8 @@ var MESSAGES = {
   RESERVED_OPERATION_PUSH: "Opera\xE7\xE3o reservada: push, abertura ou merge de PR pertencem ao Codex ou ao usu\xE1rio; o Claude n\xE3o pode execut\xE1-los.",
   RESERVED_OPERATION_COMMIT: "Opera\xE7\xE3o reservada: commit, merge e reescrita de hist\xF3rico pertencem ao Codex ou ao usu\xE1rio.",
   RESERVED_OPERATION_DEPLOY: "Opera\xE7\xE3o reservada: publica\xE7\xE3o e deploy s\xE3o muta\xE7\xF5es externas fora do escopo do Claude.",
+  RESERVED_OPERATION_WORKTREE: "Opera\xE7\xE3o reservada: criar, remover ou mover worktrees altera o reposit\xF3rio de forma persistente e \xE9 feito pelo broker, n\xE3o pelo Claude. Listar worktrees \xE9 permitido.",
+  GIT_ADMIN_AREA: "Escrita negada: o diret\xF3rio administrativo .git cont\xE9m hooks e refer\xEAncias que passam a valer no pr\xF3ximo commit, que n\xE3o pertence ao Claude.",
   RESERVED_OPERATION_INSTALL: "Opera\xE7\xE3o reservada: instala\xE7\xE3o global, de plugins ou de gerenciadores de pacotes altera a m\xE1quina e exige a\xE7\xE3o do Codex ou do usu\xE1rio.",
   RESERVED_OPERATION_CONFIG: "Opera\xE7\xE3o reservada: configura\xE7\xE3o instalada, autentica\xE7\xE3o e registro do sistema n\xE3o podem ser alterados pelo Claude.",
   SENSITIVE_FILE: "Arquivo sens\xEDvel bloqueado: credenciais, chaves, vari\xE1veis de ambiente ou configura\xE7\xE3o de autentica\xE7\xE3o n\xE3o s\xE3o lidos nem escritos.",
@@ -326,6 +333,10 @@ function isSensitivePath(candidate) {
   const text = candidate.replace(/["']/g, "");
   return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(text));
 }
+var GIT_ADMIN_SEGMENT = /(^|[\\/])\.git([\\/]|$)/i;
+function targetsGitAdminArea(candidate) {
+  return GIT_ADMIN_SEGMENT.test(candidate.replace(/["']/g, ""));
+}
 function capabilitiesOf(context) {
   if (context.capabilities) return context.capabilities;
   if (context.profile === "read") return { edit: false, test: false, commands: "none" };
@@ -387,6 +398,9 @@ function checkWriteTarget(target, context) {
   const resolved = resolveWorkspacePath(context.workspace, target);
   if (isSensitivePath(resolved.absolute)) return result("deny", "SENSITIVE_FILE", { path: target });
   if (isSensitivePath(resolved.resolved)) return result("deny", resolved.redirected ? "SENSITIVE_TARGET" : "SENSITIVE_FILE", { path: target, resolved: resolved.resolved });
+  if (targetsGitAdminArea(target) || targetsGitAdminArea(resolved.absolute) || targetsGitAdminArea(resolved.resolved)) {
+    return result("deny", "GIT_ADMIN_AREA", { path: target, ...resolved.redirected ? { resolved: resolved.resolved } : {} });
+  }
   if (!resolved.inside) return result("deny", "OUTSIDE_WORKSPACE", { path: target, ...resolved.redirected ? { resolved: resolved.resolved } : {} });
   if (!scopeContains(context, resolved.resolved)) return result("escalate", "OUTSIDE_SCOPE_PATH", { path: target, ...resolved.redirected ? { resolved: resolved.resolved } : {} });
   return null;
