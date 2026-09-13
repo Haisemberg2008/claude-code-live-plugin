@@ -1339,3 +1339,53 @@ describe('parallel worktrees', () => {
     assert.deepEqual(body.holders?.map((holder) => holder.taskId), [first.taskId]);
   });
 });
+
+describe('diff annotations', () => {
+  test('an annotation on an observed file becomes queued guidance, and anything else is refused', async () => {
+    const { taskId, taskHandle } = await register('thread-anotacao');
+    // A real repository: annotations and diffs are about tracked change, so a
+    // directory without .git has nothing to observe and nothing to diff.
+    await approveTrust(taskId, repoWorkspace);
+    // The simulated CLI emits tool events but never touches the filesystem, so
+    // the harness makes the real change git is expected to observe — before the
+    // run starts, so the first status read already sees it.
+    await writeFile(path.join(repoWorkspace, 'src', 'anotado.ts'), 'export const a = 1;\n');
+    await startRun(taskId, taskHandle, devJob(repoWorkspace, script(['say: trabalhando', 'sleep: 20000'])));
+    await waitForState(taskId, 'busy_tool');
+    await waitFor(async () => (await task(taskId)).changedFiles.observed.includes('src/anotado.ts'), { description: 'o arquivo escrito deve aparecer como observado' });
+
+    // A path the broker never observed is refused: an annotation must not be a
+    // way to point Claude at somewhere it was not sent.
+    const foreign = await broker.api(`/api/tasks/${taskId}/annotations`, {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ taskHandle, file: 'src/nunca-tocado.ts', comment: 'olhe aqui' }),
+    });
+    assert.equal(foreign.status, 400, foreign.text);
+    assert.equal((foreign.body as { error?: string }).error, 'FILE_NOT_OBSERVED');
+
+    const empty = await broker.api(`/api/tasks/${taskId}/annotations`, {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ taskHandle, file: 'src/anotado.ts', comment: '   ' }),
+    });
+    assert.equal(empty.status, 400, empty.text);
+
+    const ok = await broker.api(`/api/tasks/${taskId}/annotations`, {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ taskHandle, file: 'src/anotado.ts', hunk: '@@ -1 +1 @@', comment: 'renomeie para algo descritivo' }),
+    });
+    assert.equal(ok.status, 202, ok.text);
+    // It travels the ordinary guidance path: same queue, same states, no new
+    // delivery mechanism and no change to turn semantics.
+    const view = await task(taskId);
+    assert.ok(view.queue.some((entry) => entry.state === 'queued' || entry.state === 'delivered'), JSON.stringify(view.queue));
+
+    const diff = await broker.api(`/api/tasks/${taskId}/diff?file=${encodeURIComponent('src/anotado.ts')}&taskHandle=${encodeURIComponent(taskHandle)}`, { headers: broker.bearerHeaders() });
+    assert.equal(diff.status, 200, diff.text);
+    assert.equal((diff.body as { file: string }).file, 'src/anotado.ts');
+
+    const sensitive = await broker.api(`/api/tasks/${taskId}/diff?file=${encodeURIComponent('.env')}&taskHandle=${encodeURIComponent(taskHandle)}`, { headers: broker.bearerHeaders() });
+    assert.ok(sensitive.status === 400 || sensitive.status === 403, sensitive.text);
+
+    await broker.api(`/api/tasks/${taskId}/end`, { method: 'POST', headers: broker.bearerHeaders(), body: '{}' });
+  });
+});

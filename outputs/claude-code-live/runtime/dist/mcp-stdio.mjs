@@ -36695,6 +36695,10 @@ server.registerTool("codeorquestra_answer", { description: "Responde a um pedido
   const taskId = await taskIdFor(taskHandle);
   return call("POST", `/api/tasks/${taskId}/answer`, { taskHandle, ...rest });
 }));
+server.registerTool("codeorquestra_annotate", { description: "Anota um arquivo alterado nesta execu\xE7\xE3o; a anota\xE7\xE3o vira orienta\xE7\xE3o na fila e \xE9 entregue no pr\xF3ximo turno. S\xF3 aceita arquivos que o broker observou como alterados.", inputSchema: { taskHandle: handle, file: external_exports.string().min(1).describe("Caminho relativo ao workspace, exatamente como aparece em changedFiles.observed."), comment: external_exports.string().min(1), hunk: external_exports.string().optional().describe('Cabe\xE7alho do trecho, quando houver (ex.: "@@ -10,7 +10,9 @@").') } }, async ({ taskHandle, ...rest }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call("POST", `/api/tasks/${taskId}/annotations`, { taskHandle, ...rest });
+}));
 server.registerTool("codeorquestra_interrupt", { description: "Interrompe o turno atual (a sess\xE3o continua aberta).", inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call("POST", `/api/tasks/${taskId}/interrupt`, { taskHandle });

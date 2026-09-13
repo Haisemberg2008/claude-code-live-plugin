@@ -19,6 +19,7 @@ let broker: TestBroker;
 let workspace: string;
 
 const EXPECTED_TOOLS = [
+  'codeorquestra_annotate',
   'codeorquestra_answer',
   'codeorquestra_dashboard_url',
   'codeorquestra_end',

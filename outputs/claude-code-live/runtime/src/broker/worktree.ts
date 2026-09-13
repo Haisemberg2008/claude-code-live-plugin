@@ -77,7 +77,45 @@ export async function gitStatus(workspace: string): Promise<string[]> {
   }
   const result = await git(['status', '--porcelain', '--untracked-files=all'], workspace, 5000);
   if (result.code !== 0) return [];
-  return result.stdout.split('\n').map((line) => line.slice(3).trim()).filter(Boolean).slice(0, MAX_CHANGED_FILES);
+  return result.stdout.split('\n').map((line) => normalizeStatusPath(line.slice(3).trim())).filter(Boolean).slice(0, MAX_CHANGED_FILES);
+}
+
+/**
+ * Turns one porcelain path field into a plain workspace-relative path.
+ *
+ * Two shapes need handling or the entry is unusable downstream, where the list
+ * is what an annotation or a diff request must match exactly:
+ *   - a rename is reported as `old -> new`, and only the new path exists;
+ *   - a path with non-ASCII or unusual bytes is C-quoted, e.g. "src/a\303\247.ts".
+ * Anything still ambiguous after this is left as-is and simply fails to match,
+ * which refuses the request rather than acting on a half-parsed path.
+ */
+function normalizeStatusPath(field: string): string {
+  let value = field;
+  const arrow = value.lastIndexOf(' -> ');
+  if (arrow >= 0) value = value.slice(arrow + 4).trim();
+  if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+    const body = value.slice(1, -1);
+    try {
+      // C-style octal escapes are UTF-8 bytes; decode them as such.
+      const bytes: number[] = [];
+      for (let index = 0; index < body.length; index += 1) {
+        if (body[index] !== '\\') { bytes.push(body.charCodeAt(index)); continue; }
+        const next = body[index + 1] ?? '';
+        if (/[0-7]/.test(next)) {
+          bytes.push(parseInt(body.slice(index + 1, index + 4), 8));
+          index += 3;
+        } else {
+          bytes.push(({ n: 10, t: 9, r: 13, '"': 34, '\\': 92 } as Record<string, number>)[next] ?? body.charCodeAt(index + 1));
+          index += 1;
+        }
+      }
+      value = Buffer.from(bytes).toString('utf8');
+    } catch {
+      return field;
+    }
+  }
+  return value;
 }
 
 export interface Repository {

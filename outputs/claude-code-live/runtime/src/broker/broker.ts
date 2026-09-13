@@ -372,6 +372,11 @@ export class Broker {
         const { inventory, trust } = await this.tasks.inventoryFor(workspace);
         return sendJson(res, 200, { inventory: inventory.toJSON(), trust });
       }
+      if (action === 'diff' && method === 'GET') {
+        const file = url.searchParams.get('file');
+        if (!file) throw new HttpError(400, 'FILE_REQUIRED');
+        return sendJson(res, 200, await this.tasks.fileDiff(task, file));
+      }
       if (method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
       this.bindHandle(identity, task, body, url);
       const source: ActionSource = identity.source;
@@ -379,6 +384,10 @@ export class Broker {
         case 'message': {
           if (typeof body.text !== 'string' || !body.text.trim()) throw new HttpError(400, 'TEXT_REQUIRED');
           const entry = await this.tasks.enqueueMessage(task, body.text, source);
+          return sendJson(res, 202, entry);
+        }
+        case 'annotations': {
+          const entry = await this.tasks.annotate(task, { file: body.file, comment: body.comment, hunk: body.hunk }, source);
           return sendJson(res, 202, entry);
         }
         case 'answer':

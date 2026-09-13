@@ -23,6 +23,7 @@ import { resolvePreflight, type PreflightResult, type ProbeResult, type Resolved
 import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
 import { inventoryCustomizations, canonicalizeWorkspace, type Inventory } from '../trust/inventory.ts';
 import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
+import { isSensitivePath, resolveWorkspacePath } from '../policy/action-classifier.ts';
 import { git, gitStatus, listOrphans, resolveRepository, worktreePathFor, ensureWorktree, removeWorktree, withRepositoryMutex, assertUsablePathLength, canonicalize, canonicalizePlanned, type Repository } from './worktree.ts';
 import { WorktreePolicyStore, type WorktreePolicyRecord } from './worktree-policy.ts';
 import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
@@ -787,6 +788,79 @@ export class TaskManager {
     await this.deliverNext(task);
     this.changed(task);
     return this.queueView(entry);
+  }
+
+  /**
+   * A review note on a changed file becomes guidance for the next turn.
+   *
+   * Three steps, in order: validate the target, record the annotation in the
+   * durable log, and hand the rendered text to the EXISTING enqueueMessage.
+   * There is no new delivery path, no second queue and no new worker message,
+   * so every guarantee comes along unchanged — refused with NO_ACTIVE_RUN,
+   * refused while the run REQUIRES_REVIEW, delivered only between turns, never
+   * mid-turn, persisted in queue.jsonl, redacted on the way in.
+   *
+   * The target must be a file the broker already observed as changed. An
+   * annotation can therefore never name an arbitrary path, which is what keeps
+   * this from becoming a way to make Claude read somewhere it was not sent.
+   */
+  async annotate(task: TaskState, input: { file: unknown; comment: unknown; hunk?: unknown }, source: ActionSource): Promise<QueueEntryView> {
+    const file = typeof input.file === 'string' ? input.file.trim() : '';
+    const comment = typeof input.comment === 'string' ? input.comment.trim() : '';
+    if (!file) throw new HttpError(400, 'FILE_REQUIRED', { message: 'Informe o arquivo anotado em "file".' });
+    if (!comment) throw new HttpError(400, 'COMMENT_REQUIRED', { message: 'Uma anotação sem texto não orienta nada.' });
+    const workspace = task.record.workspace;
+    if (!workspace) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    const observed = await this.observedFiles(task);
+    if (!observed.includes(file)) {
+      throw new HttpError(400, 'FILE_NOT_OBSERVED', {
+        message: 'Só é possível anotar um arquivo que o broker observou como alterado nesta execução.',
+        observed: observed.slice(0, 50),
+      });
+    }
+    if (isSensitivePath(file)) throw new HttpError(403, 'SENSITIVE_FILE', { message: 'Arquivos sensíveis não são anotados nem exibidos.' });
+    const resolved = resolveWorkspacePath(workspace, file);
+    if (!resolved.inside) throw new HttpError(403, 'OUTSIDE_WORKSPACE', { message: 'O caminho anotado sai da árvore de trabalho.' });
+    const hunk = typeof input.hunk === 'string' && input.hunk.trim() ? input.hunk.trim().slice(0, 120) : null;
+    const rendered = `Anotação de revisão em ${file}${hunk ? ` (${hunk})` : ''}: ${comment}`;
+    await this.append(task, task.run?.runId ?? 'none', 'diff_annotated', {
+      file,
+      hunk,
+      commentPreview: boundedPreview(redactSensitiveText(comment), 300).preview,
+      source,
+      note: 'A anotação entra na fila como orientação e é entregue entre turnos, como qualquer outra.',
+    });
+    return this.enqueueMessage(task, rendered, source);
+  }
+
+  /** The changed-file list the annotation and diff routes validate against. */
+  private async observedFiles(task: TaskState): Promise<string[]> {
+    const fresh = await this.changedFiles(task);
+    return fresh.observed;
+  }
+
+  /**
+   * The diff of one observed file, for review.
+   *
+   * Diff output is file content the panel has never previewed, so it goes
+   * through the same redaction as everything else public, and through the same
+   * target validation as an annotation.
+   */
+  async fileDiff(task: TaskState, file: string): Promise<{ file: string; diff: string; truncated: boolean }> {
+    const workspace = task.record.workspace;
+    if (!workspace) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    const observed = await this.observedFiles(task);
+    if (!observed.includes(file)) throw new HttpError(400, 'FILE_NOT_OBSERVED', { observed: observed.slice(0, 50) });
+    if (isSensitivePath(file)) throw new HttpError(403, 'SENSITIVE_FILE');
+    const resolved = resolveWorkspacePath(workspace, file);
+    if (!resolved.inside) throw new HttpError(403, 'OUTSIDE_WORKSPACE');
+    // `--` separates the pathspec from revisions, so a file named like a ref
+    // cannot be read as one.
+    const result = await git(['diff', '--unified=3', '--', file], workspace);
+    const raw = result.code === 0 ? result.stdout : '';
+    const redacted = redactSensitiveText(raw);
+    const limit = 64_000;
+    return { file, diff: redacted.slice(0, limit), truncated: redacted.length > limit };
   }
 
   private async deliverNext(task: TaskState): Promise<void> {

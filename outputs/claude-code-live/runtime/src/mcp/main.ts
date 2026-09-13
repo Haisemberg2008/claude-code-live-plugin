@@ -147,6 +147,11 @@ server.registerTool('codeorquestra_answer', { description: 'Responde a um pedido
   return call('POST', `/api/tasks/${taskId}/answer`, { taskHandle, ...rest });
 }));
 
+server.registerTool('codeorquestra_annotate', { description: 'Anota um arquivo alterado nesta execução; a anotação vira orientação na fila e é entregue no próximo turno. Só aceita arquivos que o broker observou como alterados.', inputSchema: { taskHandle: handle, file: z.string().min(1).describe('Caminho relativo ao workspace, exatamente como aparece em changedFiles.observed.'), comment: z.string().min(1), hunk: z.string().optional().describe('Cabeçalho do trecho, quando houver (ex.: "@@ -10,7 +10,9 @@").') } }, async ({ taskHandle, ...rest }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call('POST', `/api/tasks/${taskId}/annotations`, { taskHandle, ...rest });
+}));
+
 server.registerTool('codeorquestra_interrupt', { description: 'Interrompe o turno atual (a sessão continua aberta).', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call('POST', `/api/tasks/${taskId}/interrupt`, { taskHandle });

@@ -47,6 +47,11 @@ export function buildRows(events: EventRecord[], queue: QueueEntryView[]): Row[]
       case 'assistant_text':
         rows.push({ kind: 'message', key, gseq, ts: event.ts, author: `Claude · ${String(data.model ?? 'modelo não observado')}`, source: 'claude', text: String(data.text ?? ''), truncated: data.truncated === true, totalChars: Number(data.totalChars ?? String(data.text ?? '').length), state: null });
         break;
+      // The annotation itself, as a system line. The guidance it produced shows
+      // up as its own message_queued row, so the text is not duplicated here.
+      case 'diff_annotated':
+        rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'info', text: `Anotação de revisão em ${String(data.file ?? '?')}${data.hunk ? ` (${String(data.hunk)})` : ''} por ${label(data.source)}` });
+        break;
       case 'message_queued':
         rows.push({ kind: 'message', key, gseq, ts: event.ts, author: label(data.source), source: String(data.source ?? ''), text: String(data.textPreview ?? ''), truncated: false, totalChars: 0, state: queueState.get(String(data.messageId)) ?? 'queued' });
         break;
