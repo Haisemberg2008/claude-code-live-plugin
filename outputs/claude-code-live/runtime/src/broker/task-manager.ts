@@ -1,0 +1,1652 @@
+// Authoritative task state.
+//
+// Invariants this module is responsible for:
+//   * one durable event log per Codex task, appended and broadcast in a single
+//     global order so a replay cursor can never skip or reorder;
+//   * one worker process per active task, reserved atomically together with
+//     the checkout writer lock before any awaited preparation;
+//   * uncertainty survives a broker restart until an explicit review;
+//   * process identity is proven before anything is terminated, and the writer
+//     lock stays quarantined while a descendant of a finished run survives;
+//   * per-job authentication policy is assessed on every launch.
+import { spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { promises as fs, realpathSync } from 'node:fs';
+import path from 'node:path';
+import { ContractError, resolveJobContract, AUTHORIZED_MODELS, type JobContract } from '../contract/job-contract.ts';
+import { deriveCompatibilityFiles } from '../events/derive.ts';
+import { EventLog } from '../events/event-log.ts';
+import { boundedPreview, previewPage } from '../events/preview.ts';
+import { redactSensitiveText } from '../events/redaction.ts';
+import { probeCli } from '../preflight/cli-probe.ts';
+import { resolvePreflight, type PreflightResult, type ProbeResult, type ResolvedExecutable } from '../preflight/cli-resolver.ts';
+import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
+import { inventoryCustomizations, type Inventory } from '../trust/inventory.ts';
+import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
+import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
+import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
+import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
+import { isHarness, envName } from '../shared/env.ts';
+import type { ActionSource, AuthorizedModel, EventRecord, PendingRequestView, QueueEntryView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import { sha256, mintTaskHandle, verifyTaskHandle, taskIdForThread, THREAD_ID_PATTERN } from './identity.ts';
+import { HttpError } from './http.ts';
+import { findClaudeLauncher, nodeExecArgv, engineInfo, workerEntry } from './runtime-paths.ts';
+import { QuotaService } from './quota-service.ts';
+import { isAlive, reconcileRunProcesses, readWorkerIdentity, survivorCheck, terminateTree, verifyWorkerLiveness, waitForExit } from './process-tree.ts';
+
+export interface TaskRecord {
+  taskId: string;
+  threadId: string;
+  createdAt: string;
+  handleHash: string | null;
+  handleRotatedAt: string | null;
+  workspace: string | null;
+  /** Survives restarts; cleared only by an explicit scoped acknowledgement. */
+  requiresReview: boolean;
+  reviewReason: string | null;
+}
+
+interface QueueEntry extends QueueEntryView {
+  text: string;
+}
+
+interface RunState {
+  runId: string;
+  runToken: string;
+  status: RunStatus;
+  startedAt: string;
+  endedAt: string | null;
+  contract: JobContract;
+  prompt: string;
+  sessionConfirmed: boolean;
+  requestedModel: string;
+  modelReason: string;
+  observedModel: string | null;
+  effortObservedByCli: string | null;
+  sessionId: string | null;
+  workerPid: number | null;
+  workerStartedAt: string | null;
+  failureStage: string | null;
+  failureCode: string | null;
+  telemetryFailures: number;
+  turns: number;
+  resumeMode: 'new' | 'automatic' | 'explicit';
+  simulated: boolean;
+  writerLockKey: string | null;
+  finalized: boolean;
+  finalizing: boolean;
+  initialPromptDelivered: boolean;
+  /** True once current-run.json records this run; no prompt is released before. */
+  ownershipRecorded: boolean;
+  claudeAuthored: Set<string>;
+  /** Harness-only fault injection; never populated by a production broker. */
+  harnessFinalizationFailure: string | null;
+}
+
+interface CurrentRunFile {
+  runId: string;
+  runToken: string;
+  status: RunStatus;
+  workerPid: number | null;
+  workerStartedAt: string | null;
+  startedAt: string;
+  workspace: string;
+  writerLockKey: string | null;
+  runDir: string;
+}
+
+interface LockRecord {
+  workspaceKey: string;
+  workspace: string;
+  holderTaskId: string;
+  holderRunId: string;
+  holderPid: number | null;
+  acquiredAt: string;
+  /** A finished run whose descendants could not be reconciled keeps the lock. */
+  quarantined: boolean;
+  /** In-memory only: keeps concurrent releases/starts behind the same owner. */
+  releaseInProgress?: boolean;
+  quarantineNote?: string;
+}
+
+export interface TaskState {
+  record: TaskRecord;
+  dir: string;
+  log: EventLog;
+  run: RunState | null;
+  worker: ChildProcess | null;
+  workerReady: boolean;
+  /** Reserved model switch awaiting worker confirmation; blocks the next turn. */
+  modelTransition: { model: string; settle: (outcome: { ok: boolean; activeModel: string | null; code: string | null }) => void } | null;
+  phase: WorkerPhase;
+  currentTool: string | null;
+  lastActivityAt: number;
+  coordinatorLastSeenAt: number | null;
+  queue: QueueEntry[];
+  pending: Map<string, PendingRequestView>;
+  resolvedRequests: Set<string>;
+  alertsRaised: Set<string>;
+  uncertain: boolean;
+  disconnected: boolean;
+  previousSessionId: string | null;
+  quota: ReturnType<QuotaService['view']> | null;
+  writer: StateWriter | null;
+  derivedDirty: boolean;
+  lastTelemetryEventAt: number;
+  changedFilesCache: { at: number; observed: string[] } | null;
+  endTimer: NodeJS.Timeout | null;
+  updatedAt: string;
+  chain: Promise<unknown>;
+}
+
+export interface TaskManagerOptions {
+  stateRoot: string;
+  log: (line: string) => void;
+  onEvent: (event: EventRecord) => void;
+  onTaskChanged: (view: TaskView) => void;
+  onTransient: (frame: TransientFrame) => void;
+  supervision?: SupervisionThresholds;
+  harness: boolean;
+  quotaWaitMs?: number;
+  /** Harness-only scheduling seam used to prove recovery cancellation. */
+  recoveryCheckpoint?: () => Promise<void>;
+}
+
+const WORKER_END_GRACE_MS = 15000;
+/** How long a model switch may stay reserved before it is reported unconfirmed. */
+const MODEL_CHANGE_TIMEOUT_MS = isHarness() ? 1000 : 30000;
+/** How long shutdown waits for in-flight preparations before reporting them. */
+const PREPARATION_DRAIN_MS = 20000;
+
+export class TaskManager {
+  readonly stateRoot: string;
+  readonly tasks = new Map<string, TaskState>();
+  readonly trustStore: TrustStore;
+  readonly quota: QuotaService;
+  readonly locks = new Map<string, LockRecord>();
+  private readonly options: TaskManagerOptions;
+  private globalSeq = 0;
+  private appendChain: Promise<unknown> = Promise.resolve();
+  private supervisionTimer: NodeJS.Timeout | null = null;
+  private derivedTimer: NodeJS.Timeout | null = null;
+  private launcherPath: string | null = null;
+  private probeCache: ProbeResult | null = null;
+  private stopping = false;
+  /** Preparations in flight; shutdown awaits them before sweeping workers. */
+  private readonly preparations = new Set<Promise<void>>();
+
+  /** True once shutdown began: no further run may be admitted. */
+  get isStopping(): boolean {
+    return this.stopping;
+  }
+
+  constructor(options: TaskManagerOptions) {
+    this.options = options;
+    this.stateRoot = options.stateRoot;
+    this.trustStore = new TrustStore(options.stateRoot);
+    this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 30000 });
+  }
+
+  get thresholds(): SupervisionThresholds {
+    return this.options.supervision ?? SUPERVISION;
+  }
+
+  private tasksDir(): string {
+    return path.join(this.stateRoot, 'tasks');
+  }
+
+  private locksDir(): string {
+    return path.join(this.stateRoot, 'locks');
+  }
+
+  async start(): Promise<void> {
+    await fs.mkdir(this.tasksDir(), { recursive: true });
+    this.assertOperational();
+    await fs.mkdir(this.locksDir(), { recursive: true });
+    this.assertOperational();
+    this.launcherPath = await findClaudeLauncher();
+    this.assertOperational();
+    await this.recover();
+    this.assertOperational();
+    this.supervisionTimer = setInterval(() => this.superviseAll(), 1000);
+    this.supervisionTimer.unref();
+    this.derivedTimer = setInterval(() => void this.flushDerived(), 1000);
+    this.derivedTimer.unref();
+  }
+
+  /**
+   * Stops workers without pretending their runs finished: in-flight runs stay
+   * RUNNING on disk so the next broker start reconciles them as uncertain and
+   * requires review before anything is resumed or replayed.
+   */
+  /**
+   * Stops accepting new work and settles everything already in flight.
+   *
+   * The order matters. `stopping` is set first so no further run is admitted,
+   * then the preparations already running are awaited: each one is about to
+   * spawn a worker, and sweeping workers before they finish would leave a
+   * process created after the sweep, owning a checkout nobody is watching.
+   * Only then are workers terminated and the logs closed.
+   */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.supervisionTimer) clearInterval(this.supervisionTimer);
+    if (this.derivedTimer) clearInterval(this.derivedTimer);
+    await this.settlePreparations();
+    for (const task of this.tasks.values()) {
+      if (task.run && !task.run.finalized) {
+        await this.append(task, task.run.runId, 'broker_stopping', { note: 'O broker está encerrando com trabalho em andamento; a execução será revisada como incerta no próximo início.' }).catch(() => undefined);
+      }
+      if (task.worker?.pid) await terminateTree(task.worker.pid);
+      await task.log.close();
+    }
+  }
+
+  /** Awaits every in-flight preparation, bounded so a hung stage cannot wedge shutdown. */
+  private async settlePreparations(): Promise<void> {
+    const deadline = Date.now() + PREPARATION_DRAIN_MS;
+    while (this.preparations.size > 0 && Date.now() < deadline) {
+      await Promise.race([
+        Promise.allSettled([...this.preparations]),
+        new Promise<void>((resolve) => { const timer = setTimeout(resolve, 250); timer.unref(); }),
+      ]);
+    }
+    if (this.preparations.size > 0) {
+      this.options.log(`broker encerrando com ${this.preparations.size} preparação(ões) ainda ativa(s); os workers criados serão reconciliados no próximo início.`);
+    }
+  }
+
+  // ---------------------------------------------------------------- recovery
+
+  private assertOperational(): void {
+    if (this.stopping) throw new Error('BROKER_STOPPED_DURING_RECOVERY');
+  }
+
+  private async recover(): Promise<void> {
+    this.assertOperational();
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(this.tasksDir());
+      this.assertOperational();
+    } catch {
+      entries = [];
+    }
+    // First pass: open every task and establish the global high-water mark
+    // BEFORE any recovery event is appended, so a new sequence can never
+    // collide with one already present in another task's log.
+    const opened: TaskState[] = [];
+    for (const taskId of entries) {
+      this.assertOperational();
+      const dir = path.join(this.tasksDir(), taskId);
+      const record = await readJsonShared<TaskRecord>(path.join(dir, 'task.json'));
+      this.assertOperational();
+      if (record.status !== 'ok') continue;
+      opened.push(await this.openTask(normalizeRecord(record.value), dir));
+      this.assertOperational();
+    }
+    for (const task of opened) {
+      this.assertOperational();
+      const tail = await task.log.readPage(Math.max(0, task.log.lastSeq - 1), 5);
+      this.assertOperational();
+      for (const event of tail.events) if ((event.gseq ?? 0) > this.globalSeq) this.globalSeq = event.gseq ?? 0;
+    }
+    if (this.options.harness && this.options.recoveryCheckpoint) {
+      await this.options.recoveryCheckpoint();
+      this.assertOperational();
+    }
+    // Second pass: reconcile in-flight work.
+    for (const task of opened) {
+      this.assertOperational();
+      const current = await readJsonShared<CurrentRunFile>(path.join(task.dir, 'current-run.json'));
+      this.assertOperational();
+      if (current.status !== 'ok') continue;
+      if (current.value.status !== 'RUNNING' && current.value.status !== 'STARTING') continue;
+      const runDir = current.value.runDir || path.join(task.dir, 'runs', current.value.runId);
+      const identity = readWorkerIdentity(runDir);
+      const verdict = await verifyWorkerLiveness(runDir, identity);
+      this.assertOperational();
+      // The engine is ALWAYS reconciled, whatever happened to the worker: a
+      // worker that vanished says nothing about the CLI it started, and an
+      // absent worker must never be read as "the run is finished". The worker
+      // PID is only offered for termination when it is provably still ours.
+      const ownWorker = verdict === 'alive' && identity && identity.token === current.value.runToken;
+      const reconciliation = await reconcileRunProcesses(runDir, ownWorker ? identity.pid : null, true);
+      this.assertOperational();
+      const terminated = reconciliation.clean;
+      let quarantineNote: string | null = reconciliation.clean ? null : reconciliation.note;
+      if (verdict === 'unknown') {
+        quarantineNote = `A identidade do worker anterior não pôde ser comprovada; nenhum processo foi encerrado por suposição. ${reconciliation.note}`;
+      }
+      task.uncertain = true;
+      task.record.requiresReview = true;
+      task.record.reviewReason = 'A execução anterior ficou incerta após reinício do broker.';
+      await this.persistRecord(task);
+      this.assertOperational();
+      for (const entry of task.queue) if (entry.state === 'queued') entry.state = 'requires_review';
+      await this.persistQueue(task);
+      this.assertOperational();
+      await this.append(task, current.value.runId, 'broker_recovered', {
+        uncertainRuns: 1,
+        previousWorkerPid: identity?.pid ?? current.value.workerPid,
+        workerLiveness: verdict,
+        terminated,
+        reconciledTargets: reconciliation.targets.map((target) => ({ name: target.name, outcome: target.outcome, identity: target.identity })),
+        quarantineNote,
+        note: 'O broker reiniciou com trabalho em andamento; revise antes de retomar. Mensagens na fila não são reenviadas automaticamente.',
+      });
+      this.assertOperational();
+      if (current.value.writerLockKey && quarantineNote) {
+        const lock: LockRecord = {
+          workspaceKey: current.value.writerLockKey,
+          workspace: current.value.workspace,
+          holderTaskId: task.record.taskId,
+          holderRunId: current.value.runId,
+          holderPid: identity?.pid ?? null,
+          acquiredAt: current.value.startedAt,
+          quarantined: true,
+          quarantineNote,
+        };
+        this.locks.set(lock.workspaceKey, lock);
+        await writeFileAtomic(path.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
+        this.assertOperational();
+      }
+      await this.writeCurrentRunBestEffort(task, { ...current.value, status: 'UNCERTAIN', workerPid: null });
+      this.assertOperational();
+      await this.writeDerivedNow(task, current.value.runId, false);
+      this.assertOperational();
+    }
+    // Locks whose holder is gone and not quarantined are released.
+    let lockFiles: string[] = [];
+    try {
+      lockFiles = await fs.readdir(this.locksDir());
+      this.assertOperational();
+    } catch {
+      lockFiles = [];
+    }
+    for (const file of lockFiles) {
+      this.assertOperational();
+      const key = file.replace(/\.json$/, '');
+      if (this.locks.has(key)) continue;
+      const read = await readJsonShared<LockRecord>(path.join(this.locksDir(), file));
+      this.assertOperational();
+      if (read.status !== 'ok') {
+        await fs.rm(path.join(this.locksDir(), file), { force: true });
+        this.assertOperational();
+        continue;
+      }
+      if (read.value.quarantined) {
+        this.locks.set(key, read.value);
+        continue;
+      }
+      await fs.rm(path.join(this.locksDir(), file), { force: true });
+      this.assertOperational();
+    }
+  }
+
+  private async openTask(record: TaskRecord, dir: string): Promise<TaskState> {
+    const existing = this.tasks.get(record.taskId);
+    if (existing) return existing;
+    const log = await EventLog.open(path.join(dir, 'events.jsonl'));
+    const queue = await this.loadQueue(dir);
+    const pointer = await readJsonShared<{ sessionId?: string }>(path.join(dir, 'session.json'));
+    const task: TaskState = {
+      record,
+      dir,
+      log,
+      run: null,
+      worker: null,
+      workerReady: false,
+      modelTransition: null,
+      phase: 'terminal',
+      currentTool: null,
+      lastActivityAt: Date.now(),
+      coordinatorLastSeenAt: null,
+      queue,
+      pending: new Map(),
+      resolvedRequests: new Set(),
+      alertsRaised: new Set(),
+      uncertain: record.requiresReview,
+      disconnected: false,
+      previousSessionId: pointer.status === 'ok' && typeof pointer.value.sessionId === 'string' ? pointer.value.sessionId : null,
+      quota: null,
+      writer: null,
+      derivedDirty: false,
+      lastTelemetryEventAt: 0,
+      changedFilesCache: null,
+      endTimer: null,
+      updatedAt: new Date().toISOString(),
+      chain: Promise.resolve(),
+    };
+    this.tasks.set(record.taskId, task);
+    return task;
+  }
+
+  private async persistRecord(task: TaskState): Promise<void> {
+    await writeFileAtomic(path.join(task.dir, 'task.json'), JSON.stringify(task.record, null, 2));
+  }
+
+  // ------------------------------------------------------------- registration
+
+  async register(threadId: string, source: string): Promise<{ taskId: string; taskHandle: string; created: boolean; requiresReview: boolean }> {
+    if (typeof threadId !== 'string' || !THREAD_ID_PATTERN.test(threadId)) throw new HttpError(400, 'THREAD_ID_INVALID');
+    const taskId = taskIdForThread(threadId);
+    const dir = path.join(this.tasksDir(), taskId);
+    await fs.mkdir(dir, { recursive: true });
+    const existing = this.tasks.get(taskId) ?? null;
+    const { handle, hash } = mintTaskHandle();
+    const record: TaskRecord = existing
+      ? { ...existing.record, handleHash: hash, handleRotatedAt: new Date().toISOString() }
+      : { taskId, threadId, createdAt: new Date().toISOString(), handleHash: hash, handleRotatedAt: new Date().toISOString(), workspace: null, requiresReview: false, reviewReason: null };
+    const task = await this.openTask(record, dir);
+    task.record = record;
+    await this.persistRecord(task);
+    await this.append(task, task.run?.runId ?? 'none', 'task_registered', { source, rotated: Boolean(existing) });
+    this.options.log(`task ${taskId} registered (${source})`);
+    this.changed(task);
+    return { taskId, taskHandle: handle, created: !existing, requiresReview: record.requiresReview };
+  }
+
+  resolveHandle(handle: unknown): TaskState {
+    if (typeof handle !== 'string' || !handle) throw new HttpError(403, 'TASK_HANDLE_REQUIRED');
+    for (const task of this.tasks.values()) if (verifyTaskHandle(handle, task.record.handleHash)) return task;
+    throw new HttpError(403, 'TASK_HANDLE_INVALID');
+  }
+
+  getTask(taskId: string): TaskState {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new HttpError(404, 'TASK_NOT_FOUND');
+    return task;
+  }
+
+  touchCoordinator(task: TaskState): void {
+    task.coordinatorLastSeenAt = Date.now();
+    this.changed(task);
+  }
+
+  /**
+   * Confirms that the ARTIFACTS of an uncertain run were reviewed.
+   *
+   * This never releases ownership of a checkout. A quarantined writer lock
+   * means a process of that run may still be alive, and reviewing a diff says
+   * nothing about that; releasing it is a separate, explicit decision that
+   * re-checks for survivors first (see `releaseQuarantinedLock`).
+   */
+  async acknowledgeReview(task: TaskState, note: string | null, source: ActionSource): Promise<void> {
+    if (!task.record.requiresReview && !task.uncertain) return;
+    task.record.requiresReview = false;
+    task.record.reviewReason = null;
+    task.uncertain = false;
+    task.disconnected = false;
+    await this.persistRecord(task);
+    const quarantined = [...this.locks.values()].filter((lock) => lock.quarantined && lock.holderTaskId === task.record.taskId);
+    await this.append(task, task.run?.runId ?? 'none', 'review_acknowledged', {
+      source,
+      note: note ? redactSensitiveText(note).slice(0, 500) : null,
+      quarantinedLocks: quarantined.map((lock) => lock.workspaceKey),
+      ownershipReleased: false,
+      ...(quarantined.length ? { ownershipNote: 'A revisão de artefatos não libera a posse do checkout; use a liberação explícita da trava em quarentena.' } : {}),
+    });
+    this.changed(task);
+  }
+
+  /**
+   * Explicit, administrative release of a quarantined checkout lock.
+   *
+   * Refuses while any recorded process of the holding run is running or cannot
+   * be proven gone: a writer is never restored while a survivor is possible.
+   * The decision and its reason are recorded in the task log.
+   */
+  async releaseQuarantinedLock(workspaceKey: string, request: { note: string | null; confirmHistoricalRisk: boolean; expectedTaskId: string | null; expectedRunId: string | null }, source: ActionSource): Promise<{ released: boolean; workspaceKey: string; livePids: number[]; note: string; historicalAncestryConclusive: boolean }> {
+    const lock = this.locks.get(workspaceKey);
+    if (!lock) throw new HttpError(404, 'LOCK_NOT_FOUND');
+    if (!lock.quarantined) throw new HttpError(409, 'LOCK_NOT_QUARANTINED', { note: 'Uma trava ativa pertence a uma execução em andamento; encerre a execução.' });
+    if (lock.releaseInProgress) throw new HttpError(409, 'LOCK_RELEASE_IN_PROGRESS');
+    if (!request.note?.trim() || !request.confirmHistoricalRisk || request.expectedTaskId !== lock.holderTaskId || request.expectedRunId !== lock.holderRunId) {
+      throw new HttpError(409, 'LOCK_RELEASE_CONFIRMATION_REQUIRED', {
+        holderTaskId: lock.holderTaskId,
+        holderRunId: lock.holderRunId,
+        note: 'A liberação excepcional exige nota, reconhecimento explícito do risco histórico e a identidade exata da posse atual.',
+      });
+    }
+    // Reserve synchronously before the first await. JavaScript can interleave a
+    // second request at any await boundary; that request must see the reservation
+    // before survivor inspection or durable audit begins.
+    lock.releaseInProgress = true;
+    const task = this.tasks.get(lock.holderTaskId) ?? null;
+    let check: { releasable: boolean; livePids: number[]; note: string } = { releasable: false, livePids: [], note: 'Auditoria ainda não executada.' };
+    const historicalAncestryConclusive = false;
+    try {
+      // Deterministic harness scheduling window: proves another HTTP request
+      // observes releaseInProgress while the first audit is still in flight.
+      if (this.options.harness) await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      const runDir = task ? path.join(task.dir, 'runs', lock.holderRunId) : null;
+      check = runDir ? await survivorCheck(runDir, lock.holderPid) : { releasable: false, livePids: [], note: 'A execução que detém a trava não pôde ser localizada no estado; a posse não é liberada às cegas.' };
+      if (!check.releasable) {
+        if (task) await this.append(task, lock.holderRunId, 'lock_release_refused', { workspaceKey, source, livePids: check.livePids, note: check.note });
+        throw new HttpError(409, 'LOCK_SURVIVOR_POSSIBLE', { livePids: check.livePids, note: check.note });
+      }
+      if (task) {
+        // Durable authorization comes first. If it cannot be audited, the
+        // checkout stays quarantined and the operation fails closed.
+        await this.append(task, lock.holderRunId, 'lock_release_authorized', {
+          workspaceKey,
+          source,
+          note: redactSensitiveText(request.note!).slice(0, 500),
+          evidence: check.note,
+          historicalAncestryConclusive,
+          riskAcknowledged: true,
+          visibleProcesses: check.livePids,
+          ownership: { taskId: lock.holderTaskId, runId: lock.holderRunId },
+        });
+      }
+      // Re-read immediately before deletion so a stale request can never
+      // release a lock replaced while the audit was being persisted.
+      const persisted = await readJsonShared<LockRecord>(path.join(this.locksDir(), `${workspaceKey}.json`));
+      const current = this.locks.get(workspaceKey);
+      if (current !== lock || persisted.status !== 'ok' || persisted.value.holderTaskId !== lock.holderTaskId || persisted.value.holderRunId !== lock.holderRunId || !persisted.value.quarantined) {
+        throw new HttpError(409, 'LOCK_OWNERSHIP_CHANGED', { note: 'A posse mudou durante a auditoria; nada foi liberado.' });
+      }
+      await fs.rm(path.join(this.locksDir(), `${workspaceKey}.json`));
+      this.locks.delete(workspaceKey);
+      if (task) await this.append(task, lock.holderRunId, 'lock_released', {
+        workspaceKey,
+        source,
+        ownership: { taskId: lock.holderTaskId, runId: lock.holderRunId },
+      });
+      if (task) this.changed(task);
+    } catch (error) {
+      if (this.locks.get(workspaceKey) === lock) lock.releaseInProgress = false;
+      throw error;
+    }
+    return { released: true, workspaceKey, livePids: [], note: check.note, historicalAncestryConclusive };
+  }
+
+  // --------------------------------------------------------------- events
+
+  /**
+   * Appends to the task log and broadcasts, globally serialized: the sequence
+   * number, the durable write and the broadcast happen in one order for every
+   * task, so no subscriber can observe a later sequence before an earlier one.
+   */
+  append(task: TaskState, runId: string, type: string, data: Record<string, unknown>, toolUseId?: string): Promise<EventRecord> {
+    const run = async (): Promise<EventRecord> => {
+      this.globalSeq += 1;
+      const gseq = this.globalSeq;
+      const record = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...(toolUseId ? { toolUseId } : {}), data, gseq });
+      task.lastActivityAt = Date.now();
+      task.derivedDirty = true;
+      task.updatedAt = record.ts;
+      this.options.onEvent(record);
+      return record;
+    };
+    const next = this.appendChain.then(run, run);
+    this.appendChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private changed(task: TaskState): void {
+    task.updatedAt = new Date().toISOString();
+    this.options.onTaskChanged(this.view(task));
+  }
+
+  // ---------------------------------------------------------------- queue
+
+  private async loadQueue(dir: string): Promise<QueueEntry[]> {
+    const file = path.join(dir, 'queue.jsonl');
+    let text: string;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch {
+      return [];
+    }
+    const entries = new Map<string, QueueEntry>();
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line) as QueueEntry;
+        entries.set(parsed.messageId, { ...(entries.get(parsed.messageId) ?? parsed), ...parsed });
+      } catch {
+        // skip
+      }
+    }
+    return [...entries.values()];
+  }
+
+  private async persistQueue(task: TaskState): Promise<void> {
+    const lines = task.queue.map((entry) => JSON.stringify(entry)).join('\n');
+    await writeFileAtomic(path.join(task.dir, 'queue.jsonl'), lines ? `${lines}\n` : '');
+  }
+
+  private queueView(entry: QueueEntry): QueueEntryView {
+    return { messageId: entry.messageId, source: entry.source, textPreview: entry.textPreview, receivedAt: entry.receivedAt, deliveredAt: entry.deliveredAt, state: entry.state };
+  }
+
+  /**
+   * Accepts guidance for the next turn. A 202 means the message is durably
+   * queued: it survives a not-yet-ready worker and is flushed in order.
+   */
+  async enqueueMessage(task: TaskState, text: string, source: ActionSource): Promise<QueueEntryView> {
+    if (!task.run || task.run.finalized || task.run.finalizing || !task.worker) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    if (task.uncertain) throw new HttpError(409, 'REQUIRES_REVIEW', { message: 'A execução está incerta; confirme a revisão antes de enviar novas orientações.' });
+    const redacted = redactSensitiveText(text);
+    const entry: QueueEntry = { messageId: `msg-${randomUUID()}`, source, text: redacted, textPreview: boundedPreview(redacted, 300).preview, receivedAt: new Date().toISOString(), deliveredAt: null, state: 'queued' };
+    task.queue.push(entry);
+    await this.persistQueue(task);
+    await this.append(task, task.run.runId, 'message_queued', { messageId: entry.messageId, source, textPreview: entry.textPreview });
+    if (source !== 'browser') this.touchCoordinator(task);
+    await this.deliverNext(task);
+    this.changed(task);
+    return this.queueView(entry);
+  }
+
+  private async deliverNext(task: TaskState): Promise<void> {
+    const run = task.run;
+    if (!run || !task.worker || !task.workerReady || task.uncertain || run.finalized || run.finalizing) return;
+    if (task.phase !== 'idle') return;
+    // A model switch is in flight: the next turn waits for a known model.
+    if (task.modelTransition) return;
+    const next = task.queue.find((entry) => entry.state === 'queued');
+    if (!next) return;
+    next.state = 'delivered';
+    next.deliveredAt = new Date().toISOString();
+    task.phase = 'busy_model';
+    await this.persistQueue(task);
+    this.sendToWorker(task, { t: 'deliver', messageId: next.messageId, text: next.text, source: next.source });
+    await this.append(task, run.runId, 'message_delivered', { messageId: next.messageId, source: next.source });
+  }
+
+  // -------------------------------------------------------------- requests
+
+  async answer(task: TaskState, body: { requestId: unknown; runId: unknown; decision: unknown; message?: unknown; answers?: unknown }, source: ActionSource): Promise<void> {
+    const requestId = String(body.requestId ?? '');
+    if (task.resolvedRequests.has(requestId)) throw new HttpError(409, 'REQUEST_ALREADY_RESOLVED');
+    const pending = task.pending.get(requestId);
+    if (!pending) throw new HttpError(404, 'REQUEST_NOT_FOUND');
+    if (body.runId !== pending.runId) throw new HttpError(409, 'REQUEST_WRONG_RUN');
+    const decision = body.decision === 'allow' || body.decision === 'deny' || body.decision === 'answer' ? body.decision : null;
+    if (!decision) throw new HttpError(400, 'DECISION_INVALID');
+    const answers = body.answers && typeof body.answers === 'object' ? (body.answers as Record<string, string | string[]>) : undefined;
+    task.pending.delete(requestId);
+    task.resolvedRequests.add(requestId);
+    this.sendToWorker(task, { t: 'answer', requestId, decision, ...(typeof body.message === 'string' ? { message: body.message.slice(0, 2000) } : {}), ...(answers ? { answers } : {}), source });
+    if (source !== 'browser') this.touchCoordinator(task);
+    this.changed(task);
+  }
+
+  // ------------------------------------------------------------- lifecycle
+
+  private sendToWorker(task: TaskState, message: BrokerToWorker): void {
+    try {
+      task.worker?.send(message);
+    } catch (error) {
+      this.options.log(`task ${task.record.taskId}: envio ao worker falhou (${(error as Error).name})`);
+    }
+  }
+
+  async interrupt(task: TaskState, source: ActionSource): Promise<void> {
+    if (!task.run || !task.worker || task.run.finalized) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    this.sendToWorker(task, { t: 'interrupt', source });
+    if (source !== 'browser') this.touchCoordinator(task);
+  }
+
+  async end(task: TaskState, source: ActionSource): Promise<void> {
+    if (!task.run || !task.worker || task.run.finalized) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    this.sendToWorker(task, { t: 'end', source });
+    if (source !== 'browser') this.touchCoordinator(task);
+    const run = task.run;
+    task.endTimer = setTimeout(() => {
+      if (task.run === run && !run.finalized) void this.finalize(task, run, 'CANCELLED', 'END_TIMEOUT', 'O worker não encerrou no prazo; a árvore de processos foi terminada.', 1, null);
+    }, WORKER_END_GRACE_MS);
+    task.endTimer.unref();
+  }
+
+  /**
+   * Switches the model between turns.
+   *
+   * The transition is reserved before the request leaves and released only
+   * after the worker confirms, so a queued message cannot start a turn on an
+   * indeterminate model. Until the CLI confirms, the recorded model is still
+   * the old one; a refusal reports the model that stayed active.
+   */
+  async setModel(task: TaskState, model: unknown, reason: unknown, source: ActionSource): Promise<{ applied: 'next_turn'; strategy: 'in_session'; model: AuthorizedModel }> {
+    if (typeof model !== 'string' || !AUTHORIZED_MODELS.includes(model as AuthorizedModel)) throw new HttpError(400, 'MODEL_NOT_AUTHORIZED');
+    if (typeof reason !== 'string' || !reason.trim()) throw new HttpError(400, 'MODEL_REASON_REQUIRED');
+    if (!task.run || !task.worker || task.run.finalized) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    // Every refusal states which model stayed in force, so a caller never has
+    // to assume whether its request took effect.
+    if (task.phase !== 'idle') throw new HttpError(409, 'TURN_IN_PROGRESS', { activeModel: task.run.requestedModel });
+    if (task.modelTransition) throw new HttpError(409, 'MODEL_CHANGE_IN_PROGRESS', { activeModel: task.run.requestedModel, pendingModel: task.modelTransition.model });
+    const run = task.run;
+    let uncertain = false;
+    let settle: (outcome: { ok: boolean; activeModel: string | null; code: string | null }) => void = () => undefined;
+    const confirmed = new Promise<{ ok: boolean; activeModel: string | null; code: string | null }>((resolve) => { settle = resolve; });
+    // A timeout is NOT a refusal: the CLI may have applied the switch and only
+    // lost or delayed its confirmation. `activeModel` is deliberately null.
+    const timer = setTimeout(() => settle({ ok: false, activeModel: null, code: 'MODEL_CHANGE_TIMEOUT' }), MODEL_CHANGE_TIMEOUT_MS);
+    timer.unref();
+    task.modelTransition = { model, settle };
+    this.changed(task);
+    try {
+      this.sendToWorker(task, { t: 'set_model', model, reason: reason.trim(), source });
+      const outcome = await confirmed;
+      if (outcome.code === 'MODEL_CHANGE_TIMEOUT') {
+        // Nobody knows which model is loaded now. Asserting the old one and
+        // resuming would run the next turn on an unknown model, so the run
+        // becomes uncertain and no further turn is released until an explicit
+        // review restarts it.
+        uncertain = true;
+        task.uncertain = true;
+        task.record.requiresReview = true;
+        task.record.reviewReason = 'A troca de modelo não foi confirmada pelo CLI; o modelo em vigor é desconhecido.';
+        await this.persistRecord(task);
+        await this.append(task, run.runId, 'model_change_uncertain', {
+          requestedModel: model,
+          previousModel: run.requestedModel,
+          source,
+          note: 'O CLI não confirmou a troca no prazo. Ele pode tê-la aplicado. O modelo em vigor não é afirmado e nenhum turno novo é liberado até revisão explícita.',
+        });
+        throw new HttpError(409, 'MODEL_CHANGE_UNCERTAIN', {
+          activeModel: null,
+          requestedModel: model,
+          note: 'A troca não foi confirmada; o modelo em vigor é desconhecido e a execução exige revisão antes de continuar.',
+        });
+      }
+      if (!outcome.ok) {
+        throw new HttpError(409, outcome.code ?? 'MODEL_CHANGE_REFUSED', { activeModel: outcome.activeModel, note: 'O modelo em vigor não mudou.' });
+      }
+      run.requestedModel = model;
+      run.modelReason = reason.trim();
+      if (source !== 'browser') this.touchCoordinator(task);
+      return { applied: 'next_turn', strategy: 'in_session', model: model as AuthorizedModel };
+    } finally {
+      clearTimeout(timer);
+      task.modelTransition = null;
+      this.changed(task);
+      // A queued message starts its turn now — unless the model in force is
+      // unknown, in which case nothing may run.
+      if (!uncertain) await this.deliverNext(task);
+    }
+  }
+
+  async inventoryFor(workspace: string): Promise<{ inventory: Inventory; trust: TrustCheck }> {
+    const inventory = await inventoryCustomizations(workspace, this.options.harness ? { userConfigDir: null, userClaudeJsonPath: null, managedSettingsPaths: null, ancestorBoundary: workspace } : {});
+    const trust = await this.trustStore.check(inventory);
+    return { inventory, trust };
+  }
+
+  async approveTrust(task: TaskState, workspace: string, approvalRevision: number, approvedItems: string[] | 'all', note: string | undefined, source: ActionSource): Promise<TrustCheck> {
+    const { inventory } = await this.inventoryFor(workspace);
+    await this.trustStore.approve({ inventory, identity: { threadId: task.record.threadId, source: source === 'mcp' ? 'mcp' : source === 'browser' ? 'browser' : 'local-secret' }, approvalRevision, approvedItems, ...(note ? { approvedRevisionNote: note } : {}) });
+    const trust = await this.trustStore.check(inventory);
+    await this.append(task, task.run?.runId ?? 'none', 'trust_approved', { workspace: inventory.canonicalWorkspace, approvalRevision, items: approvedItems === 'all' ? inventory.items.length : approvedItems.length, trusted: trust.trusted, source });
+    return trust;
+  }
+
+  /**
+   * Reserves the task slot and the checkout writer lock synchronously, before
+   * any awaited preparation, so two concurrent starts can never both proceed.
+   */
+  async startRun(task: TaskState, job: unknown, harness: Record<string, unknown> | null, source: ActionSource, acknowledgeReview: boolean): Promise<{ runId: string; status: 'STARTING' }> {
+    let contract: JobContract;
+    try {
+      contract = resolveJobContract(job);
+    } catch (error) {
+      if (error instanceof ContractError) throw new HttpError(400, 'CONTRACT_INVALID', { code: error.code, message: error.message });
+      throw error;
+    }
+    if (contract.version !== 2) throw new HttpError(409, 'LEGACY_CONTRACT_USE_LEGACY_RUNNER', { message: 'Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2.' });
+    // Admission stops the moment shutdown begins, before any reservation.
+    if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker está encerrando; nenhuma execução nova é aceita.' });
+    if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
+      throw new HttpError(409, 'REQUIRES_REVIEW', { message: 'A última execução ficou incerta ou desconectada; confirme a revisão (acknowledgeReview: true) antes de iniciar outra.', reason: task.record.reviewReason });
+    }
+    let workspace: string;
+    let canonicalWorkspace: string;
+    try {
+      workspace = realpathSync.native(contract.workspace);
+      canonicalWorkspace = workspace.replace(/\\/g, '/').replace(/\/+$/, '');
+      if (process.platform === 'win32') canonicalWorkspace = canonicalWorkspace.toLowerCase();
+    } catch {
+      throw new HttpError(400, 'WORKSPACE_NOT_FOUND');
+    }
+    const workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+
+    // --- synchronous critical section: no await until the reservation exists.
+    if (task.run && !task.run.finalized) throw new HttpError(409, 'RUN_IN_PROGRESS', { runId: task.run.runId });
+    const holder = this.locks.get(workspaceKey);
+    if (contract.capabilities.edit && holder && holder.holderTaskId !== task.record.taskId) {
+      throw new HttpError(409, holder.quarantined ? 'WORKSPACE_LOCK_QUARANTINED' : 'WORKSPACE_WRITER_LOCKED', { holderTaskId: holder.holderTaskId, holderRunId: holder.holderRunId, acquiredAt: holder.acquiredAt, ...(holder.quarantined ? { note: holder.quarantineNote } : {}) });
+    }
+    // A quarantined lock means a process of the previous run may still be able
+    // to write here. Acknowledging the artefact review does NOT clear that:
+    // ownership is released only by the explicit action that first re-checks
+    // for survivors.
+    if (holder?.quarantined && holder.holderTaskId === task.record.taskId) {
+      throw new HttpError(409, 'WORKSPACE_LOCK_QUARANTINED', {
+        holderRunId: holder.holderRunId,
+        note: holder.quarantineNote,
+        remediation: 'Libere explicitamente a trava em quarentena depois de confirmar que nenhum processo da execução anterior sobreviveu; a revisão de artefatos não libera a posse.',
+      });
+    }
+    const runId = `run-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+    const runToken = randomUUID();
+    const runDir = path.join(task.dir, 'runs', runId);
+    const run: RunState = {
+      runId,
+      runToken,
+      status: 'STARTING',
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      contract,
+      prompt: '',
+      sessionConfirmed: false,
+      requestedModel: contract.model.resolved ?? contract.model.requested,
+      modelReason: contract.model.reason,
+      observedModel: null,
+      effortObservedByCli: null,
+      sessionId: task.previousSessionId,
+      workerPid: null,
+      workerStartedAt: null,
+      failureStage: null,
+      failureCode: null,
+      telemetryFailures: 0,
+      turns: 0,
+      resumeMode: task.previousSessionId ? 'automatic' : 'new',
+      simulated: false,
+      writerLockKey: contract.capabilities.edit ? workspaceKey : null,
+      finalized: false,
+      finalizing: false,
+      initialPromptDelivered: false,
+      ownershipRecorded: false,
+      claudeAuthored: new Set(),
+      harnessFinalizationFailure: this.options.harness && typeof harness?.finalizationFailure === 'string' ? harness.finalizationFailure : null,
+    };
+    task.run = run;
+    if (contract.capabilities.edit) {
+      this.locks.set(workspaceKey, { workspaceKey, workspace: canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run.startedAt, quarantined: false });
+    }
+    task.uncertain = false;
+    task.disconnected = false;
+    task.phase = 'starting';
+    task.currentTool = null;
+    task.alertsRaised.clear();
+    task.pending.clear();
+    task.workerReady = false;
+    task.record.workspace = workspace;
+    // --- end of critical section.
+
+    try {
+      await fs.mkdir(runDir, { recursive: true });
+      run.prompt = contract.prompt ?? (contract.promptFile ? await fs.readFile(contract.promptFile, 'utf8') : '');
+      if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante a preparação; nenhum worker será criado.' });
+      const { inventory, trust } = await this.inventoryFor(workspace);
+      if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante a preparação; nenhum worker será criado.' });
+      if (!trust.trusted) {
+        throw new HttpError(409, 'WORKSPACE_NOT_TRUSTED', { reason: trust.reason, pending: trust.pending, changed: trust.changed, fingerprint: inventory.fingerprint, incomplete: inventory.incomplete });
+      }
+      const record = await this.trustStore.load(inventory.canonicalWorkspace);
+      const launch = resolveLaunchCustomizations({ inventory, trust, record });
+      task.writer = new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15000, onTelemetryFailure: (failure) => { run.telemetryFailures += 1; void this.reportTelemetryFailure(task, run, failure.file, failure.code); } });
+      await this.persistRecord(task);
+      if (run.writerLockKey) {
+        const lock = this.locks.get(run.writerLockKey)!;
+        await writeFileAtomic(path.join(this.locksDir(), `${run.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+      }
+      // Ownership must be recorded before anything else happens; a failure here
+      // aborts the launch and releases the reservation.
+      try {
+        await this.writeCurrentRun(task, { runId, runToken, status: 'STARTING', workerPid: null, workerStartedAt: null, startedAt: run.startedAt, workspace, writerLockKey: run.writerLockKey, runDir });
+      } catch (error) {
+        throw new HttpError(503, 'OWNERSHIP_RECORD_FAILED', {
+          code: (error as { code?: string }).code ?? 'WRITE_FAILED',
+          message: 'O estado autoritativo da execução não pôde ser gravado; nenhum trabalho é iniciado sem esse registro.',
+        });
+      }
+      await this.append(task, runId, 'run_started', {
+        startedAt: run.startedAt,
+        requestedModel: run.requestedModel,
+        modelReason: run.modelReason,
+        effort: contract.effort,
+        workspace,
+        profile: contract.profile,
+        contractVersion: contract.version,
+        coordination: contract.coordination,
+        scope: contract.scope,
+        capabilities: contract.capabilities,
+        resumeMode: run.resumeMode,
+        resumeSessionId: run.sessionId,
+        source,
+        trust: { reason: trust.reason, approvalRevision: trust.trusted ? trust.approvalRevision : null, items: inventory.items.length, managedSettingsPresent: inventory.managedSettings.present },
+      });
+      if (source !== 'browser') this.touchCoordinator(task);
+      this.changed(task);
+      const approvedAgents = inventory.items.filter((item) => item.kind === 'agent').map((item) => path.basename(item.relativePath, '.md'));
+      const approvedSkills = inventory.items.filter((item) => item.kind === 'skill').map((item) => path.basename(path.dirname(item.relativePath)));
+      // Tracked so shutdown can await it: a preparation that finishes after the
+      // worker sweep would leave a process nobody is watching.
+      const preparation = this.prepareAndSpawn(task, run, launch, approvedAgents, approvedSkills, harness).catch((error) => {
+        this.options.log(`task ${task.record.taskId}: preparação falhou inesperadamente (${(error as Error).name})`);
+        void this.finalize(task, run, 'FAIL', 'PREPARATION_CRASH', redactSensitiveText(String((error as Error).message ?? error)).slice(0, 300), 1, 'preparation');
+      }).finally(() => this.preparations.delete(preparation));
+      this.preparations.add(preparation);
+      return { runId, status: 'STARTING' };
+    } catch (error) {
+      // Every failure path releases the reservation it took.
+      await this.releaseReservation(task, run);
+      throw error;
+    }
+  }
+
+  private async releaseReservation(task: TaskState, run: RunState): Promise<void> {
+    if (run.writerLockKey) {
+      const lock = this.locks.get(run.writerLockKey);
+      if (lock && lock.holderRunId === run.runId && !lock.quarantined) {
+        this.locks.delete(run.writerLockKey);
+        await fs.rm(path.join(this.locksDir(), `${run.writerLockKey}.json`), { force: true });
+      }
+      run.writerLockKey = null;
+    }
+    run.finalized = true;
+    if (task.run === run) {
+      task.run = null;
+      task.phase = 'terminal';
+    }
+  }
+
+  private async prepareAndSpawn(task: TaskState, run: RunState, launch: ReturnType<typeof resolveLaunchCustomizations>, approvedAgents: string[], approvedSkills: string[], harness: Record<string, unknown> | null): Promise<void> {
+    const preparationDelayMs = typeof harness?.preparationDelayMs === 'number' ? Math.max(0, Math.min(5000, harness.preparationDelayMs)) : 0;
+    if (preparationDelayMs) await new Promise<void>((resolve) => setTimeout(resolve, preparationDelayMs));
+    if (this.stopping || task.run !== run || run.finalized) return;
+    const failPreparation = typeof harness?.failPreparation === 'string' ? harness.failPreparation : null;
+    const stage = async (name: string, fn: () => Promise<void>): Promise<boolean> => {
+      if (failPreparation === name) {
+        await this.append(task, run.runId, 'preparation_failed', { stage: name, code: 'HARNESS_SIMULATED_FAILURE', message: `Falha simulada pelo harness na etapa ${name}.` });
+        await this.finalize(task, run, 'FAIL', 'HARNESS_SIMULATED_FAILURE', `Falha simulada na etapa ${name}.`, 1, name);
+        return false;
+      }
+      try {
+        await fn();
+        return true;
+      } catch (error) {
+        const code = (error as { code?: string }).code ?? 'PREPARATION_FAILED';
+        const failedStage = (error as { stage?: string }).stage ?? name;
+        const message = redactSensitiveText(String((error as Error).message ?? error)).slice(0, 300);
+        await this.append(task, run.runId, 'preparation_failed', { stage: failedStage, code, message });
+        await this.finalize(task, run, 'FAIL', code, message, 1, failedStage);
+        return false;
+      }
+    };
+    let executable: Extract<ResolvedExecutable, { status: 'resolved' }> | null = null;
+    let cliVersion: string | null = null;
+    const preflightOk = await stage('cli-resolution', async () => {
+      if (!this.launcherPath) throw Object.assign(new Error('Claude Code CLI não encontrado no PATH; nenhum CLI empacotado é usado como substituto.'), { code: 'CLI_NOT_FOUND' });
+      if (failPreparation === 'cli-probe') throw Object.assign(new Error('Falha simulada pelo harness na sondagem do CLI.'), { code: 'CLI_PROBE_FAILED', stage: 'cli-probe' });
+      // Only immutable CLI capability evidence is cached; the authentication
+      // policy is reassessed for every job against the real spawn environment.
+      const preflight: PreflightResult = await resolvePreflight({
+        launcherPath: this.launcherPath,
+        requestedModel: run.requestedModel as AuthorizedModel,
+        runtimeVersion: engineInfo().runtimeVersion,
+        allowApiBilling: run.contract.auth.allowApiBilling,
+        env: process.env,
+        probe: async (resolved) => {
+          if (!this.probeCache) this.probeCache = await probeCli(resolved);
+          return this.probeCache;
+        },
+      });
+      if (preflight.status !== 'ready') throw Object.assign(new Error(preflight.message), { code: preflight.code, stage: preflight.failureStage });
+      executable = preflight.executable;
+      cliVersion = preflight.observed.cliVersion;
+      await this.append(task, run.runId, 'preflight_ready', {
+        cliVersion,
+        executableKind: preflight.executable.kind,
+        compatibility: preflight.diagnosis.status,
+        modelSupport: preflight.diagnosis.modelSupport,
+        notes: preflight.diagnosis.notes,
+        auth: preflight.auth.code,
+        authEvidence: preflight.auth.evidence,
+        vendorCliUsed: false,
+      });
+    });
+    if (!preflightOk) return;
+    if (this.stopping || task.run !== run || run.finalized) return;
+    const observation = await this.quota.observe(executable);
+    if (this.stopping || task.run !== run || run.finalized) return;
+    task.quota = this.quota.view(run.requestedModel as AuthorizedModel, observation);
+    await this.append(task, run.runId, 'quota_observed', { attemptedAt: observation.attemptedAt, observedAt: observation.observedAt, snapshot: task.quota.snapshot, recommendation: task.quota.recommendation, alternate: task.quota.alternate, failure: observation.failure });
+    const spawned = await stage('worker-spawn', async () => {
+      const descriptor: WorkerDescriptor = {
+        taskId: task.record.taskId,
+        runId: run.runId,
+        threadId: task.record.threadId,
+        stateRoot: this.stateRoot,
+        taskDir: task.dir,
+        runDir: path.join(task.dir, 'runs', run.runId),
+        contract: run.contract,
+        prompt: run.prompt,
+        resumeSessionId: run.sessionId,
+        resumeMode: run.resumeMode,
+        launch,
+        approvedMcpTools: {},
+        approvedAgents,
+        approvedSkills,
+        executable: { path: executable!.executablePath, runWith: executable!.runWith, cliVersion },
+        harness: harness
+          ? {
+              ...(typeof harness.adapterPath === 'string' ? { adapterPath: harness.adapterPath } : {}),
+              ...(failPreparation ? { failPreparation } : {}),
+              ...(typeof harness.effortCap === 'string' ? { effortCap: harness.effortCap } : {}),
+              ...(Array.isArray(harness.modelCatalog) ? { modelCatalog: harness.modelCatalog as string[] } : {}),
+              ...(harness.hooksApplied === false ? { hooksApplied: false } : {}),
+              ...(typeof harness.setModelDelayMs === 'number' ? { setModelDelayMs: harness.setModelDelayMs } : {}),
+            }
+          : null,
+      };
+      const descriptorFile = path.join(descriptor.runDir, 'worker-descriptor.json');
+      await writeFileAtomic(descriptorFile, JSON.stringify(descriptor, null, 2));
+      if (this.stopping || task.run !== run || run.finalized) return;
+      const child = spawn(process.execPath, [...nodeExecArgv(), workerEntry(), '--descriptor', descriptorFile], {
+        cwd: run.contract.workspace,
+        env: { ...process.env, [envName('TASK_ID')]: task.record.taskId, [envName('RUN_ID')]: run.runId, [envName('RUN_TOKEN')]: run.runToken },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        serialization: 'json',
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+      });
+      task.worker = child;
+      run.workerPid = child.pid ?? null;
+      run.workerStartedAt = new Date().toISOString();
+      const lock = run.writerLockKey ? this.locks.get(run.writerLockKey) : null;
+      if (lock) {
+        lock.holderPid = run.workerPid;
+        await writeFileAtomic(path.join(this.locksDir(), `${run.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+      }
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', (chunk: string) => this.options.log(`worker ${run.workerPid} stderr: ${redactSensitiveText(chunk).trim().slice(0, 500)}`));
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', () => undefined);
+      child.on('message', (message: WorkerToBroker) => this.enqueueTaskWork(task, () => this.onWorkerMessage(task, run, message)));
+      child.on('exit', (code, signal) => this.enqueueTaskWork(task, () => this.onWorkerExit(task, run, code, signal)));
+      // Ownership is recorded BEFORE any prompt is released. If this throws,
+      // the stage fails the launch and the spawned tree is reconciled, so work
+      // never starts against a state a restarted broker could not recover.
+      await this.writeCurrentRun(task, { runId: run.runId, runToken: run.runToken, status: 'RUNNING', workerPid: run.workerPid, workerStartedAt: run.workerStartedAt, startedAt: run.startedAt, workspace: run.contract.workspace, writerLockKey: run.writerLockKey, runDir: descriptor.runDir });
+      run.ownershipRecorded = true;
+      await this.append(task, run.runId, 'worker_spawned', { workerPid: run.workerPid });
+    });
+    if (!spawned) return;
+    if (this.stopping || task.run !== run || run.finalized) return;
+    await this.releaseInitialPrompt(task, run);
+    this.changed(task);
+  }
+
+  /**
+   * Hands the job prompt to the worker exactly once, and only after BOTH the
+   * worker announced itself and the authoritative ownership record was written.
+   * Whichever happens last triggers it, so no work is ever released against a
+   * state a restarted broker could not recognise.
+   */
+  private async releaseInitialPrompt(task: TaskState, run: RunState): Promise<void> {
+    if (this.stopping || task.run !== run || run.finalized || run.initialPromptDelivered) return;
+    if (!task.workerReady || !run.ownershipRecorded) return;
+    run.initialPromptDelivered = true;
+    task.phase = 'busy_model';
+    this.sendToWorker(task, { t: 'deliver', messageId: `msg-initial-${run.runId}`, text: run.prompt, source: 'system' });
+    await this.append(task, run.runId, 'message_delivered', { messageId: `msg-initial-${run.runId}`, source: 'system', initial: true });
+  }
+
+  /** Serializes per-task transitions so stale callbacks cannot race a new run. */
+  private enqueueTaskWork(task: TaskState, work: () => Promise<void>): void {
+    const next = task.chain.then(work, work);
+    task.chain = next.catch(() => undefined);
+  }
+
+  private async onWorkerMessage(task: TaskState, run: RunState, message: WorkerToBroker): Promise<void> {
+    if (task.run !== run || run.finalized) return;
+    switch (message.t) {
+      case 'ready': {
+        task.workerReady = true;
+        run.simulated = message.simulated;
+        run.status = 'RUNNING';
+        await this.releaseInitialPrompt(task, run);
+        this.changed(task);
+        break;
+      }
+      case 'event': {
+        await this.append(task, run.runId, message.type, message.data, message.toolUseId);
+        this.applyEvent(task, run, message.type, message.data, message.toolUseId);
+        if (message.type === 'permission_requested' || message.type === 'question_asked') this.changed(task);
+        break;
+      }
+      case 'phase': {
+        // The broker owns the terminal transition so locks and derived files
+        // are settled before anyone observes "terminal".
+        if (message.phase === 'terminal') break;
+        task.phase = message.phase;
+        task.currentTool = message.currentTool;
+        task.lastActivityAt = Date.now();
+        this.changed(task);
+        break;
+      }
+      case 'transient':
+        this.options.onTransient(message.frame);
+        break;
+      case 'request':
+        task.pending.set(message.request.requestId, message.request);
+        this.changed(task);
+        break;
+      case 'blob':
+        await fs.mkdir(path.join(task.dir, 'blobs'), { recursive: true });
+        await writeFileAtomic(path.join(task.dir, 'blobs', `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
+        break;
+      case 'model_result': {
+        task.modelTransition?.settle({ ok: message.ok, activeModel: message.activeModel, code: message.code });
+        break;
+      }
+      case 'model_uncertain': {
+        // The worker could not establish which model the CLI is running.
+        task.uncertain = true;
+        task.record.requiresReview = true;
+        task.record.reviewReason = 'O worker não confirmou qual modelo está em vigor no CLI.';
+        await this.persistRecord(task);
+        this.changed(task);
+        break;
+      }
+      case 'turn_done': {
+        run.turns += 1;
+        task.phase = 'idle';
+        task.currentTool = null;
+        await this.observeBetweenTurns(task, run);
+        await this.deliverNext(task);
+        this.changed(task);
+        break;
+      }
+      case 'preparation_failed': {
+        await this.append(task, run.runId, 'preparation_failed', { stage: message.stage, code: message.code, message: message.message });
+        await this.finalize(task, run, 'FAIL', message.code, message.message, 1, message.stage);
+        break;
+      }
+      case 'run_ended':
+        await this.finalize(task, run, message.status, message.code, message.message, message.exitCode, null);
+        break;
+      default:
+        break;
+    }
+  }
+
+  private applyEvent(task: TaskState, run: RunState, type: string, data: Record<string, unknown>, toolUseId?: string): void {
+    switch (type) {
+      case 'session_init':
+        if (typeof data.sessionId === 'string') {
+          run.sessionId = data.sessionId;
+          run.sessionConfirmed = true;
+        }
+        if (typeof data.observedModel === 'string') run.observedModel = data.observedModel;
+        if (typeof data.effortObservedByCli === 'string') run.effortObservedByCli = data.effortObservedByCli;
+        break;
+      case 'assistant_text':
+        if (typeof data.model === 'string') run.observedModel = data.model;
+        break;
+      case 'tool_start':
+        if (toolUseId && typeof data.name === 'string' && ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(data.name) && typeof data.inputPreview === 'string') {
+          const match = /"(?:file_path|notebook_path)":"((?:[^"\\]|\\.)*)"/.exec(data.inputPreview);
+          if (match) run.claudeAuthored.add(match[1]!.replace(/\\\\/g, '\\'));
+        }
+        break;
+      case 'turn_completed':
+      case 'turn_interrupted':
+      case 'turn_failed':
+        if (typeof data.model === 'string') run.observedModel = data.model;
+        break;
+      case 'model_changed':
+        if (typeof data.to === 'string') run.requestedModel = data.to;
+        if (typeof data.reason === 'string') run.modelReason = data.reason;
+        break;
+      case 'permission_resolved':
+      case 'question_answered':
+        if (typeof data.requestId === 'string') {
+          task.pending.delete(data.requestId);
+          task.resolvedRequests.add(data.requestId);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  private async observeBetweenTurns(task: TaskState, run: RunState): Promise<void> {
+    const last = this.quota.lastObservation;
+    const stale = !last || Date.now() - Date.parse(last.attemptedAt) > 5 * 60_000;
+    if (!stale) {
+      task.quota = this.quota.view(run.requestedModel as AuthorizedModel);
+      return;
+    }
+    const executable = await this.resolveExecutableForQuota();
+    const observation = await this.quota.observe(executable);
+    task.quota = this.quota.view(run.requestedModel as AuthorizedModel, observation);
+    if (task.run === run && !run.finalized) {
+      await this.append(task, run.runId, 'quota_observed', { attemptedAt: observation.attemptedAt, observedAt: observation.observedAt, snapshot: task.quota.snapshot, recommendation: task.quota.recommendation, alternate: task.quota.alternate, failure: observation.failure, betweenTurns: true });
+    }
+  }
+
+  private async resolveExecutableForQuota(): Promise<Extract<ResolvedExecutable, { status: 'resolved' }> | null> {
+    if (!this.launcherPath) return null;
+    const { resolveClaudeExecutable } = await import('../preflight/cli-resolver.ts');
+    const resolved = await resolveClaudeExecutable({ launcherPath: this.launcherPath });
+    return resolved.status === 'resolved' ? resolved : null;
+  }
+
+  private async onWorkerExit(task: TaskState, run: RunState, code: number | null, signal: NodeJS.Signals | null): Promise<void> {
+    if (task.run !== run || run.finalized || run.finalizing || this.stopping) return;
+    // The worker vanished without a terminal message. The whole public view
+    // moves to uncertain in one synchronous step: reconciliation below can take
+    // seconds, and during that window the task must never be readable as
+    // "disconnected" while its run still claims to be RUNNING.
+    task.disconnected = true;
+    task.record.requiresReview = true;
+    task.record.reviewReason = 'O worker desapareceu sem resultado; a execução ficou incerta.';
+    task.worker = null;
+    run.status = 'UNCERTAIN';
+    run.endedAt = new Date().toISOString();
+    task.phase = 'terminal';
+    for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
+    task.pending.clear();
+    this.changed(task);
+    const runDir = path.join(task.dir, 'runs', run.runId);
+    const reconciliation = await reconcileRunProcesses(runDir, run.workerPid, true);
+    await this.append(task, run.runId, 'worker_disconnected', {
+      workerPid: run.workerPid,
+      exitCode: code,
+      signal,
+      reconciledBy: 'process-identity',
+      descendantsClean: reconciliation.clean,
+      survivingPids: reconciliation.survivingPids,
+      note: reconciliation.note,
+    });
+    await this.persistRecord(task);
+    await this.settleLock(task, run, reconciliation.clean, reconciliation.note);
+    await this.writeCurrentRunBestEffort(task, { runId: run.runId, runToken: run.runToken, status: 'UNCERTAIN', workerPid: null, workerStartedAt: run.workerStartedAt, startedAt: run.startedAt, workspace: run.contract.workspace, writerLockKey: null, runDir });
+    await this.writeDerivedNow(task, run.runId, true);
+    run.finalized = true;
+    this.changed(task);
+  }
+
+  /**
+   * Settles a run. The terminal state is published only after the worker tree
+   * is reconciled, the writer lock released or quarantined, and the session
+   * pointer and derived files written.
+   */
+  private async finalize(task: TaskState, run: RunState, status: 'COMPLETED' | 'FAIL' | 'CANCELLED', code: string | null, message: string | null, exitCode: number, failureStage: string | null): Promise<void> {
+    if (task.run !== run || run.finalized || run.finalizing) return;
+    run.finalizing = true;
+    const endedAt = new Date().toISOString();
+    run.failureCode = code;
+    run.failureStage = failureStage;
+    if (task.endTimer) clearTimeout(task.endTimer);
+    task.endTimer = null;
+    task.currentTool = null;
+    for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
+    task.pending.clear();
+    const runDir = path.join(task.dir, 'runs', run.runId);
+    try {
+      if (task.worker?.pid) {
+        const pid = task.worker.pid;
+        try { task.worker.send({ t: 'exit' } satisfies BrokerToWorker); } catch { /* ignore */ }
+        await waitForExit(pid, 500);
+      }
+      const reconciliation = await reconcileRunProcesses(runDir, run.workerPid, exitCode !== 0);
+      task.worker = null;
+      task.workerReady = false;
+      await this.settleLock(task, run, reconciliation.clean, reconciliation.note);
+      if (!reconciliation.clean) {
+        task.record.requiresReview = true;
+        task.record.reviewReason = reconciliation.note;
+        await this.persistRecord(task);
+        await this.append(task, run.runId, 'descendants_not_reconciled', { survivingPids: reconciliation.survivingPids, note: reconciliation.note });
+      }
+      if (run.sessionId && run.sessionConfirmed) {
+        task.previousSessionId = run.sessionId;
+        await writeFileAtomic(path.join(task.dir, 'session.json'), JSON.stringify({ sessionId: run.sessionId, runId: run.runId, updatedAt: endedAt, resultFile: path.join(runDir, 'resultado.json') }, null, 2));
+      }
+      await this.writeCurrentRunBestEffort(task, { runId: run.runId, runToken: run.runToken, status, workerPid: null, workerStartedAt: run.workerStartedAt, startedAt: run.startedAt, workspace: run.contract.workspace, writerLockKey: null, runDir });
+      // Produce compatibility artefacts from a private terminal projection.
+      // Only after all cleanup and durable state succeeded is run_ended appended
+      // and broadcast to public readers.
+      await this.writeDerivedNow(task, run.runId, true, { status, code, message, exitCode, endedAt, failureStage });
+      if (run.harnessFinalizationFailure === 'before-public-event') throw Object.assign(new Error('Falha simulada antes do evento terminal público.'), { code: 'HARNESS_FINALIZATION_FAILURE' });
+      await this.append(task, run.runId, 'run_ended', { status, code, message, exitCode, endedAt, failureStage });
+      run.status = status;
+      run.endedAt = endedAt;
+      run.finalized = true;
+      task.phase = 'terminal';
+      this.changed(task);
+      this.options.log(`task ${task.record.taskId} run ${run.runId} ended ${status}${code ? ` (${code})` : ''}`);
+    } catch (error) {
+      const detail = redactSensitiveText(String((error as Error).message ?? error)).slice(0, 300);
+      task.record.requiresReview = true;
+      task.record.reviewReason = `A finalização falhou e exige revisão: ${detail}`;
+      await this.persistRecord(task).catch(() => undefined);
+      try {
+        if (task.worker?.pid) await terminateTree(task.worker.pid);
+        const reconciliation = await reconcileRunProcesses(runDir, run.workerPid, true);
+        await this.settleLock(task, run, false, `A finalização falhou; ${reconciliation.note}`);
+      } catch { /* quarantine remains on disk/in memory */ }
+      task.worker = null;
+      task.workerReady = false;
+      run.status = 'UNCERTAIN';
+      run.endedAt = new Date().toISOString();
+      run.finalized = true;
+      task.uncertain = true;
+      task.phase = 'terminal';
+      await this.append(task, run.runId, 'finalization_failed', { code: (error as { code?: string }).code ?? 'FINALIZATION_FAILED', message: detail }).catch(() => undefined);
+      await this.writeCurrentRunBestEffort(task, { runId: run.runId, runToken: run.runToken, status: 'UNCERTAIN', workerPid: null, workerStartedAt: run.workerStartedAt, startedAt: run.startedAt, workspace: run.contract.workspace, writerLockKey: run.writerLockKey, runDir });
+      // Replace any private terminal projection that may already have been
+      // written before the failing public append. Without run_ended in the log,
+      // derivation records this run as uncertain.
+      await this.writeDerivedNow(task, run.runId, true, {
+        status: 'UNCERTAIN',
+        code: (error as { code?: string }).code ?? 'FINALIZATION_FAILED',
+        message: detail,
+        exitCode: 1,
+        endedAt: run.endedAt,
+        failureStage: 'finalization',
+      }).catch(() => undefined);
+      this.changed(task);
+      this.options.log(`task ${task.record.taskId} run ${run.runId}: finalização falhou (${detail})`);
+    }
+    run.finalizing = false;
+  }
+
+  private async settleLock(task: TaskState, run: RunState, clean: boolean, note: string): Promise<void> {
+    if (!run.writerLockKey) return;
+    const key = run.writerLockKey;
+    const holder = this.locks.get(key);
+    if (!holder || holder.holderRunId !== run.runId) {
+      run.writerLockKey = null;
+      return;
+    }
+    if (clean) {
+      this.locks.delete(key);
+      await fs.rm(path.join(this.locksDir(), `${key}.json`), { force: true });
+    } else {
+      holder.quarantined = true;
+      holder.quarantineNote = note;
+      await writeFileAtomic(path.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+    }
+    run.writerLockKey = null;
+  }
+
+  /**
+   * Writes the authoritative ownership record of the task.
+   *
+   * This file is not observability: it is what a restarted broker reads to
+   * learn that a run was in flight, which PID owned it and which checkout it
+   * held. If it cannot be written, a crash would leave the run invisible and
+   * the checkout apparently free, so the caller must fail the launch rather
+   * than release work against an unrecorded state.
+   */
+  private async writeCurrentRun(task: TaskState, value: CurrentRunFile): Promise<void> {
+    await writeFileAtomic(path.join(task.dir, 'current-run.json'), JSON.stringify(value, null, 2), { maxWaitMs: 3000 });
+  }
+
+  /** Same record, on paths that are already finishing and cannot abort. */
+  private async writeCurrentRunBestEffort(task: TaskState, value: CurrentRunFile): Promise<void> {
+    try {
+      await this.writeCurrentRun(task, value);
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'ERRO';
+      this.options.log(`task ${task.record.taskId}: current-run.json não gravado (${code})`);
+      await this.append(task, value.runId, 'ownership_record_failed', {
+        file: 'current-run.json',
+        code,
+        note: 'O estado autoritativo desta execução não pôde ser gravado; após um reinício do broker ela pode não ser reconhecida. Revise antes de retomar.',
+      }).catch(() => undefined);
+      task.record.requiresReview = true;
+      task.record.reviewReason = 'O registro autoritativo da execução falhou; o estado no disco pode estar incompleto.';
+      await this.persistRecord(task).catch(() => undefined);
+    }
+  }
+
+  // --------------------------------------------------------- derived files
+
+  private async reportTelemetryFailure(task: TaskState, run: RunState, file: string, code: string): Promise<void> {
+    const now = Date.now();
+    if (now - task.lastTelemetryEventAt < 10_000) return;
+    task.lastTelemetryEventAt = now;
+    await this.append(task, run.runId, 'telemetry_write_failed', { file, code, note: 'Falha de observabilidade; a execução continua.' });
+  }
+
+  private async flushDerived(): Promise<void> {
+    for (const task of this.tasks.values()) {
+      if (!task.derivedDirty || !task.run || !task.writer) continue;
+      task.derivedDirty = false;
+      await this.writeDerivedNow(task, task.run.runId, false);
+    }
+  }
+
+  private async writeDerivedNow(task: TaskState, runId: string, final: boolean, terminal?: { status: 'COMPLETED' | 'FAIL' | 'CANCELLED' | 'UNCERTAIN'; code: string | null; message: string | null; exitCode: number; endedAt: string; failureStage: string | null }): Promise<void> {
+    const runDir = path.join(task.dir, 'runs', runId);
+    const writer = task.writer && task.writer.directory === runDir
+      ? task.writer
+      : new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15000, onTelemetryFailure: (failure) => { if (task.run) { task.run.telemetryFailures += 1; void this.reportTelemetryFailure(task, task.run, failure.file, failure.code); } } });
+    const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
+    if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: 'run_ended', taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
+    const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
+    const status = { ...derived.status, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
+    await writer.writeStatus(status);
+    try {
+      await writeFileAtomic(path.join(runDir, 'acompanhamento.txt'), derived.acompanhamento, { maxWaitMs: 1500 });
+    } catch {
+      // acompanhamento is telemetry as well
+    }
+    if (final) {
+      try {
+        const outcome = await writer.writeFinalResult({ ...derived.result, telemetryFailures: status.telemetryFailures });
+        if (outcome.fallback) await this.append(task, runId, 'final_result_fallback', { path: outcome.path });
+      } catch (error) {
+        await this.append(task, runId, 'final_result_not_persisted', { code: (error as { code?: string }).code ?? 'FINAL_RESULT_NOT_PERSISTED', message: redactSensitiveText((error as Error).message).slice(0, 300) }).catch(() => undefined);
+        this.options.log(`task ${task.record.taskId}: resultado final NÃO persistido (${(error as { code?: string }).code ?? 'erro'})`);
+        throw error;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ supervision
+
+  private superviseAll(): void {
+    for (const task of this.tasks.values()) {
+      const run = task.run;
+      if (!run || run.finalized) continue;
+      const evaluation = evaluateSupervision({
+        now: Date.now(),
+        runStartedAt: Date.parse(run.startedAt),
+        lastActivityAt: task.lastActivityAt,
+        phase: task.phase,
+        processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)),
+        coordinatorLastSeenAt: task.coordinatorLastSeenAt,
+        pendingRequests: task.pending.size,
+        brokerRestartedDuringRun: task.uncertain,
+        terminal: run.finalized,
+        thresholds: this.thresholds,
+      });
+      for (const alert of evaluation.alerts) {
+        if (task.alertsRaised.has(alert)) continue;
+        task.alertsRaised.add(alert);
+        void this.append(task, run.runId, 'alert', { alert, action: 'none', note: 'Alerta de supervisão; nenhum encerramento automático.' }).then(() => this.changed(task));
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ views
+
+  async changedFiles(task: TaskState): Promise<{ observed: string[]; claudeAuthored: string[]; observedAt: string | null }> {
+    const workspace = task.record.workspace;
+    if (!workspace) return { observed: [], claudeAuthored: [], observedAt: null };
+    const cached = task.changedFilesCache;
+    let observed: string[] = cached?.observed ?? [];
+    if (!cached || Date.now() - cached.at > 5000) {
+      observed = await gitStatus(workspace);
+      task.changedFilesCache = { at: Date.now(), observed };
+    }
+    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path.relative(workspace, file).replace(/\\/g, '/')) : [];
+    return { observed, claudeAuthored: authored, observedAt: new Date(task.changedFilesCache?.at ?? Date.now()).toISOString() };
+  }
+
+  view(task: TaskState): TaskView {
+    const run = task.run;
+    const now = Date.now();
+    const evaluation = evaluateSupervision({
+      now,
+      runStartedAt: run ? Date.parse(run.startedAt) : now,
+      lastActivityAt: task.lastActivityAt,
+      phase: run && run.finalizing && !run.finalized ? 'busy_model' : task.phase,
+      processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)) || Boolean(run && run.finalizing && !run.finalized),
+      coordinatorLastSeenAt: task.coordinatorLastSeenAt,
+      pendingRequests: task.pending.size,
+      brokerRestartedDuringRun: task.uncertain,
+      terminal: !run || run.finalized,
+      thresholds: this.thresholds,
+    });
+    const state = task.uncertain ? 'uncertain' : task.disconnected ? 'disconnected' : evaluation.state;
+    // Supervision can observe that the worker process is gone before the exit
+    // callback has been processed. The view must stay self-consistent: a run
+    // behind a disconnected or uncertain task is not RUNNING any more, it is
+    // exactly what "uncertain" means. onWorkerExit writes the durable status.
+    const runStatus: RunStatus | null = run
+      ? ((state === 'disconnected' || state === 'uncertain') && (run.status === 'RUNNING' || run.status === 'STARTING') ? 'UNCERTAIN' : run.status)
+      : null;
+    return {
+      taskId: task.record.taskId,
+      threadId: task.record.threadId,
+      workspace: task.record.workspace,
+      state,
+      simulated: run?.simulated ?? this.options.harness,
+      alerts: [...task.alertsRaised],
+      coordinatorPresence: evaluation.coordinatorPresence,
+      coordinatorLastSeenAt: task.coordinatorLastSeenAt ? new Date(task.coordinatorLastSeenAt).toISOString() : null,
+      coordinatorLabel: evaluation.coordinatorLabel,
+      // Supervision can see the worker is gone before the exit callback runs;
+      // its verdict counts immediately so the panel never shows a disconnected
+      // task that claims no review is needed. onWorkerExit persists it.
+      requiresReview: task.record.requiresReview || task.uncertain || task.disconnected || evaluation.requiresReview,
+      currentRun: run ? {
+        runId: run.runId,
+        status: runStatus ?? run.status,
+        sessionId: run.sessionId,
+        requestedModel: run.requestedModel,
+        modelReason: run.modelReason,
+        observedModel: run.observedModel,
+        effortConfigured: run.contract.effort,
+        effortObservedByCli: run.effortObservedByCli,
+        effortConfirmed: null,
+        currentTool: task.currentTool,
+        workerPid: run.workerPid,
+        failureStage: run.failureStage,
+        failureCode: run.failureCode,
+        telemetryFailures: run.telemetryFailures,
+        startedAt: run.startedAt,
+        endedAt: run.endedAt,
+        lastActivityAt: new Date(task.lastActivityAt).toISOString(),
+        elapsedSeconds: Math.max(0, Math.round(((run.endedAt ? Date.parse(run.endedAt) : now) - Date.parse(run.startedAt)) / 1000)),
+        turns: run.turns,
+        profile: run.contract.profile,
+        contractVersion: run.contract.version,
+        resumeMode: run.resumeMode,
+      } : null,
+      previousSessionId: task.previousSessionId,
+      pendingRequests: [...task.pending.values()],
+      queue: task.queue.map((entry) => this.queueView(entry)),
+      quota: task.quota ?? this.quota.view((run?.requestedModel as AuthorizedModel | undefined) ?? 'claude-fable-5-1'),
+      changedFiles: { observed: task.changedFilesCache?.observed ?? [], claudeAuthored: run ? [...run.claudeAuthored] : [], observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null },
+      reviewPending: true,
+      createdAt: task.record.createdAt,
+      updatedAt: task.updatedAt,
+      lastEventSeq: task.log.lastSeq,
+    };
+  }
+
+  views(scope: string | null): TaskView[] {
+    return [...this.tasks.values()].filter((task) => !scope || task.record.taskId === scope).map((task) => this.view(task));
+  }
+
+  async runsOf(task: TaskState): Promise<Array<{ runId: string; status: string; startedAt: string | null; endedAt: string | null }>> {
+    const dir = path.join(task.dir, 'runs');
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return [];
+    }
+    const runs: Array<{ runId: string; status: string; startedAt: string | null; endedAt: string | null }> = [];
+    for (const runId of entries.sort()) {
+      const status = await readJsonShared<{ status?: string; startedAt?: string; endedAt?: string }>(path.join(dir, runId, 'status.json'));
+      runs.push({ runId, status: status.status === 'ok' ? status.value.status ?? 'UNKNOWN' : 'UNKNOWN', startedAt: status.status === 'ok' ? status.value.startedAt ?? null : null, endedAt: status.status === 'ok' ? status.value.endedAt ?? null : null });
+    }
+    return runs;
+  }
+
+  async blobPage(task: TaskState, blobId: string, page: number): Promise<{ page: number; pages: number; text: string; truncated: boolean; totalChars: number } | null> {
+    if (!/^blob-[a-f0-9-]{36}$/.test(blobId)) return null;
+    const read = await readJsonShared<{ text: string; truncated: boolean; totalChars: number }>(path.join(task.dir, 'blobs', `${blobId}.json`));
+    if (read.status !== 'ok') return null;
+    const paged = previewPage(read.value.text, page);
+    return { ...paged, truncated: read.value.truncated, totalChars: read.value.totalChars };
+  }
+
+  /**
+   * Global replay for a reconnecting subscriber. `gapped` is true when older
+   * events could not fit the page, so the client resets rather than assuming
+   * continuity.
+   */
+  async replay(cursor: number, taskId: string | null, scope: string | null, limit = 2000): Promise<{ events: EventRecord[]; gapped: boolean }> {
+    const collected: EventRecord[] = [];
+    let gapped = false;
+    for (const task of this.tasks.values()) {
+      if (taskId && task.record.taskId !== taskId) continue;
+      if (scope && task.record.taskId !== scope) continue;
+      const page = await task.log.readPage(0, limit);
+      // A gap is only real when the events the CLIENT still needs were the ones
+      // dropped. A caught-up subscriber must not be told its history is broken
+      // just because this task has more history than one page holds.
+      const oldestAvailable = page.events[0]?.gseq ?? null;
+      if (page.gapped && (oldestAvailable === null || oldestAvailable > cursor + 1)) gapped = true;
+      for (const event of page.events) if ((event.gseq ?? 0) > cursor) collected.push(event);
+    }
+    collected.sort((a, b) => (a.gseq ?? 0) - (b.gseq ?? 0));
+    if (collected.length > limit) {
+      gapped = true;
+      return { events: collected.slice(collected.length - limit), gapped };
+    }
+    return { events: collected, gapped };
+  }
+}
+
+function normalizeRecord(record: TaskRecord): TaskRecord {
+  return {
+    ...record,
+    requiresReview: record.requiresReview === true,
+    reviewReason: typeof record.reviewReason === 'string' ? record.reviewReason : null,
+  };
+}
+
+async function gitStatus(workspace: string): Promise<string[]> {
+  try {
+    await fs.access(path.join(workspace, '.git'));
+  } catch {
+    return [];
+  }
+  return new Promise((resolve) => {
+    const child = spawn('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    const timer = setTimeout(() => { child.kill(); resolve([]); }, 5000);
+    child.on('error', () => { clearTimeout(timer); resolve([]); });
+    child.on('exit', () => {
+      clearTimeout(timer);
+      resolve(stdout.split('\n').map((line) => line.slice(3).trim()).filter(Boolean).slice(0, 500));
+    });
+  });
+}
+
+export { isHarness };

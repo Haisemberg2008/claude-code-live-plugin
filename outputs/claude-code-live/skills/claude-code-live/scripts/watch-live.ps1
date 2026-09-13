@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$StateDirectory, [Parameter(Mandatory)][stri
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'claude-thread-context.ps1')
 . (Join-Path $PSScriptRoot 'claude-log-reader.ps1')
+. (Join-Path $PSScriptRoot 'claude-live-state.ps1')
 $panelMutex = [Threading.Mutex]::new($false, (Get-ClaudeLiveMutexName -Kind Panel -ThreadKey $PanelKey))
 try { $panelLockHeld = $panelMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $panelLockHeld = $true }
 if (-not $panelLockHeld) { $panelMutex.Dispose(); exit }
@@ -25,15 +26,15 @@ try {
                 if ($key.Key -eq 'X') { break }
                 if ($key.Key -eq 'Q' -and $currentRun) {
                     $stateFile = Join-Path $currentRun 'status.json'
-                    $state = Get-Content -LiteralPath $stateFile -Raw -Encoding utf8 -ErrorAction SilentlyContinue | ConvertFrom-Json
-                    if ($state.status -eq 'RUNNING') {
+                    $state = Read-ClaudeLiveStateJson -Path $stateFile
+                    if ($null -ne $state -and $state.status -eq 'RUNNING') {
                         [IO.File]::WriteAllText((Join-Path $currentRun 'stop.request'), 'Requested from visible panel.')
                         Write-Host "`n[Parada solicitada]" -ForegroundColor Yellow
                     }
                 }
             }
-            if (Test-Path -LiteralPath $pointer) {
-                $active = Get-Content -LiteralPath $pointer -Raw -Encoding utf8 | ConvertFrom-Json
+            $active = Read-ClaudeLiveStateJson -Path $pointer
+            if ($null -ne $active) {
                 if ($active.runDirectory -ne $currentRun) {
                     $currentRun = $active.runDirectory
                     $cursor = New-ClaudeLogCursor
@@ -48,8 +49,8 @@ try {
                     if ($content.Length) { Write-Host -NoNewline $content }
                 }
                 $stateFile = Join-Path $currentRun 'status.json'
-                if (Test-Path -LiteralPath $stateFile) {
-                    $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+                $state = Read-ClaudeLiveStateJson -Path $stateFile
+                if ($null -ne $state) {
                     $elapsed = Get-ClaudeElapsedSeconds -State $state
                     $Host.UI.RawUI.WindowTitle = 'Claude Code | ' + $PanelKey + ' | ' + $state.status + ' | ' + $elapsed + 's'
                 }

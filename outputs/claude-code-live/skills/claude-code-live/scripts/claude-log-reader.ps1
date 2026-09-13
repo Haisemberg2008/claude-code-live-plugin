@@ -13,7 +13,7 @@ function Get-ClaudeElapsedSeconds {
 function Read-ClaudeLogDelta {
     param([hashtable]$Cursor, [string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
     try {
         if ($Cursor.Path -ne $Path -or $stream.Length -lt $Cursor.Offset) {
             $Cursor.Path = $Path

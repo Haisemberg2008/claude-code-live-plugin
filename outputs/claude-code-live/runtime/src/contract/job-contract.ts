@@ -1,0 +1,395 @@
+// Versioned job contract. v2 jobs describe the interactive development
+// profile; v1 (legacy) jobs are represented faithfully for consultation and
+// compatibility (their model, effort and timeout policy are preserved, never
+// silently migrated) and are executed only by the unchanged legacy runner.
+// Every rejection carries a machine-readable code.
+import { RESPONSIBILITY_KEYS, type AuthorizedModel, type Coordination, type EffortLevel, type Owner, type Responsibilities } from '../shared/types.ts';
+
+export const CONTRACT_VERSION = 2;
+export const AUTHORIZED_MODELS: readonly AuthorizedModel[] = ['claude-fable-5-1', 'claude-opus-5'];
+export const REQUIRED_EFFORT = 'xhigh';
+export const EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+// Closed lookup table (Map, not a plain object) so inherited properties such
+// as "constructor" or "__proto__" can never resolve to a model.
+const LEGACY_MODEL_ALIASES = new Map<string, AuthorizedModel>([
+  ['fable', 'claude-fable-5-1'],
+  ['opus', 'claude-opus-5'],
+  ['claude-fable-5-1', 'claude-fable-5-1'],
+  ['claude-opus-5', 'claude-opus-5'],
+]);
+const OWNERS: readonly Owner[] = ['codex', 'claude', 'user', 'not_applicable'];
+const RESERVED_RESPONSIBILITIES: readonly (keyof Responsibilities)[] = ['commit', 'push', 'deploy'];
+const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const LEGACY_RULE_PATTERN = /^Bash\([^*\r\n]+\)$/;
+const LEGACY_CRITICAL_PATTERN = /(\bgit\b[^)\r\n]*\b(commit|push)\b|\bgh\s+pr\s+(create|merge)\b|\b(deploy|publish)\b)/i;
+
+export class ContractError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'ContractError';
+    this.code = code;
+  }
+}
+
+export interface LegacyCommand {
+  rule: string;
+  responsibility: string;
+}
+
+export type LegacyTimeoutPolicy =
+  | { mode: 'fixed'; timeoutSeconds: number }
+  | { mode: 'adaptive'; renewEverySeconds: number; idleAfterSeconds: number; hardStopAfterSeconds: number };
+
+export interface JobContract {
+  version: 1 | 2;
+  profile: 'development' | 'read' | 'restricted' | 'diagnostic';
+  workspace: string;
+  prompt: string | null;
+  promptFile: string | null;
+  /** requested is the exact configured value; resolved is the authorized id or null. */
+  model: { requested: string; resolved: AuthorizedModel | null; reason: string };
+  effort: EffortLevel;
+  coordination: Coordination;
+  scope: { summary: string; paths: string[]; wholeWorkspace: boolean };
+  launch: {
+    permissionMode: 'default' | 'dontAsk';
+    safeMode: boolean;
+    permissionPromptsDisabled: boolean;
+    restricted: boolean;
+    strictMcpConfig: true;
+  };
+  capabilities: { edit: boolean; test: boolean; commands: 'classified' | 'exact-list' | 'none' };
+  limits: { maxTurns: null; maxTokens: null; maxRuntimeSeconds: null };
+  auth: { allowApiBilling: boolean };
+  resumeFrom: string | null;
+  codexThreadId: string | null;
+  legacy: null | {
+    mode: 'chat' | 'read' | 'verify' | 'local';
+    allowedCommands: LegacyCommand[];
+    modelPolicy: null | { mode: 'quota-aware'; primary: 'fable'; alternate: 'opus'; switchAtRemainingPercent: number };
+    timeoutPolicy: LegacyTimeoutPolicy;
+    /** Legacy jobs run only through the unchanged PowerShell executor. */
+    executor: 'legacy-runner';
+  };
+}
+
+type Dict = Record<string, unknown>;
+
+function isDict(value: unknown): value is Dict {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function own(value: Dict, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(value, key) ? value[key] : undefined;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+}
+
+export function resolveCoordination(value: unknown): Coordination {
+  if (!isDict(value)) throw new ContractError('COORDINATION_REQUIRED', 'coordination é obrigatório em todo job.');
+  const phase = stringField(own(value, 'phase'));
+  if (phase !== 'planning' && phase !== 'execution') throw new ContractError('PHASE_INVALID', 'coordination.phase deve ser planning ou execution.');
+  const scopeId = stringField(own(value, 'scopeId'))?.trim() ?? '';
+  if (!scopeId) throw new ContractError('SCOPE_ID_REQUIRED', 'coordination.scopeId é obrigatório.');
+  const revision = own(value, 'approvalRevision');
+  if (!isPositiveInteger(revision)) throw new ContractError('APPROVAL_REVISION_INVALID', 'coordination.approvalRevision deve ser um inteiro positivo.');
+  const approved = own(value, 'planApproved');
+  if (typeof approved !== 'boolean') throw new ContractError('PLAN_APPROVED_INVALID', 'coordination.planApproved deve ser booleano.');
+  const summaryRaw = own(value, 'planSummary');
+  if (summaryRaw !== undefined && typeof summaryRaw !== 'string') throw new ContractError('PLAN_SUMMARY_INVALID', 'coordination.planSummary deve ser texto.');
+  const planSummary = (summaryRaw ?? '').trim();
+  const responsibilities = resolveResponsibilities(own(value, 'responsibilities'));
+  if (phase === 'execution') {
+    if (!approved) throw new ContractError('PLAN_NOT_APPROVED', 'A execução exige plano explicitamente aprovado.');
+    if (!planSummary) throw new ContractError('PLAN_SUMMARY_REQUIRED', 'coordination.planSummary é obrigatório na execução.');
+  }
+  return { phase, scopeId, approvalRevision: revision, planSummary, planApproved: approved, responsibilities };
+}
+
+export function resolveResponsibilities(value: unknown): Responsibilities {
+  if (!isDict(value)) throw new ContractError('RESPONSIBILITY_MISSING', 'coordination.responsibilities é obrigatório com as oito responsabilidades.');
+  for (const key of Object.keys(value)) {
+    if (!(RESPONSIBILITY_KEYS as readonly string[]).includes(key)) {
+      throw new ContractError('RESPONSIBILITY_UNEXPECTED', `coordination.responsibilities contém a etapa inesperada ${key}.`);
+    }
+  }
+  const result = {} as Responsibilities;
+  for (const key of RESPONSIBILITY_KEYS) {
+    const raw = own(value, key);
+    if (typeof raw !== 'string' || !raw.trim()) throw new ContractError('RESPONSIBILITY_MISSING', `coordination.responsibilities.${key} é obrigatório.`);
+    const actor = raw.trim().toLowerCase() as Owner;
+    if (!OWNERS.includes(actor)) throw new ContractError('RESPONSIBILITY_ACTOR_INVALID', `coordination.responsibilities.${key} tem um ator inválido.`);
+    if (RESERVED_RESPONSIBILITIES.includes(key) && actor === 'claude') {
+      throw new ContractError('RESERVED_RESPONSIBILITY', `O Claude não pode ser responsável por ${key}.`);
+    }
+    result[key] = actor;
+  }
+  return result;
+}
+
+function resolveEffortV2(value: unknown): 'xhigh' {
+  if (value === undefined || value === null) return 'xhigh';
+  if (value !== 'xhigh') throw new ContractError('EFFORT_NOT_XHIGH', 'Somente o esforço xhigh (Extra) é autorizado em jobs v2; nenhum downgrade é permitido.');
+  return 'xhigh';
+}
+
+function resolveEffortLegacy(value: unknown): EffortLevel {
+  if (value === undefined || value === null) return 'high';
+  if (typeof value !== 'string' || !EFFORT_LEVELS.includes(value as EffortLevel)) throw new ContractError('EFFORT_INVALID', 'effort legado deve ser low, medium, high, xhigh ou max.');
+  return value as EffortLevel;
+}
+
+function resolveThreadId(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !THREAD_ID_PATTERN.test(value)) throw new ContractError('THREAD_ID_INVALID', 'codexThreadId deve conter apenas letras, números, sublinhado ou hífen, com até 128 caracteres.');
+  return value;
+}
+
+function resolveWorkspace(value: unknown): string {
+  const workspace = stringField(value)?.trim() ?? '';
+  if (!workspace) throw new ContractError('WORKSPACE_REQUIRED', 'workspace é obrigatório.');
+  return workspace;
+}
+
+function normalizeScopePath(raw: string): string {
+  let text = raw.trim().replace(/\\/g, '/');
+  while (text.startsWith('./')) text = text.slice(2);
+  text = text.replace(/\/{2,}/g, '/');
+  return text;
+}
+
+function resolveScope(value: unknown, phase: 'planning' | 'execution'): { summary: string; paths: string[]; wholeWorkspace: boolean } {
+  if (value === undefined || value === null) {
+    if (phase === 'execution') throw new ContractError('SCOPE_REQUIRED', 'scope com summary e paths não vazios (ou wholeWorkspace: true) é obrigatório na execução.');
+    return { summary: '', paths: [], wholeWorkspace: false };
+  }
+  if (!isDict(value)) throw new ContractError('SCOPE_INVALID', 'scope deve ser um objeto com summary, paths e opcionalmente wholeWorkspace.');
+  const summaryRaw = own(value, 'summary');
+  if (summaryRaw !== undefined && typeof summaryRaw !== 'string') throw new ContractError('SCOPE_INVALID', 'scope.summary deve ser texto.');
+  const summary = (summaryRaw ?? '').trim();
+  const wholeRaw = own(value, 'wholeWorkspace');
+  if (wholeRaw !== undefined && typeof wholeRaw !== 'boolean') throw new ContractError('SCOPE_INVALID', 'scope.wholeWorkspace deve ser booleano.');
+  const wholeWorkspace = wholeRaw === true;
+  const pathsRaw = own(value, 'paths');
+  if (pathsRaw !== undefined && !Array.isArray(pathsRaw)) throw new ContractError('SCOPE_INVALID', 'scope.paths deve ser uma lista de caminhos relativos.');
+  const paths: string[] = [];
+  for (const entry of pathsRaw ?? []) {
+    if (typeof entry !== 'string') throw new ContractError('SCOPE_PATH_INVALID', 'scope.paths só aceita textos.');
+    const normalized = normalizeScopePath(entry);
+    const segments = normalized.split('/').filter((segment) => segment.length > 0);
+    if (segments.length === 0 || segments.some((segment) => segment === '.' || segment === '..') || /^[A-Za-z]:/.test(normalized) || normalized.startsWith('/')) {
+      throw new ContractError('SCOPE_PATH_INVALID', `scope.paths contém um caminho inválido (${JSON.stringify(entry)}); use caminhos relativos dentro do workspace ou wholeWorkspace: true.`);
+    }
+    paths.push(normalized);
+  }
+  if (phase === 'execution' && (!summary || (paths.length === 0 && !wholeWorkspace))) {
+    throw new ContractError('SCOPE_REQUIRED', 'scope.summary e scope.paths não podem estar vazios na execução, salvo wholeWorkspace: true explícito.');
+  }
+  return { summary, paths, wholeWorkspace };
+}
+
+function resolveModelV2(value: unknown): { requested: AuthorizedModel; resolved: AuthorizedModel; reason: string } {
+  let requested: string | null = null;
+  let reason: string | null = null;
+  if (typeof value === 'string') {
+    requested = value;
+  } else if (isDict(value)) {
+    requested = stringField(own(value, 'requested'));
+    reason = stringField(own(value, 'reason'));
+  }
+  if (!requested || !AUTHORIZED_MODELS.includes(requested as AuthorizedModel)) {
+    throw new ContractError('MODEL_NOT_AUTHORIZED', `Modelo não autorizado: somente ${AUTHORIZED_MODELS.join(' e ')} são permitidos, com o identificador exato.`);
+  }
+  if (!reason || !reason.trim()) throw new ContractError('MODEL_REASON_REQUIRED', 'model.reason deve explicar a escolha do modelo.');
+  return { requested: requested as AuthorizedModel, resolved: requested as AuthorizedModel, reason: reason.trim() };
+}
+
+function resolvePrompt(job: Dict): { prompt: string | null; promptFile: string | null } {
+  const prompt = stringField(own(job, 'prompt'));
+  const promptFile = stringField(own(job, 'promptFile'));
+  if ((prompt === null || !prompt.trim()) && (promptFile === null || !promptFile.trim())) {
+    throw new ContractError('PROMPT_REQUIRED', 'prompt ou promptFile é obrigatório.');
+  }
+  return { prompt: prompt && prompt.trim() ? prompt : null, promptFile: promptFile && promptFile.trim() ? promptFile : null };
+}
+
+function resolveProfileField(job: Dict, fallback: string): string {
+  const raw = own(job, 'profile');
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'string') throw new ContractError('PROFILE_INVALID', 'profile deve ser texto; campos de autorização malformados são rejeitados.');
+  return raw;
+}
+
+function resolveAuth(job: Dict): { allowApiBilling: boolean } {
+  const raw = own(job, 'auth');
+  if (raw === undefined || raw === null) return { allowApiBilling: false };
+  if (!isDict(raw)) throw new ContractError('AUTH_INVALID', 'auth deve ser um objeto.');
+  const allow = own(raw, 'allowApiBilling');
+  if (allow !== undefined && typeof allow !== 'boolean') throw new ContractError('AUTH_INVALID', 'auth.allowApiBilling deve ser booleano.');
+  for (const key of Object.keys(raw)) if (key !== 'allowApiBilling') throw new ContractError('AUTH_INVALID', `auth contém o campo inesperado ${key}.`);
+  return { allowApiBilling: allow === true };
+}
+
+function resolveV2(job: Dict): JobContract {
+  for (const legacyField of ['mode', 'allowedCommands', 'modelPolicy', 'timeoutPolicy', 'timeoutSeconds']) {
+    if (Object.prototype.hasOwnProperty.call(job, legacyField)) throw new ContractError('LEGACY_FIELD_IN_V2', `O campo legado ${legacyField} não existe no contrato v2.`);
+  }
+  const workspace = resolveWorkspace(own(job, 'workspace'));
+  const { prompt, promptFile } = resolvePrompt(job);
+  const profileRaw = resolveProfileField(job, 'development');
+  if (profileRaw === 'diagnostic' || profileRaw === 'restricted') throw new ContractError('PROFILE_INVALID', 'Perfis diagnostic e restricted pertencem ao contrato legado; use development ou read.');
+  if (profileRaw !== 'development' && profileRaw !== 'read') throw new ContractError('PROFILE_INVALID', 'profile deve ser development ou read.');
+  const coordination = resolveCoordination(own(job, 'coordination'));
+  const model = resolveModelV2(own(job, 'model'));
+  const effort = resolveEffortV2(own(job, 'effort'));
+  const scope = resolveScope(own(job, 'scope'), coordination.phase);
+  const codexThreadId = resolveThreadId(own(job, 'codexThreadId'));
+  const auth = resolveAuth(job);
+  const resumeFrom = stringField(own(job, 'resumeFrom'));
+  const readOnly = profileRaw === 'read' || coordination.phase === 'planning';
+  const capabilities = readOnly
+    ? { edit: false, test: false, commands: 'none' as const }
+    : {
+        edit: coordination.responsibilities.implementation === 'claude',
+        test: coordination.responsibilities.testing === 'claude',
+        commands: 'classified' as const,
+      };
+  return {
+    version: 2,
+    profile: profileRaw,
+    workspace,
+    prompt,
+    promptFile,
+    model,
+    effort,
+    coordination,
+    scope,
+    launch: { permissionMode: 'default', safeMode: false, permissionPromptsDisabled: false, restricted: false, strictMcpConfig: true },
+    capabilities,
+    limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
+    auth,
+    resumeFrom,
+    codexThreadId,
+    legacy: null,
+  };
+}
+
+function resolveLegacyModelPolicy(value: unknown): NonNullable<JobContract['legacy']>['modelPolicy'] {
+  if (value === undefined || value === null) return null;
+  if (!isDict(value)) throw new ContractError('LEGACY_MODEL_POLICY_INVALID', 'modelPolicy deve ser um objeto.');
+  for (const field of Object.keys(value)) {
+    if (!['mode', 'primary', 'alternate', 'switchAtRemainingPercent'].includes(field)) throw new ContractError('LEGACY_MODEL_POLICY_INVALID', `modelPolicy contém o campo inesperado ${field}.`);
+  }
+  if (own(value, 'mode') !== 'quota-aware' || own(value, 'primary') !== 'fable' || own(value, 'alternate') !== 'opus') {
+    throw new ContractError('LEGACY_MODEL_POLICY_INVALID', 'modelPolicy.mode deve ser quota-aware com primary fable e alternate opus.');
+  }
+  const threshold = own(value, 'switchAtRemainingPercent') ?? 3;
+  if (!Number.isInteger(threshold) || (threshold as number) < 1 || (threshold as number) > 20) {
+    throw new ContractError('LEGACY_MODEL_POLICY_INVALID', 'modelPolicy.switchAtRemainingPercent deve ser um inteiro de 1 a 20.');
+  }
+  return { mode: 'quota-aware', primary: 'fable', alternate: 'opus', switchAtRemainingPercent: threshold as number };
+}
+
+function positiveLegacyInteger(value: unknown, field: string): number {
+  if (!isPositiveInteger(value) || value > 2147483647) throw new ContractError('LEGACY_TIMEOUT_INVALID', `${field} deve ser um inteiro positivo.`);
+  return value;
+}
+
+export function resolveLegacyTimeoutPolicy(policy: unknown, timeoutSeconds: unknown): LegacyTimeoutPolicy {
+  if (policy !== undefined && policy !== null && timeoutSeconds !== undefined && timeoutSeconds !== null) {
+    throw new ContractError('LEGACY_TIMEOUT_CONFLICT', 'Use timeoutSeconds ou timeoutPolicy, nunca ambos.');
+  }
+  if (timeoutSeconds !== undefined && timeoutSeconds !== null) {
+    return { mode: 'fixed', timeoutSeconds: positiveLegacyInteger(timeoutSeconds, 'timeoutSeconds') };
+  }
+  const value = policy === undefined || policy === null ? { mode: 'adaptive' } : policy;
+  if (!isDict(value)) throw new ContractError('LEGACY_TIMEOUT_INVALID', 'timeoutPolicy deve ser um objeto.');
+  for (const field of Object.keys(value)) {
+    if (!['mode', 'renewEverySeconds', 'idleAfterSeconds', 'hardStopAfterSeconds'].includes(field)) throw new ContractError('LEGACY_TIMEOUT_INVALID', `timeoutPolicy contém o campo inesperado ${field}.`);
+  }
+  if (own(value, 'mode') !== 'adaptive') throw new ContractError('LEGACY_TIMEOUT_INVALID', 'timeoutPolicy.mode deve ser adaptive.');
+  const renew = positiveLegacyInteger(own(value, 'renewEverySeconds') ?? 1800, 'timeoutPolicy.renewEverySeconds');
+  const idle = positiveLegacyInteger(own(value, 'idleAfterSeconds') ?? 1200, 'timeoutPolicy.idleAfterSeconds');
+  const hard = positiveLegacyInteger(own(value, 'hardStopAfterSeconds') ?? 7200, 'timeoutPolicy.hardStopAfterSeconds');
+  if (renew >= hard) throw new ContractError('LEGACY_TIMEOUT_INVALID', 'timeoutPolicy.renewEverySeconds deve ser menor que hardStopAfterSeconds.');
+  if (idle >= hard) throw new ContractError('LEGACY_TIMEOUT_INVALID', 'timeoutPolicy.idleAfterSeconds deve ser menor que hardStopAfterSeconds.');
+  return { mode: 'adaptive', renewEverySeconds: renew, idleAfterSeconds: idle, hardStopAfterSeconds: hard };
+}
+
+function resolveLegacy(job: Dict): JobContract {
+  const workspace = resolveWorkspace(own(job, 'workspace'));
+  const { prompt, promptFile } = resolvePrompt(job);
+  const coordination = resolveCoordination(own(job, 'coordination'));
+  const mode = stringField(own(job, 'mode'));
+  if (mode !== 'chat' && mode !== 'read' && mode !== 'verify' && mode !== 'local') throw new ContractError('MODE_INVALID', 'mode deve ser chat, read, verify ou local.');
+  if (coordination.phase === 'planning' && mode !== 'chat' && mode !== 'read') throw new ContractError('PLANNING_MODE_INVALID', 'Um job de planejamento só pode usar chat ou read.');
+  if (mode === 'local' && coordination.responsibilities.implementation !== 'claude') throw new ContractError('LOCAL_REQUIRES_IMPLEMENTATION', 'O modo local exige que o Claude seja responsável por implementation.');
+  const profileRaw = resolveProfileField(job, 'diagnostic');
+  if (profileRaw === 'development' || profileRaw === 'read') throw new ContractError('PROFILE_REQUIRES_V2', 'O perfil development pertence ao contrato v2 (contractVersion: 2).');
+  if (profileRaw !== 'diagnostic' && profileRaw !== 'restricted') throw new ContractError('PROFILE_INVALID', 'profile deve ser diagnostic ou restricted.');
+  const modelRaw = own(job, 'model');
+  const policyRaw = own(job, 'modelPolicy');
+  if (modelRaw !== undefined && modelRaw !== null && policyRaw !== undefined && policyRaw !== null) throw new ContractError('LEGACY_MODEL_CONFLICT', 'Use model ou modelPolicy, nunca ambos.');
+  if (modelRaw !== undefined && modelRaw !== null && typeof modelRaw !== 'string') throw new ContractError('MODEL_NOT_AUTHORIZED', 'model legado deve ser texto.');
+  const modelPolicy = resolveLegacyModelPolicy(policyRaw);
+  const requested = typeof modelRaw === 'string' && modelRaw.trim() ? modelRaw.trim() : (modelPolicy ? modelPolicy.primary : 'fable');
+  const resolved = LEGACY_MODEL_ALIASES.get(requested) ?? null;
+  const effort = resolveEffortLegacy(own(job, 'effort'));
+  const timeoutPolicy = resolveLegacyTimeoutPolicy(own(job, 'timeoutPolicy'), own(job, 'timeoutSeconds'));
+  const codexThreadId = resolveThreadId(own(job, 'codexThreadId'));
+  const commands: LegacyCommand[] = [];
+  const rawCommands = own(job, 'allowedCommands');
+  if (rawCommands !== undefined && rawCommands !== null && !Array.isArray(rawCommands)) throw new ContractError('LEGACY_RULE_INVALID', 'allowedCommands deve ser uma lista.');
+  for (const raw of (Array.isArray(rawCommands) ? rawCommands : []).filter((c) => c !== null && c !== undefined)) {
+    if (mode !== 'verify' && mode !== 'local') throw new ContractError('LEGACY_COMMANDS_MODE', 'allowedCommands só existem nos modos verify ou local.');
+    if (!isDict(raw)) throw new ContractError('LEGACY_RULE_INVALID', 'Cada comando permitido exige rule e responsibility.');
+    const rule = stringField(own(raw, 'rule')) ?? '';
+    const responsibility = (stringField(own(raw, 'responsibility')) ?? '').toLowerCase();
+    if (!rule.trim() || !responsibility.trim()) throw new ContractError('LEGACY_RULE_INVALID', 'Cada comando permitido exige rule e responsibility.');
+    if (!LEGACY_RULE_PATTERN.test(rule) || /[:*]/.test(rule)) throw new ContractError('LEGACY_RULE_INVALID', 'Somente regras Bash explícitas sem curingas são permitidas.');
+    if (LEGACY_CRITICAL_PATTERN.test(rule)) throw new ContractError('LEGACY_RULE_CRITICAL', 'Um comando externo crítico não pode ser delegado ao Claude.');
+    const allowedStages = mode === 'verify' ? ['inspection', 'testing'] : ['inspection', 'implementation', 'testing'];
+    if (!allowedStages.includes(responsibility)) throw new ContractError('LEGACY_RULE_STAGE', `A responsabilidade ${responsibility} não autoriza comandos no modo ${mode}.`);
+    if (coordination.responsibilities[responsibility as keyof Responsibilities] !== 'claude') throw new ContractError('LEGACY_RULE_OWNER', `O Claude precisa ser responsável por ${responsibility} para esse comando.`);
+    commands.push({ rule, responsibility });
+  }
+  const capabilities = {
+    edit: mode === 'local',
+    test: (mode === 'verify' || mode === 'local') && coordination.responsibilities.testing === 'claude',
+    commands: mode === 'verify' || mode === 'local' ? ('exact-list' as const) : ('none' as const),
+  };
+  return {
+    version: 1,
+    profile: profileRaw,
+    workspace,
+    prompt,
+    promptFile,
+    model: { requested, resolved, reason: 'Job legado (contrato v1): configuração original preservada para consulta; execução somente pelo runner legado.' },
+    effort,
+    coordination,
+    scope: { summary: coordination.planSummary, paths: [], wholeWorkspace: false },
+    launch: { permissionMode: 'dontAsk', safeMode: true, permissionPromptsDisabled: true, restricted: profileRaw === 'restricted', strictMcpConfig: true },
+    capabilities,
+    limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
+    auth: { allowApiBilling: false },
+    resumeFrom: stringField(own(job, 'resumeFrom')),
+    codexThreadId,
+    legacy: { mode, allowedCommands: commands, modelPolicy, timeoutPolicy, executor: 'legacy-runner' },
+  };
+}
+
+export function resolveJobContract(job: unknown): JobContract {
+  if (!isDict(job)) throw new ContractError('JOB_INVALID', 'O job deve ser um objeto JSON.');
+  const version = own(job, 'contractVersion');
+  if (version === undefined || version === null) return resolveLegacy(job);
+  if (version !== CONTRACT_VERSION) throw new ContractError('CONTRACT_VERSION_UNSUPPORTED', `contractVersion ${String(version)} não é suportado; use ${CONTRACT_VERSION}.`);
+  return resolveV2(job);
+}

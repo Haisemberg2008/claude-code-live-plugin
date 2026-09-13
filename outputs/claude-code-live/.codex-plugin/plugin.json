@@ -1,13 +1,13 @@
 {
   "name": "claude-code-live",
-  "version": "0.1.0+codex.20260910201327",
-  "description": "OpenAInthropic permite que modelos Codex, como Terra e Sol, coordenem Opus e Fable sob plano, responsabilidades e permissoes aprovados.",
+  "version": "0.1.0+codex.20260913192644",
+  "description": "CodeOrquestra permite que modelos Codex, como Terra e Sol, coordenem Opus e Fable sob plano, responsabilidades e permissoes aprovados.",
   "author": {
     "name": "YOU Telecom"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "OpenAInthropic",
+    "displayName": "CodeOrquestra",
     "shortDescription": "Terra e Sol coordenando Opus e Fable.",
     "longDescription": "Integracao local independente para modelos Codex, como Terra e Sol, planejarem, supervisionarem e revisarem sessoes Claude Opus e Fable. Defina quem planeja, inspeciona, implementa, testa, revisa, commita, envia e publica; aprove o plano e execute Claude Code com ferramentas controladas.",
     "developerName": "YOU Telecom",
@@ -18,12 +18,12 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Use OpenAInthropic para um modelo Codex, como Terra ou Sol, planejar esta tarefa, definir os responsaveis e coordenar Opus ou Fable somente depois da minha aprovacao.",
-      "Use OpenAInthropic para planejar e atribuir esta tarefa antes de iniciar e acompanhar uma sessao Claude Code em nuvem."
+      "Use CodeOrquestra para um modelo Codex, como Terra ou Sol, planejar esta tarefa, definir os responsaveis e coordenar Opus ou Fable somente depois da minha aprovacao.",
+      "Use CodeOrquestra para planejar e atribuir esta tarefa antes de iniciar e acompanhar uma sessao Claude Code em nuvem."
     ],
     "brandColor": "#6D28D9",
-    "composerIcon": "./assets/openainthropic-icon.png",
-    "logo": "./assets/openainthropic-icon.png",
-    "logoDark": "./assets/openainthropic-icon.png"
+    "composerIcon": "./assets/codeorquestra-icon.png",
+    "logo": "./assets/codeorquestra-icon.png",
+    "logoDark": "./assets/codeorquestra-icon.png"
   }
 }

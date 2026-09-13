@@ -3,11 +3,13 @@ name: claude-code-live
 description: Use when coordinating authorized Claude Code CLI work that needs explicit responsibility assignment, an approved plan, visible progress, scoped tools, controlled permissions, resumption, interruption, or background-session management.
 ---
 
-# OpenAInthropic
+# CodeOrquestra
 
-OpenAInthropic e a marca visivel desta integracao local independente para o Codex coordenar Opus e Fable; nao e produto oficial nem representa parceria entre OpenAI e Anthropic. O identificador tecnico da skill permanece `claude-code-live`.
+CodeOrquestra e a marca visivel desta integracao local independente para o Codex coordenar Opus e Fable; nao e produto oficial nem representa parceria entre OpenAI e Anthropic. Identificador tecnico: `codeorquestra`; o nome da skill permanece `claude-code-live` como alias legado documentado.
 
-Use o CLI instalado e a autenticacao existente. A skill coordena tanto sessoes locais quanto sessoes na nuvem; escolha o destino por tarefa, nao por preferencia fixa. Nao transforme isso em automacao recorrente. O usuario acompanha uma janela de terminal; o Codex coordena, le os resultados e verifica os artefatos. O encerramento do processo nunca prova que a tarefa foi aprovada.
+Use o CLI instalado e a autenticacao existente: nada do Claude Code e empacotado nem substituido aqui, e nenhum SDK de fornecedor e importado em tempo de execucao. A skill coordena tanto sessoes locais quanto sessoes na nuvem; escolha o destino por tarefa, nao por preferencia fixa. Nao transforme isso em automacao recorrente. O usuario acompanha uma janela de terminal; o Codex coordena, le os resultados e verifica os artefatos. O encerramento do processo nunca prova que a tarefa foi aprovada.
+
+Este documento descreve o runner legado (v1), que continua suportado sem alteracoes. O runtime v2 — sessao duravel multiturno, fila de orientacoes, permissoes e perguntas ao vivo, broker HTTP em loopback, adaptador MCP stdio (`codeorquestra_*`) e painel web — esta em `references/runtime-v2.md`, com detalhes de implementacao em `runtime/README.md`. As regras de dados, confianca em personalizacoes e autenticacao valem para as duas geracoes e estao em `references/security.md`.
 
 ## Escolher o destino
 
@@ -96,7 +98,7 @@ Nao trate limite de uso da assinatura como autorizacao para ampliar escopo ou in
 
 Leia `acompanhamento.txt` e `status.json` na pasta da execucao em intervalos razoaveis enquanto o terminal mostra os eventos ao vivo. O modelo efetivo aparece no inicio. Nao repetir atualizacoes sem mudanca; comunicar resultado, bloqueio ou mudanca concreta. Nao mostrar eventos JSON brutos, argumentos/resultados de ferramentas, stderr ou raciocinio interno. O texto publico e armazenado; portanto somente delegar dados autorizados e sanitizados. Nao alegar redacao automatica de qualquer segredo.
 
-O usuario pode apertar Q no painel da tarefa ou pedir parada aqui. Para parar por aqui, crie `stop.request` na pasta exata da execucao com `apply_patch`; o executor encerra o processo filho e seus descendentes. Ctrl+C no terminal executor tambem aciona a limpeza no finally. X ou fechar o painel encerra somente a visualizacao, nao o trabalho; o painel daquela tarefa reabre na proxima chamada. Fechamento forcado do executor ou queda do sistema nao foram garantidos: verificar processos antes de retomar.
+O usuario pode apertar Q no painel da tarefa ou pedir parada aqui. Para parar por aqui, crie `stop.request` na pasta exata da execucao com `apply_patch`; o executor solicita o encerramento do processo filho e reconcilia a arvore ainda atribuivel. Ctrl+C no terminal executor tambem aciona a limpeza no finally. Isso e coordenacao cooperativa, nao isolamento do SO: queda, saida anormal ou arvore historica inconclusiva deixam o checkout em quarentena. X ou fechar o painel encerra somente a visualizacao, nao o trabalho; o painel daquela tarefa reabre na proxima chamada.
 
 `resultado.json` contem status, sessionId, workspace, modelo, perfil, contrato de coordenacao sanitizado, politica e motivo de tempo, nomes das ferramentas, quantidade de falhas de ferramenta, negativas de permissao e resposta final. O painel mostra fase, escopo, revisao aprovada, resumo, responsaveis e renovacoes de tempo. `COMPLETED` significa que o CLI terminou, nao que a tarefa foi aprovada. `FAIL`, `BLOCKED`, `CANCELLED` e `TIMEOUT` nunca sao sucesso. Logs ficam preservados; nao sobrescrever uma pasta de execucao anterior.
 

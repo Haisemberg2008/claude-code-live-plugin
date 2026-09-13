@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'claude-live-contract.ps1')
 . (Join-Path $PSScriptRoot 'claude-usage.ps1')
 . (Join-Path $PSScriptRoot 'claude-thread-context.ps1')
+. (Join-Path $PSScriptRoot 'claude-live-state.ps1')
 $Host.UI.RawUI.WindowTitle = 'Claude Code | Acompanhamento ao vivo'
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
 if (Test-Path -LiteralPath $runPath) { throw 'Use a new run directory.' }
@@ -26,18 +27,27 @@ $clock = [Diagnostics.Stopwatch]::StartNew()
 $runtimeClock = $null
 $seenTools = [Collections.Generic.List[string]]::new()
 $startedAt = [DateTimeOffset]::UtcNow.ToString('o')
-$record = [ordered]@{ status='STARTING'; codexThreadId=$ThreadId; startedAt=$startedAt; sessionId=$null; result=$null; exitCode=$null; elapsedSeconds=0; toolCalls=@() }
+$record = [ordered]@{ status='STARTING'; codexThreadId=$ThreadId; startedAt=$startedAt; sessionId=$null; result=$null; exitCode=$null; elapsedSeconds=0; toolCalls=@(); telemetryFailures=0; preparationSeconds=$null }
 $binaryArguments = @()
 $usageProvider = { Get-ClaudeUsageSnapshot }
 $quotaWaitMilliseconds = 30000
+$script:telemetryFailures = 0
+$script:persistenceFailure = $null
 function Show-Line([string]$Text) {
     Write-Host $Text
     Add-Content -LiteralPath $logPath -Value $Text -Encoding utf8
 }
+# Status telemetry is nonfatal: a reader holding status.json (panel, editor,
+# antivirus) must never kill a healthy Claude session. Failures are counted,
+# reported in the log and preserved in the final result.
 function Write-State($Value, [string]$Path) {
-    $temp = $Path + '.tmp'
-    $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding utf8
-    [IO.File]::Move($temp, $Path, $true)
+    $outcome = Write-ClaudeLiveTelemetry -Value $Value -Path $Path -MaxWaitMilliseconds 1500
+    if (-not $outcome.Ok) {
+        $script:telemetryFailures++
+        if ($script:telemetryFailures -le 3 -or ($script:telemetryFailures % 20) -eq 0) {
+            Show-Line ('[Telemetria] Falha ao gravar ' + (Split-Path -Leaf $Path) + ' (' + $outcome.Code + ', ocorrencia ' + $script:telemetryFailures + '); a execucao continua.')
+        }
+    }
 }
 Write-State $record $statusPath
 try {
@@ -175,9 +185,9 @@ try {
             }
         }
         processStartedAt = $null; lastActivityAt = $null; nextRenewalAt = $null
-        extensionCount = 0; timeoutReason = $null; runtimeSeconds = 0
+        extensionCount = 0; timeoutReason = $null; runtimeSeconds = 0; preparationSeconds = $null
         result = $null; usage = $usageSnapshot; toolCalls = @(); toolErrors = 0; permissionDenials = 0
-        exitCode = $null; elapsedSeconds = 0
+        exitCode = $null; elapsedSeconds = 0; telemetryFailures = 0
     }
     Show-Line 'CLAUDE CODE - ACOMPANHAMENTO AO VIVO'
     Show-Line 'Q no painel solicita parada; Ctrl+C no terminal executor interrompe. Resultados ficam preservados.'
@@ -208,6 +218,8 @@ try {
     $record.processStartedTicks = $process.StartTime.ToUniversalTime().Ticks
     $processStarted = [DateTimeOffset]::UtcNow
     $runtimeClock = [Diagnostics.Stopwatch]::StartNew()
+    $record.preparationSeconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
+    Show-Line ('[Tempo] Preparacao: ' + $record.preparationSeconds + 's (nao consome o limite de execucao do Claude).')
     $lastActivityElapsed = 0.0
     $lastActivityStateWriteElapsed = 0.0
     $record.processStartedAt = $processStarted.ToString('o')
@@ -352,11 +364,23 @@ try {
     $record.elapsedSeconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
     if ($null -ne $runtimeClock) { $record.runtimeSeconds = [math]::Round($runtimeClock.Elapsed.TotalSeconds, 1) }
     $record.toolCalls = @($seenTools.ToArray())
-    Write-State $record $resultPath
+    $record.telemetryFailures = $script:telemetryFailures
+    # The final result is strict: it must land in resultado.json or in the
+    # explicit fallback; a failure here is reported, never swallowed.
+    $finalResultPath = $null
+    try {
+        $final = Write-ClaudeLiveFinalResult -Value $record -Path $resultPath -MaxWaitMilliseconds 15000
+        $finalResultPath = $final.Path
+        if ($final.Fallback) { Show-Line ('[Persistencia] resultado.json ocupado; resultado final gravado em ' + (Split-Path -Leaf $final.Path) + '.') }
+    } catch {
+        $script:persistenceFailure = $_.Exception.Message
+        Show-Line ('[FAIL] Resultado final NAO persistido: ' + $script:persistenceFailure)
+    }
     Write-State $record $statusPath
-    if ($sessionConfirmed) { Write-ClaudeLiveSessionPointer -PointerFile $SessionPointerFile -ResultFile $resultPath }
+    if ($sessionConfirmed -and $finalResultPath) { Write-ClaudeLiveSessionPointer -PointerFile $SessionPointerFile -ResultFile $finalResultPath }
     if ($null -ne $process) { $process.Dispose() }
 }
 Show-Line ('[Encerrado] ' + $record.status)
 Show-Line 'COMPLETED confirma o fim da execucao; a aprovacao depende da revisao dos artefatos.'
+if ($script:persistenceFailure) { exit 3 }
 if ($record.status -ne 'COMPLETED') { exit 1 }

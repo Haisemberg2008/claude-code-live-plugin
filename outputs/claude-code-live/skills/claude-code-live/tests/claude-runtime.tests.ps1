@@ -200,13 +200,39 @@ try {
     $fixedResult = Read-Result 'fixed-timeout'
     Assert-True ($p.ExitCode -ne 0 -and $fixedResult.status -eq 'TIMEOUT' -and $fixedResult.timeoutReason -eq 'fixed_limit') 'Legacy timeoutSeconds must remain a fixed runtime cap'
 
+    # Preparation (the simulated usage query) is deliberately LONGER than the fixed
+    # runtime cap, while the fake CLI itself finishes well inside it. Cold
+    # PowerShell startup (~1s on this machine) must not race a 1-second cap.
     $preparationThread = 'test-' + [guid]::NewGuid().ToString('N')
     $preparation = New-Job 'preparation-outside-timeout'
-    $preparation | Add-Member -NotePropertyName timeoutSeconds -NotePropertyValue 1
+    $preparation | Add-Member -NotePropertyName timeoutSeconds -NotePropertyValue 3
     $preparation | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $root 'preparation-outside-timeout.json')
-    $p = Start-TestRun 'preparation-outside-timeout' $preparationThread '' 10 '' 250 1500
+    $p = Start-TestRun 'preparation-outside-timeout' $preparationThread '' 10 '' 250 4000
     Wait-Result $p
-    Assert-True ((Read-Result 'preparation-outside-timeout').status -eq 'COMPLETED') 'Preparation time must not consume the Claude runtime limit'
+    $preparationResult = Read-Result 'preparation-outside-timeout'
+    Assert-True ($preparationResult.status -eq 'COMPLETED') ('Preparation time must not consume the Claude runtime limit (status=' + $preparationResult.status + ', preparationSeconds=' + $preparationResult.preparationSeconds + ', runtimeSeconds=' + $preparationResult.runtimeSeconds + ')')
+    Assert-True ($preparationResult.preparationSeconds -ge 3.5) 'The recorded preparation diagnostic must reflect the deliberately long preparation'
+    Assert-True ($preparationResult.runtimeSeconds -lt 3) 'Measured Claude runtime must stay inside the cap'
+    Assert-True ($preparationResult.elapsedSeconds -ge $preparationResult.preparationSeconds) 'Total elapsed time includes preparation'
+
+    # A reader holding status.json (no delete sharing) during the run must not
+    # kill the healthy session: telemetry failures are counted and reported.
+    # The runner writes status about once per second of activity and retries a
+    # busy replacement for 1.5s, so a 4s hold guarantees at least one counted
+    # telemetry failure before the reader releases; the fake CLI keeps going.
+    $heldThread = 'test-' + [guid]::NewGuid().ToString('N')
+    $null = New-Job 'status-held'
+    $p = Start-TestRun 'status-held' $heldThread '' 6500 'activity' 200
+    Wait-Running 'status-held'
+    $heldStatus = Join-Path $root 'status-held/status.json'
+    $holder = [IO.File]::Open($heldStatus, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try { Start-Sleep -Milliseconds 4000 } finally { $holder.Dispose() }
+    Wait-Result $p
+    $heldResult = Read-Result 'status-held'
+    Assert-True ($heldResult.status -eq 'COMPLETED') ('A held status.json must not kill the session (status=' + $heldResult.status + ')')
+    Assert-True ($heldResult.telemetryFailures -ge 1) 'Telemetry failures during the hold must be counted in the result'
+    Assert-True ((Get-Content (Join-Path $root 'status-held/acompanhamento.txt') -Raw) -match '\[Telemetria\]') 'Telemetry degradation must be visible in the log'
+    Assert-True (((Get-Content $heldStatus -Raw | ConvertFrom-Json).status) -eq 'COMPLETED') 'The final status is persisted once the reader releases'
 
     $log = Join-Path $root 'log.txt'; $cursor = New-ClaudeLogCursor
     $bytes = [Text.Encoding]::UTF8.GetBytes('á🙂fim')

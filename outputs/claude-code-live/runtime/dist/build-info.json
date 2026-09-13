@@ -1,0 +1,32 @@
+{
+  "name": "@codeorquestra/runtime",
+  "version": "0.1.0",
+  "builtWithNode": "v22.22.2",
+  "entrypoints": {
+    "codeorquestra": "codeorquestra.mjs",
+    "worker": "worker.mjs",
+    "mcp-stdio": "mcp-stdio.mjs"
+  },
+  "dependencyVersions": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "4.6.4"
+  },
+  "vendorSdkBundled": false,
+  "bundledPackages": [
+    "@modelcontextprotocol/sdk",
+    "ajv",
+    "ajv-formats",
+    "fast-deep-equal",
+    "fast-uri",
+    "json-schema-traverse",
+    "react",
+    "react-dom",
+    "scheduler",
+    "zod",
+    "zod-to-json-schema"
+  ],
+  "external": [],
+  "notices": "THIRD_PARTY_NOTICES.txt"
+}

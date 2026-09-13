@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "types": [],
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  // Seeded from the browser entrypoints only. Shared modules the panel really
+  // uses (src/shared/types.ts) are pulled in through their imports and are
+  // still checked here, under DOM-only globals; Node-only modules that happen
+  // to live under src/shared (env.ts reads process.env) belong to
+  // tsconfig.json. If the panel ever imports one of those by mistake, the
+  // import graph brings it back into this program and the build fails.
+  "include": ["dashboard/src/**/*.ts", "dashboard/src/**/*.tsx"],
+  "exclude": ["node_modules", "dist"]
+}

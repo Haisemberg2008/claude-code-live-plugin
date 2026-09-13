@@ -1,12 +1,16 @@
-# OpenAInthropic
+# CodeOrquestra
 
-![Fluxo do OpenAInthropic: Codex Terra e Sol planejam, supervisionam e revisam sessões separadas do Claude Opus e Fable](outputs/claude-code-live/assets/openainthropic-workflow-terra-sol.png)
+![Fluxo do CodeOrquestra: Codex Terra e Sol planejam, supervisionam e revisam sessões separadas do Claude Opus e Fable](outputs/claude-code-live/assets/codeorquestra-workflow-terra-sol.png)
 
-**Codex com Opus e Fable.** OpenAInthropic é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
+**Codex com Opus e Fable.** CodeOrquestra é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
-O identificador técnico permanece `claude-code-live`, preservando instalações, comandos, caminhos, automações e sessões existentes.
+Identificador técnico: `codeorquestra`. O alias legado `claude-code-live` continua documentado e em uso nos nomes de skill, diretórios de estado e arquivos derivados, preservando instalações, comandos, caminhos, automações e sessões existentes.
 
 O pacote instalável fica em [`outputs/claude-code-live`](outputs/claude-code-live/README.md). O diretório `work/`, quando existir, contém somente artefatos locais de validação e não faz parte do repositório.
+
+## Como o Claude Code é acionado
+
+Nada do Claude Code é empacotado aqui: o CodeOrquestra controla a instalação do Claude Code que já existe na sua máquina, com a autenticação que você já usa. O runtime v2 conversa diretamente com o processo do CLI instalado pelo protocolo `stream-json` que o próprio CLI documenta, sem importar nem redistribuir o Agent SDK. Antes de iniciar, o preflight confirma que aquela build anuncia todas as flags de que o runtime depende; se faltar alguma, a execução não começa e o motivo é reportado. Nenhum CLI alternativo é usado como substituto e nenhum caminho de cobrança por API é ativado automaticamente.
 
 ## O que o plugin faz
 
@@ -20,6 +24,18 @@ O pacote instalável fica em [`outputs/claude-code-live`](outputs/claude-code-li
 - Permite interromper e retomar uma sessão sem repetir mutações automaticamente.
 - Mantém commit, push, PR, deploy, publicação e outras mutações externas fora do Claude.
 - Obriga o Codex a revisar artefatos e testes; término do processo não equivale a aceite.
+
+## Duas gerações
+
+| | Runner legado (v1) | Runtime v2 |
+|---|---|---|
+| Onde | `outputs/claude-code-live/skills/claude-code-live/scripts/*.ps1` | `outputs/claude-code-live/runtime/` (Node 22+, TypeScript) |
+| Unidade de trabalho | uma execução com prompt fixo | sessão durável por tarefa Codex, com vários turnos |
+| Durante o trabalho | acompanhamento somente | fila de orientações, permissões e perguntas ao vivo, interrupção de turno |
+| Superfícies | PowerShell | broker HTTP em loopback + MCP stdio (`codeorquestra_*`) + CLI + painel web |
+| Tempo | 20 min de inatividade e 2 h encerram | 20 min e 2 h **alertam**; nada encerra sozinho |
+
+O v1 continua suportado sem alterações de escopo. O v2 está descrito em [`references/runtime-v2.md`](outputs/claude-code-live/skills/claude-code-live/references/runtime-v2.md) e em [`runtime/README.md`](outputs/claude-code-live/runtime/README.md).
 
 ## Fluxo obrigatório antes da execução
 
@@ -226,6 +242,7 @@ Safe mode, perfil restrito e allowlists reduzem a superfície de acesso, mas nã
 ## Estrutura do repositório
 
 - `outputs/claude-code-live/.codex-plugin/plugin.json`: manifesto.
+- `outputs/claude-code-live/.mcp.json`: registra no Codex o adaptador MCP `codeorquestra`, executado a partir do bundle local.
 - `outputs/claude-code-live/skills/claude-code-live/SKILL.md`: regras principais.
 - `outputs/claude-code-live/skills/claude-code-live/references/`: operação local, nuvem e segurança.
 - `outputs/claude-code-live/skills/claude-code-live/scripts/`: contrato, executor, painel e consulta de uso.
@@ -242,6 +259,8 @@ O Codex instala plugins por marketplace. Este projeto não altera marketplaces a
 3. Para marketplace não padrão, execute `codex plugin marketplace add <raiz>`.
 4. Execute `codex plugin add claude-code-live@<marketplace>`.
 5. Abra uma nova tarefa para carregar a versão instalada.
+
+Na tarefa nova, o Codex passa a enxergar as ferramentas `codeorquestra_*`. O adaptador MCP inicia ou reutiliza o broker local; cada tarefa precisa registrar sua identidade uma vez para obter o `taskHandle` privado que limita todas as ações daquela sessão. O painel é aberto por um link local de uso único e continua funcionando mesmo que a aba seja fechada.
 
 O marketplace pessoal padrão em `~/.agents/plugins/marketplace.json` é descoberto implicitamente e não exige `marketplace add`.
 

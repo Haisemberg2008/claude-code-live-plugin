@@ -1,0 +1,36 @@
+{
+  "name": "@codeorquestra/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CodeOrquestra runtime: broker, per-task worker, MCP stdio adapter, CLI and web dashboard that coordinate the user's own installed Claude Code CLI from Codex. Independent local integration; not an official OpenAI or Anthropic product. Legacy technical alias: claude-code-live.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.dashboard.json",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination=last-test-run.tap \"test/*.test.ts\"",
+    "test:browser": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination=last-browser-test-run.tap \"test/browser/*.test.ts\"",
+    "build": "npm run build:backend && npm run build:dashboard",
+    "build:backend": "node esbuild.config.mjs",
+    "build:dashboard": "vite build --config vite.config.mts",
+    "verify": "npm run typecheck && npm run build && npm run test && npm run test:browser"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "4.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "esbuild": "0.28.2",
+    "playwright-core": "1.63.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.0"
+  }
+}
