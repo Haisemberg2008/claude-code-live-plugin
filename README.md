@@ -1,6 +1,6 @@
 # CodeOrquestra
 
-![Fluxo do CodeOrquestra: Codex Terra e Sol planejam, supervisionam e revisam sessões separadas do Claude Opus e Fable](outputs/claude-code-live/assets/codeorquestra-workflow-terra-sol.png)
+![Arquitetura do CodeOrquestra: Codex Terra e Sol coordenam sessões isoladas do Claude Fable e Opus por MCP local, painel ao vivo e revisão independente](outputs/claude-code-live/assets/codeorquestra-architecture-v2.png)
 
 **Codex com Opus e Fable.** CodeOrquestra é a marca visível desta integração local independente para coordenar tarefas do Claude Code a partir do Codex. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento ao vivo e retomada controlada. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
@@ -190,13 +190,17 @@ O validador bloqueia regras que revelem commit, push, criação ou merge de PR, 
 
 ## Execução e acompanhamento local
 
+![Fluxo Painel Primeiro: registrar a tarefa, abrir ou reutilizar uma única aba, confirmar o painel, iniciar Claude, acompanhar ao vivo e revisar a entrega](outputs/claude-code-live/assets/codeorquestra-panel-first.png)
+
 ```powershell
 pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' `
   -JobFile '<job.json>' `
   -RunDirectory '<pasta-nova>'
 ```
 
-O preflight valida o contrato antes de abrir o painel ou iniciar o Claude. Cada tarefa Codex possui diretório de estado, painel e mutex próprios; jobs da mesma tarefa são serializados, enquanto tarefas diferentes podem executar simultaneamente. A consulta de quota continua protegida por um mutex global porque os limites pertencem à conta, não à tarefa.
+No runner legado, o preflight valida o contrato antes de preparar o painel e o processo; o handshake de prontidão do painel precisa terminar antes de o processo Claude começar. No runtime v2, o Codex abre ou reutiliza uma única aba, confirma visualmente a tarefa selecionada e somente então chama `codeorquestra_start`. Se essa confirmação falhar, o Claude não é iniciado silenciosamente.
+
+Cada tarefa Codex possui diretório de estado, painel e mutex próprios; jobs da mesma tarefa são serializados, enquanto tarefas diferentes podem executar simultaneamente. A consulta de quota continua protegida por um mutex global porque os limites pertencem à conta, não à tarefa.
 
 O painel mostra modo, perfil, modelo efetivo, fase, escopo, revisão aprovada, resumo do plano, responsáveis, limites de uso sanitizados, política de tempo, renovações, ferramentas e mudanças de estado.
 
@@ -248,6 +252,7 @@ Safe mode, perfil restrito e allowlists reduzem a superfície de acesso, mas nã
 - `outputs/claude-code-live/skills/claude-code-live/scripts/`: contrato, executor, painel e consulta de uso.
 - `outputs/claude-code-live/skills/claude-code-live/tests/`: testes contratuais e do parser.
 - `outputs/claude-code-live/scripts/`: validação e smoke test.
+- `outputs/claude-code-live/assets/`: ícone, visão de arquitetura e fluxo visual de painel primeiro.
 - `docs/superpowers/plans/`: planos históricos.
 
 ## Instalação

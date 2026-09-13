@@ -1,6 +1,6 @@
 # CodeOrquestra
 
-![Fluxo do CodeOrquestra: Codex Terra e Sol planejam, supervisionam e revisam sessões separadas do Claude Opus e Fable](assets/codeorquestra-workflow-terra-sol.png)
+![Arquitetura do CodeOrquestra: Codex Terra e Sol coordenam sessões isoladas do Claude Fable e Opus por MCP local, painel ao vivo e revisão independente](assets/codeorquestra-architecture-v2.png)
 
 **Codex com Opus e Fable.** CodeOrquestra é a marca visível desta integração local independente para coordenar o Claude Code que você já instalou, local ou em nuvem. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento e retomada controlados. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
@@ -111,13 +111,15 @@ A decisão é refeita a cada início/retomada e volta ao Fable após a renovaç�
 
 ## Executar localmente
 
+![Fluxo Painel Primeiro: registrar a tarefa, abrir ou reutilizar uma única aba, confirmar o painel, iniciar Claude, acompanhar ao vivo e revisar a entrega](assets/codeorquestra-panel-first.png)
+
 ```powershell
 pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' `
   -JobFile '<job.json>' `
   -RunDirectory '<pasta-nova>'
 ```
 
-O contrato é validado antes de abrir o painel ou iniciar o Claude. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo, responsáveis e renovações do tempo adaptativo.
+No runner legado, o contrato é validado antes de preparar o painel e o processo; o handshake de prontidão do painel precisa terminar antes de o processo Claude começar. No runtime v2, o Codex abre ou reutiliza uma única aba, confirma visualmente a tarefa selecionada e somente então chama `codeorquestra_start`. Se essa confirmação falhar, o Claude não é iniciado silenciosamente. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo, responsáveis e renovações do tempo adaptativo.
 
 Cada tarefa Codex usa `CODEX_THREAD_ID` para manter diretório, painel, mutex e sessão Claude próprios. Jobs da mesma tarefa são serializados; tarefas diferentes podem executar ao mesmo tempo. A leitura de quota permanece globalmente serializada. Fora do Codex, `codexThreadId` fornece uma identidade estável opcional; sem identidade, cada chamada recebe uma chave isolada de uso único.
 
@@ -157,6 +159,7 @@ Safe mode, perfis e allowlists reduzem acesso, mas não substituem revisão nem 
 - `skills/claude-code-live/scripts/`: executor, painel, contrato e consulta de uso (v1).
 - `skills/claude-code-live/tests/`: testes automatizados do v1.
 - `runtime/`: runtime v2 (broker, worker por tarefa, MCP stdio, CLI e painel web) — ver `runtime/README.md`.
+- `assets/`: ícone, visão de arquitetura e fluxo visual de painel primeiro.
 - `scripts/validate.ps1`: validação estrutural.
 - `scripts/smoke-test.ps1`: validação completa sem iniciar sessão Claude.
 
