@@ -1,0 +1,80 @@
+name: verify
+
+# The runtime is Windows-first: the broker singleton and the global quota mutex
+# spawn `pwsh`, and several tests depend on Windows file-sharing semantics. The
+# GitHub windows-latest image ships PowerShell 7 and Edge, which stock Windows
+# 11 does not — that is why the full suite can pass here and be skipped locally.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: outputs/claude-code-live/runtime
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18'
+          cache: npm
+          cache-dependency-path: outputs/claude-code-live/runtime/package-lock.json
+
+      # --ignore-scripts is the supply-chain policy the README states; keeping it
+      # on the command line here means CI cannot silently drift from it.
+      - name: install
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: build
+        run: npm run build
+
+      # The plugin ships prebuilt bundles because an installed plugin never runs
+      # npm install, so dist/ is committed on purpose. This proves the committed
+      # bundles are the ones this source produces.
+      #
+      # Compared through the index, not the working tree: Vite emits CRLF on
+      # Windows while esbuild emits LF, and it is git's checkin filter (see
+      # .gitattributes) that normalizes both to LF. `git diff` on the working
+      # tree would report every line of the Vite output as changed.
+      - name: dist matches src
+        shell: bash
+        run: |
+          git add --renormalize dist
+          if ! git diff --cached --quiet -- dist; then
+            echo "::error::dist/ nao corresponde ao src/ commitado. Rode 'npm run build' e commite o dist/ atualizado."
+            git diff --cached --stat -- dist
+            exit 1
+          fi
+          echo "dist/ esta em sincronia com src/."
+
+      - name: test
+        run: npm test
+
+      # Drives an already-installed Edge or Chrome through playwright-core; no
+      # browser is downloaded. Kept non-blocking until it has proven stable on
+      # the hosted image — flip continue-on-error off once it has.
+      - name: browser tests
+        run: npm run test:browser
+        continue-on-error: true
+
+      - name: upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tap-reports
+          path: |
+            outputs/claude-code-live/runtime/last-test-run.tap
+            outputs/claude-code-live/runtime/last-browser-test-run.tap
+          if-no-files-found: ignore

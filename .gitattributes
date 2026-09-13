@@ -1,0 +1,17 @@
+# Line endings are pinned to LF everywhere.
+#
+# Without this, `core.autocrlf=true` (the Windows default) checks every text
+# file out with CRLF while esbuild and Vite emit LF. The committed bundles in
+# runtime/dist then differ from a fresh build on every line, which makes a
+# build-drift guard in CI fail for a reason that has nothing to do with drift.
+#
+# No .bat or .cmd files are tracked here; those are the only ones that would
+# genuinely need CRLF. PowerShell reads LF fine.
+* text eol=lf
+
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff2 binary

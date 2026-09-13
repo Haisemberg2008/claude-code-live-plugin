@@ -33,7 +33,7 @@ Set-Location outputs/claude-code-live/runtime
 npm install --ignore-scripts --no-audit --no-fund
 ```
 
-Um `.npmrc` local com `ignore-scripts=true`, `save-exact=true`, `save-prefix=` e `package-lock=true` tornaria essa política independente da linha de comando; ele ainda não existe porque o runner legado bloqueia a criação desse nome de arquivo.
+Essa política agora vive em `runtime/.npmrc` (`ignore-scripts=true`, `save-exact=true`, `save-prefix=`, `package-lock=true`, `global=false`), e não depende mais de quem digita o comando lembrar das flags. O arquivo precisa ser criado pelo Codex ou pelo usuário: `.npmrc` está em `SENSITIVE_PATH_PATTERNS` porque pode conter `_authToken`, então uma sessão Claude sob este contrato é impedida de escrevê-lo — o que é o comportamento correto, não uma limitação a contornar.
 
 O plugin registra `dist/mcp-stdio.mjs` por meio do `.mcp.json` da raiz. Ao ser carregado numa tarefa nova do Codex, o adaptador inicia ou reutiliza o broker local. O registro inicial da tarefa continua explícito porque o `taskHandle` é a capacidade que impede uma tarefa de consultar, orientar ou cancelar outra:
 
