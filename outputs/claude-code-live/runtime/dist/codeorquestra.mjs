@@ -202,14 +202,14 @@ var init_cli_resolver = __esm({
 });
 
 // src/cli/main.ts
-import { promises as fs16 } from "node:fs";
-import path16 from "node:path";
+import { promises as fs17 } from "node:fs";
+import path17 from "node:path";
 import { pathToFileURL } from "node:url";
 
 // src/broker/broker.ts
 import http from "node:http";
-import { promises as fs14 } from "node:fs";
-import path14 from "node:path";
+import { promises as fs15 } from "node:fs";
+import path15 from "node:path";
 import { randomUUID as randomUUID2 } from "node:crypto";
 
 // src/shared/types.ts
@@ -796,8 +796,8 @@ data: ${JSON.stringify(frame)}
 // src/broker/task-manager.ts
 import { spawn as spawn7 } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs13, realpathSync as realpathSync3 } from "node:fs";
-import path12 from "node:path";
+import { promises as fs14, realpathSync as realpathSync3 } from "node:fs";
+import path13 from "node:path";
 
 // src/contract/job-contract.ts
 var CONTRACT_VERSION = 2;
@@ -2409,6 +2409,16 @@ async function withGlobalQuotaMutex(fn, options = {}) {
 // src/broker/worktree.ts
 var GIT_TIMEOUT_MS = 2e4;
 var MAX_CHANGED_FILES = 500;
+var WorktreeError = class extends Error {
+  code;
+  detail;
+  constructor(code, message, detail) {
+    super(message);
+    this.name = "WorktreeError";
+    this.code = code;
+    this.detail = detail;
+  }
+};
 function git(args, cwd, timeoutMs = GIT_TIMEOUT_MS) {
   return new Promise((resolve) => {
     const child = spawn3("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
@@ -2447,11 +2457,150 @@ async function gitStatus(workspace) {
   if (result.code !== 0) return [];
   return result.stdout.split("\n").map((line) => line.slice(3).trim()).filter(Boolean).slice(0, MAX_CHANGED_FILES);
 }
+function canonicalize(target) {
+  const normalized = target.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+async function resolveRepository(workspace) {
+  const result = await git(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"], workspace);
+  if (result.code !== 0) {
+    throw new WorktreeError("NOT_A_GIT_REPOSITORY", "O workspace declarado n\xE3o pertence a um reposit\xF3rio git; worktrees exigem um.", result.stderr.trim().slice(0, 400));
+  }
+  const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  const commonDir = lines[0];
+  const topLevel = lines[1];
+  if (!commonDir || !topLevel) {
+    throw new WorktreeError("NOT_A_GIT_REPOSITORY", "N\xE3o foi poss\xEDvel identificar o reposit\xF3rio do workspace declarado.");
+  }
+  return { commonDir: canonicalize(commonDir), topLevel: canonicalize(topLevel), repoKey: sha256(canonicalize(commonDir)).slice(0, 24) };
+}
+async function listOrphans(stateRoot, isOwned) {
+  const root = path8.join(stateRoot, "worktrees");
+  let repoDirs;
+  try {
+    repoDirs = (await fs8.readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+  const orphans = [];
+  for (const repoKey of repoDirs) {
+    let taskDirs;
+    try {
+      taskDirs = (await fs8.readdir(path8.join(root, repoKey), { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    } catch {
+      continue;
+    }
+    for (const taskPrefix of taskDirs) {
+      if (isOwned(repoKey, taskPrefix)) continue;
+      const target = path8.join(root, repoKey, taskPrefix);
+      orphans.push({ path: target, repoKey, taskId: taskPrefix, dirtyFiles: await gitStatus(target) });
+    }
+  }
+  return orphans;
+}
 
-// src/trust/trust-store.ts
+// src/broker/worktree-policy.ts
 import { createHash as createHash3 } from "node:crypto";
 import { promises as fs9 } from "node:fs";
 import path9 from "node:path";
+var DEFAULT_MAX_RETAINED = 8;
+var DEFAULT_MAX_PARALLEL = 3;
+var WorktreePolicyError = class extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "WorktreePolicyError";
+    this.code = code;
+  }
+};
+function boundedInteger(value, field, min, max, fallback) {
+  if (value === void 0 || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    throw new WorktreePolicyError("WORKTREE_POLICY_INVALID", `${field} deve ser inteiro entre ${min} e ${max}.`);
+  }
+  return value;
+}
+var WorktreePolicyStore = class {
+  root;
+  constructor(root) {
+    this.root = root;
+  }
+  fileFor(repoKey) {
+    return path9.join(this.root, "worktree-policy", `${createHash3("sha256").update(repoKey).digest("hex")}.json`);
+  }
+  /**
+   * Records the user's decision to allow worktrees in this repository.
+   *
+   * A note is mandatory, exactly as releasing a quarantine requires one: an
+   * unexplained standing permission to mutate a repository is worth less than
+   * no record at all.
+   */
+  async enrol(input) {
+    const note = typeof input.note === "string" ? input.note.trim() : "";
+    if (!note) throw new WorktreePolicyError("WORKTREE_POLICY_NOTE_REQUIRED", "Habilitar worktrees exige uma nota dizendo por qu\xEA; a permiss\xE3o fica registrada.");
+    let worktreeRoot = null;
+    if (input.worktreeRoot !== void 0 && input.worktreeRoot !== null) {
+      if (typeof input.worktreeRoot !== "string" || !path9.isAbsolute(input.worktreeRoot)) {
+        throw new WorktreePolicyError("WORKTREE_POLICY_INVALID", "worktreeRoot deve ser um caminho absoluto.");
+      }
+      worktreeRoot = input.worktreeRoot;
+    }
+    const file = this.fileFor(input.repoKey);
+    const record2 = {
+      repoKey: input.repoKey,
+      canonicalWorkspace: input.canonicalWorkspace,
+      enabled: true,
+      enabledAt: (/* @__PURE__ */ new Date()).toISOString(),
+      enabledBy: input.enabledBy,
+      note,
+      maxParallelRuns: boundedInteger(input.maxParallelRuns, "maxParallelRuns", 1, 10, DEFAULT_MAX_PARALLEL),
+      maxRetainedWorktrees: boundedInteger(input.maxRetainedWorktrees, "maxRetainedWorktrees", 1, 50, DEFAULT_MAX_RETAINED),
+      worktreeRoot,
+      file
+    };
+    await fs9.mkdir(path9.dirname(file), { recursive: true });
+    await writeFileAtomic(file, JSON.stringify(record2, null, 2));
+    return record2;
+  }
+  async load(repoKey) {
+    const read = await readJsonShared(this.fileFor(repoKey));
+    return read.status === "ok" && read.value.enabled ? read.value : null;
+  }
+  /** Fails closed: a repository nobody enrolled cannot be provisioned into. */
+  async require(repoKey) {
+    const record2 = await this.load(repoKey);
+    if (!record2) {
+      throw new WorktreePolicyError(
+        "WORKTREE_POLICY_REQUIRED",
+        'Este reposit\xF3rio ainda n\xE3o foi habilitado para worktrees. Criar um worktree altera o reposit\xF3rio de forma persistente, ent\xE3o exige uma a\xE7\xE3o local do usu\xE1rio: "codeorquestra worktree enable --repo <caminho> --note <motivo>".'
+      );
+    }
+    return record2;
+  }
+  async revoke(repoKey) {
+    await fs9.rm(this.fileFor(repoKey), { force: true });
+  }
+  async list() {
+    const dir = path9.join(this.root, "worktree-policy");
+    let names;
+    try {
+      names = (await fs9.readdir(dir)).filter((name) => name.endsWith(".json"));
+    } catch {
+      return [];
+    }
+    const records = [];
+    for (const name of names) {
+      const read = await readJsonShared(path9.join(dir, name));
+      if (read.status === "ok") records.push(read.value);
+    }
+    return records.sort((a, b) => a.canonicalWorkspace.localeCompare(b.canonicalWorkspace));
+  }
+};
+
+// src/trust/trust-store.ts
+import { createHash as createHash4 } from "node:crypto";
+import { promises as fs10 } from "node:fs";
+import path10 from "node:path";
 var TrustStoreError = class extends Error {
   code;
   constructor(code, message) {
@@ -2466,7 +2615,7 @@ var TrustStore = class {
     this.root = root;
   }
   fileFor(canonicalWorkspace) {
-    return path9.join(this.root, "trust", `${createHash3("sha256").update(canonicalWorkspace).digest("hex")}.json`);
+    return path10.join(this.root, "trust", `${createHash4("sha256").update(canonicalWorkspace).digest("hex")}.json`);
   }
   async approve(input) {
     if (input.inventory.incomplete) throw new TrustStoreError("INVENTORY_INCOMPLETE", "O invent\xE1rio est\xE1 incompleto; aprove somente ap\xF3s a descoberta completa.");
@@ -2490,7 +2639,7 @@ var TrustStore = class {
       mcpServers,
       file
     };
-    await fs9.mkdir(path9.dirname(file), { recursive: true });
+    await fs10.mkdir(path10.dirname(file), { recursive: true });
     await writeFileAtomic(file, JSON.stringify(record2, null, 2));
     return record2;
   }
@@ -2517,7 +2666,7 @@ var TrustStore = class {
     return { trusted: true, approvalRevision: record2.approvalRevision, pending: [], changed: [], reason: "TRUSTED" };
   }
   async revoke(canonicalWorkspace) {
-    await fs9.rm(this.fileFor(canonicalWorkspace), { force: true });
+    await fs10.rm(this.fileFor(canonicalWorkspace), { force: true });
   }
 };
 
@@ -2911,18 +3060,18 @@ var CodexUsageService = class {
 };
 
 // src/broker/runtime-paths.ts
-import { promises as fs10, existsSync, readFileSync } from "node:fs";
+import { promises as fs11, existsSync, readFileSync } from "node:fs";
 import os3 from "node:os";
-import path10 from "node:path";
+import path11 from "node:path";
 import { fileURLToPath } from "node:url";
 var here = fileURLToPath(import.meta.url);
 var SOURCE_MODE = here.endsWith(".ts");
-var RUNTIME_BASE = SOURCE_MODE ? path10.resolve(path10.dirname(here), "..", "..") : path10.dirname(here);
+var RUNTIME_BASE = SOURCE_MODE ? path11.resolve(path11.dirname(here), "..", "..") : path11.dirname(here);
 function workerEntry() {
-  return readEnv("WORKER_ENTRY") ?? (SOURCE_MODE ? path10.join(RUNTIME_BASE, "src", "worker", "main.ts") : path10.join(RUNTIME_BASE, "worker.mjs"));
+  return readEnv("WORKER_ENTRY") ?? (SOURCE_MODE ? path11.join(RUNTIME_BASE, "src", "worker", "main.ts") : path11.join(RUNTIME_BASE, "worker.mjs"));
 }
 function cliEntry() {
-  return SOURCE_MODE ? path10.join(RUNTIME_BASE, "src", "cli", "main.ts") : path10.join(RUNTIME_BASE, "codeorquestra.mjs");
+  return SOURCE_MODE ? path11.join(RUNTIME_BASE, "src", "cli", "main.ts") : path11.join(RUNTIME_BASE, "codeorquestra.mjs");
 }
 function nodeExecArgv() {
   return SOURCE_MODE ? ["--experimental-strip-types", "--disable-warning=ExperimentalWarning"] : [];
@@ -2930,14 +3079,14 @@ function nodeExecArgv() {
 function dashboardDir() {
   const candidates = [
     readEnv("DASHBOARD_DIR"),
-    SOURCE_MODE ? path10.join(RUNTIME_BASE, "dist", "dashboard") : path10.join(RUNTIME_BASE, "dashboard")
+    SOURCE_MODE ? path11.join(RUNTIME_BASE, "dist", "dashboard") : path11.join(RUNTIME_BASE, "dashboard")
   ].filter((candidate) => Boolean(candidate));
-  for (const candidate of candidates) if (existsSync(path10.join(candidate, "index.html"))) return candidate;
+  for (const candidate of candidates) if (existsSync(path11.join(candidate, "index.html"))) return candidate;
   return null;
 }
 function defaultStateRoot() {
-  const base = process.platform === "win32" ? process.env.LOCALAPPDATA ?? path10.join(os3.homedir(), "AppData", "Local") : path10.join(os3.homedir(), ".local", "state");
-  return path10.join(base, "CodexClaudeLive", "v2");
+  const base = process.platform === "win32" ? process.env.LOCALAPPDATA ?? path11.join(os3.homedir(), "AppData", "Local") : path11.join(os3.homedir(), ".local", "state");
+  return path11.join(base, "CodexClaudeLive", "v2");
 }
 function engineInfo() {
   return { runtimeVersion: RUNTIME_VERSION, productName: BRAND.name };
@@ -2946,11 +3095,11 @@ async function findClaudeLauncher(env = process.env) {
   const override = readEnv("TEST_CLI", env) ?? readEnv("CLAUDE_LAUNCHER", env);
   if (override) return override;
   const names = process.platform === "win32" ? ["claude.ps1", "claude.cmd", "claude.exe", "claude"] : ["claude"];
-  for (const dir of (env.PATH ?? "").split(path10.delimiter).filter(Boolean)) {
+  for (const dir of (env.PATH ?? "").split(path11.delimiter).filter(Boolean)) {
     for (const name of names) {
-      const candidate = path10.join(dir, name);
+      const candidate = path11.join(dir, name);
       try {
-        await fs10.access(candidate);
+        await fs11.access(candidate);
         return candidate;
       } catch {
       }
@@ -3069,12 +3218,12 @@ var QuotaService = class {
 // src/broker/process-tree.ts
 import { spawn as spawn6 } from "node:child_process";
 import { closeSync, openSync, statSync, unlinkSync, utimesSync, writeFileSync, readFileSync as readFileSync2, mkdirSync } from "node:fs";
-import { promises as fs12 } from "node:fs";
-import path11 from "node:path";
+import { promises as fs13 } from "node:fs";
+import path12 from "node:path";
 
 // src/broker/process-identity.ts
 import { spawn as spawn5 } from "node:child_process";
-import { promises as fs11 } from "node:fs";
+import { promises as fs12 } from "node:fs";
 var PROBE_TIMEOUT_MS = 1e4;
 function runCapture(command, args, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -3131,7 +3280,7 @@ async function windowsCreationTime(pid) {
 async function linuxCreationTime(pid) {
   let raw;
   try {
-    raw = await fs11.readFile(`/proc/${pid}/stat`, "utf8");
+    raw = await fs12.readFile(`/proc/${pid}/stat`, "utf8");
   } catch (error) {
     return error.code === "ENOENT" ? "" : null;
   }
@@ -3172,7 +3321,7 @@ function parsePipeTable(text) {
 async function linuxProcessTable() {
   let names;
   try {
-    names = await fs11.readdir("/proc");
+    names = await fs12.readdir("/proc");
   } catch {
     return null;
   }
@@ -3180,7 +3329,7 @@ async function linuxProcessTable() {
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      const raw = await fs11.readFile(`/proc/${name}/stat`, "utf8");
+      const raw = await fs12.readFile(`/proc/${name}/stat`, "utf8");
       const close = raw.lastIndexOf(")");
       if (close < 0) continue;
       const fields = raw.slice(close + 2).split(" ");
@@ -3246,10 +3395,10 @@ async function verifyProcessIdentity(pid, recorded) {
 
 // src/broker/process-tree.ts
 function holdFileFor(runDir) {
-  return path11.join(runDir, "worker.hold");
+  return path12.join(runDir, "worker.hold");
 }
 function identityFileFor(runDir) {
-  return path11.join(runDir, "worker-identity.json");
+  return path12.join(runDir, "worker-identity.json");
 }
 function readWorkerIdentity(runDir) {
   try {
@@ -3323,7 +3472,7 @@ function waitForExit(pid, timeoutMs) {
   });
 }
 function engineFileFor(runDir) {
-  return path11.join(runDir, "engine.json");
+  return path12.join(runDir, "engine.json");
 }
 function readEngineProcess(runDir) {
   try {
@@ -3388,7 +3537,7 @@ async function settleExitedTarget(name, pid, createdAt, abnormal = false) {
 }
 async function reconcileRunProcesses(runDir, workerPid, strictRecovery = false) {
   const targets = [];
-  const holdReleased = await fs12.access(holdFileFor(runDir)).then(() => false, () => true);
+  const holdReleased = await fs13.access(holdFileFor(runDir)).then(() => false, () => true);
   const workerCreatedAt = readWorkerIdentity(runDir)?.createdAt;
   if (workerPid !== null) {
     if (holdReleased) targets.push(await settleExitedTarget("worker", workerPid, workerCreatedAt));
@@ -3467,6 +3616,7 @@ var TaskManager = class {
   stateRoot;
   tasks = /* @__PURE__ */ new Map();
   trustStore;
+  worktreePolicy;
   quota;
   codexUsage;
   locks = /* @__PURE__ */ new Map();
@@ -3488,6 +3638,7 @@ var TaskManager = class {
     this.options = options;
     this.stateRoot = options.stateRoot;
     this.trustStore = new TrustStore(options.stateRoot);
+    this.worktreePolicy = new WorktreePolicyStore(options.stateRoot);
     this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 3e4 });
     this.codexUsage = options.codexUsage ?? (options.harness ? {
       refresh: async () => unavailableCodexUsage("CODEX_USAGE_DISABLED_IN_HARNESS", (/* @__PURE__ */ new Date()).toISOString()),
@@ -3498,15 +3649,15 @@ var TaskManager = class {
     return this.options.supervision ?? SUPERVISION;
   }
   tasksDir() {
-    return path12.join(this.stateRoot, "tasks");
+    return path13.join(this.stateRoot, "tasks");
   }
   locksDir() {
-    return path12.join(this.stateRoot, "locks");
+    return path13.join(this.stateRoot, "locks");
   }
   async start() {
-    await fs13.mkdir(this.tasksDir(), { recursive: true });
+    await fs14.mkdir(this.tasksDir(), { recursive: true });
     this.assertOperational();
-    await fs13.mkdir(this.locksDir(), { recursive: true });
+    await fs14.mkdir(this.locksDir(), { recursive: true });
     this.assertOperational();
     this.launcherPath = await findClaudeLauncher();
     this.assertOperational();
@@ -3570,7 +3721,7 @@ var TaskManager = class {
     this.assertOperational();
     let entries = [];
     try {
-      entries = await fs13.readdir(this.tasksDir());
+      entries = await fs14.readdir(this.tasksDir());
       this.assertOperational();
     } catch {
       entries = [];
@@ -3578,8 +3729,8 @@ var TaskManager = class {
     const opened = [];
     for (const taskId of entries) {
       this.assertOperational();
-      const dir = path12.join(this.tasksDir(), taskId);
-      const record2 = await readJsonShared(path12.join(dir, "task.json"));
+      const dir = path13.join(this.tasksDir(), taskId);
+      const record2 = await readJsonShared(path13.join(dir, "task.json"));
       this.assertOperational();
       if (record2.status !== "ok") continue;
       opened.push(await this.openTask(normalizeRecord(record2.value), dir));
@@ -3597,11 +3748,11 @@ var TaskManager = class {
     }
     for (const task of opened) {
       this.assertOperational();
-      const current = await readJsonShared(path12.join(task.dir, "current-run.json"));
+      const current = await readJsonShared(path13.join(task.dir, "current-run.json"));
       this.assertOperational();
       if (current.status !== "ok") continue;
       if (current.value.status !== "RUNNING" && current.value.status !== "STARTING") continue;
-      const runDir = current.value.runDir || path12.join(task.dir, "runs", current.value.runId);
+      const runDir = current.value.runDir || path13.join(task.dir, "runs", current.value.runId);
       const identity = readWorkerIdentity(runDir);
       const verdict = await verifyWorkerLiveness(runDir, identity);
       this.assertOperational();
@@ -3643,7 +3794,7 @@ var TaskManager = class {
           quarantineNote
         };
         this.locks.set(lock.workspaceKey, lock);
-        await writeFileAtomic(path12.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path13.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
         this.assertOperational();
       }
       await this.writeCurrentRunBestEffort(task, { ...current.value, status: "UNCERTAIN", workerPid: null });
@@ -3653,7 +3804,7 @@ var TaskManager = class {
     }
     let lockFiles = [];
     try {
-      lockFiles = await fs13.readdir(this.locksDir());
+      lockFiles = await fs14.readdir(this.locksDir());
       this.assertOperational();
     } catch {
       lockFiles = [];
@@ -3662,10 +3813,10 @@ var TaskManager = class {
       this.assertOperational();
       const key = file.replace(/\.json$/, "");
       if (this.locks.has(key)) continue;
-      const read = await readJsonShared(path12.join(this.locksDir(), file));
+      const read = await readJsonShared(path13.join(this.locksDir(), file));
       this.assertOperational();
       if (read.status !== "ok") {
-        await fs13.rm(path12.join(this.locksDir(), file), { force: true });
+        await fs14.rm(path13.join(this.locksDir(), file), { force: true });
         this.assertOperational();
         continue;
       }
@@ -3673,17 +3824,17 @@ var TaskManager = class {
         this.locks.set(key, read.value);
         continue;
       }
-      await fs13.rm(path12.join(this.locksDir(), file), { force: true });
+      await fs14.rm(path13.join(this.locksDir(), file), { force: true });
       this.assertOperational();
     }
   }
   async openTask(record2, dir) {
     const existing = this.tasks.get(record2.taskId);
     if (existing) return existing;
-    const log = await EventLog.open(path12.join(dir, "events.jsonl"));
+    const log = await EventLog.open(path13.join(dir, "events.jsonl"));
     const history = await log.readFrom(0);
     const queue = await this.loadQueue(dir);
-    const pointer = await readJsonShared(path12.join(dir, "session.json"));
+    const pointer = await readJsonShared(path13.join(dir, "session.json"));
     const task = {
       record: record2,
       dir,
@@ -3719,14 +3870,14 @@ var TaskManager = class {
     return task;
   }
   async persistRecord(task) {
-    await writeFileAtomic(path12.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
+    await writeFileAtomic(path13.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
   }
   // ------------------------------------------------------------- registration
   async register(threadId, source) {
     if (typeof threadId !== "string" || !THREAD_ID_PATTERN.test(threadId)) throw new HttpError(400, "THREAD_ID_INVALID");
     const taskId = taskIdForThread(threadId);
-    const dir = path12.join(this.tasksDir(), taskId);
-    await fs13.mkdir(dir, { recursive: true });
+    const dir = path13.join(this.tasksDir(), taskId);
+    await fs14.mkdir(dir, { recursive: true });
     const existing = this.tasks.get(taskId) ?? null;
     const { handle, hash } = mintTaskHandle();
     const record2 = existing ? { ...existing.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() } : { taskId, threadId, createdAt: (/* @__PURE__ */ new Date()).toISOString(), handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString(), workspace: null, requiresReview: false, reviewReason: null };
@@ -3785,6 +3936,22 @@ var TaskManager = class {
    * be proven gone: a writer is never restored while a survivor is possible.
    * The decision and its reason are recorded in the task log.
    */
+  /**
+   * What worktrees exist under this state root and which are unaccounted for.
+   *
+   * Ownership is decided here, not in the git module, because only the task
+   * manager knows which tasks are live and which locks are quarantined. A
+   * quarantined worktree is never reported as an orphan: a process of the
+   * previous run may still be able to write there, and the audited release
+   * path — not a sweep — is what ends that.
+   */
+  async worktreeInventory() {
+    const ownedPrefixes = /* @__PURE__ */ new Set();
+    for (const task of this.tasks.values()) ownedPrefixes.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) ownedPrefixes.add(lock.holderTaskId.slice(0, 16));
+    const orphans = await listOrphans(this.stateRoot, (_repoKey, taskPrefix) => ownedPrefixes.has(taskPrefix));
+    return { policies: await this.worktreePolicy.list(), orphans };
+  }
   async releaseQuarantinedLock(workspaceKey, request, source) {
     const lock = this.locks.get(workspaceKey);
     if (!lock) throw new HttpError(404, "LOCK_NOT_FOUND");
@@ -3803,7 +3970,7 @@ var TaskManager = class {
     const historicalAncestryConclusive = false;
     try {
       if (this.options.harness) await new Promise((resolve) => setTimeout(resolve, 50));
-      const runDir = task ? path12.join(task.dir, "runs", lock.holderRunId) : null;
+      const runDir = task ? path13.join(task.dir, "runs", lock.holderRunId) : null;
       check = runDir ? await survivorCheck(runDir, lock.holderPid) : { releasable: false, livePids: [], note: "A execu\xE7\xE3o que det\xE9m a trava n\xE3o p\xF4de ser localizada no estado; a posse n\xE3o \xE9 liberada \xE0s cegas." };
       if (!check.releasable) {
         if (task) await this.append(task, lock.holderRunId, "lock_release_refused", { workspaceKey, source, livePids: check.livePids, note: check.note });
@@ -3821,12 +3988,12 @@ var TaskManager = class {
           ownership: { taskId: lock.holderTaskId, runId: lock.holderRunId }
         });
       }
-      const persisted = await readJsonShared(path12.join(this.locksDir(), `${workspaceKey}.json`));
+      const persisted = await readJsonShared(path13.join(this.locksDir(), `${workspaceKey}.json`));
       const current = this.locks.get(workspaceKey);
       if (current !== lock || persisted.status !== "ok" || persisted.value.holderTaskId !== lock.holderTaskId || persisted.value.holderRunId !== lock.holderRunId || !persisted.value.quarantined) {
         throw new HttpError(409, "LOCK_OWNERSHIP_CHANGED", { note: "A posse mudou durante a auditoria; nada foi liberado." });
       }
-      await fs13.rm(path12.join(this.locksDir(), `${workspaceKey}.json`));
+      await fs14.rm(path13.join(this.locksDir(), `${workspaceKey}.json`));
       this.locks.delete(workspaceKey);
       if (task) await this.append(task, lock.holderRunId, "lock_released", {
         workspaceKey,
@@ -3867,10 +4034,10 @@ var TaskManager = class {
   }
   // ---------------------------------------------------------------- queue
   async loadQueue(dir) {
-    const file = path12.join(dir, "queue.jsonl");
+    const file = path13.join(dir, "queue.jsonl");
     let text;
     try {
-      text = await fs13.readFile(file, "utf8");
+      text = await fs14.readFile(file, "utf8");
     } catch {
       return [];
     }
@@ -3887,7 +4054,7 @@ var TaskManager = class {
   }
   async persistQueue(task) {
     const lines = task.queue.map((entry) => JSON.stringify(entry)).join("\n");
-    await writeFileAtomic(path12.join(task.dir, "queue.jsonl"), lines ? `${lines}
+    await writeFileAtomic(path13.join(task.dir, "queue.jsonl"), lines ? `${lines}
 ` : "");
   }
   queueView(entry) {
@@ -4078,7 +4245,7 @@ var TaskManager = class {
     }
     const runId = `run-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     const runToken = randomUUID();
-    const runDir = path12.join(task.dir, "runs", runId);
+    const runDir = path13.join(task.dir, "runs", runId);
     const run2 = {
       runId,
       runToken,
@@ -4122,8 +4289,8 @@ var TaskManager = class {
     task.workerReady = false;
     task.record.workspace = workspace;
     try {
-      await fs13.mkdir(runDir, { recursive: true });
-      run2.prompt = contract.prompt ?? (contract.promptFile ? await fs13.readFile(contract.promptFile, "utf8") : "");
+      await fs14.mkdir(runDir, { recursive: true });
+      run2.prompt = contract.prompt ?? (contract.promptFile ? await fs14.readFile(contract.promptFile, "utf8") : "");
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
       const { inventory, trust } = await this.inventoryFor(workspace);
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
@@ -4139,7 +4306,7 @@ var TaskManager = class {
       await this.persistRecord(task);
       if (run2.writerLockKey) {
         const lock = this.locks.get(run2.writerLockKey);
-        await writeFileAtomic(path12.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path13.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       try {
         await this.writeCurrentRun(task, { runId, runToken, status: "STARTING", workerPid: null, workerStartedAt: null, startedAt: run2.startedAt, workspace, writerLockKey: run2.writerLockKey, runDir });
@@ -4167,8 +4334,8 @@ var TaskManager = class {
       });
       if (source !== "browser") this.touchCoordinator(task);
       this.changed(task);
-      const approvedAgents = inventory.items.filter((item) => item.kind === "agent").map((item) => path12.basename(item.relativePath, ".md"));
-      const approvedSkills = inventory.items.filter((item) => item.kind === "skill").map((item) => path12.basename(path12.dirname(item.relativePath)));
+      const approvedAgents = inventory.items.filter((item) => item.kind === "agent").map((item) => path13.basename(item.relativePath, ".md"));
+      const approvedSkills = inventory.items.filter((item) => item.kind === "skill").map((item) => path13.basename(path13.dirname(item.relativePath)));
       const preparation = this.prepareAndSpawn(task, run2, launch, approvedAgents, approvedSkills, harness).catch((error) => {
         this.options.log(`task ${task.record.taskId}: prepara\xE7\xE3o falhou inesperadamente (${error.name})`);
         void this.finalize(task, run2, "FAIL", "PREPARATION_CRASH", redactSensitiveText(String(error.message ?? error)).slice(0, 300), 1, "preparation");
@@ -4185,7 +4352,7 @@ var TaskManager = class {
       const lock = this.locks.get(run2.writerLockKey);
       if (lock && lock.holderRunId === run2.runId && !lock.quarantined) {
         this.locks.delete(run2.writerLockKey);
-        await fs13.rm(path12.join(this.locksDir(), `${run2.writerLockKey}.json`), { force: true });
+        await fs14.rm(path13.join(this.locksDir(), `${run2.writerLockKey}.json`), { force: true });
       }
       run2.writerLockKey = null;
     }
@@ -4261,7 +4428,7 @@ var TaskManager = class {
         threadId: task.record.threadId,
         stateRoot: this.stateRoot,
         taskDir: task.dir,
-        runDir: path12.join(task.dir, "runs", run2.runId),
+        runDir: path13.join(task.dir, "runs", run2.runId),
         contract: run2.contract,
         prompt: run2.prompt,
         resumeSessionId: run2.sessionId,
@@ -4280,7 +4447,7 @@ var TaskManager = class {
           ...typeof harness.setModelDelayMs === "number" ? { setModelDelayMs: harness.setModelDelayMs } : {}
         } : null
       };
-      const descriptorFile = path12.join(descriptor.runDir, "worker-descriptor.json");
+      const descriptorFile = path13.join(descriptor.runDir, "worker-descriptor.json");
       await writeFileAtomic(descriptorFile, JSON.stringify(descriptor, null, 2));
       if (this.stopping || task.run !== run2 || run2.finalized) return;
       const child = spawn7(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
@@ -4297,7 +4464,7 @@ var TaskManager = class {
       const lock = run2.writerLockKey ? this.locks.get(run2.writerLockKey) : null;
       if (lock) {
         lock.holderPid = run2.workerPid;
-        await writeFileAtomic(path12.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path13.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       child.stderr?.setEncoding("utf8");
       child.stderr?.on("data", (chunk) => this.options.log(`worker ${run2.workerPid} stderr: ${redactSensitiveText(chunk).trim().slice(0, 500)}`));
@@ -4367,8 +4534,8 @@ var TaskManager = class {
         this.changed(task);
         break;
       case "blob":
-        await fs13.mkdir(path12.join(task.dir, "blobs"), { recursive: true });
-        await writeFileAtomic(path12.join(task.dir, "blobs", `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
+        await fs14.mkdir(path13.join(task.dir, "blobs"), { recursive: true });
+        await writeFileAtomic(path13.join(task.dir, "blobs", `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
         break;
       case "model_result": {
         task.modelTransition?.settle({ ok: message.ok, activeModel: message.activeModel, code: message.code });
@@ -4475,7 +4642,7 @@ var TaskManager = class {
     for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
     task.pending.clear();
     this.changed(task);
-    const runDir = path12.join(task.dir, "runs", run2.runId);
+    const runDir = path13.join(task.dir, "runs", run2.runId);
     const reconciliation = await reconcileRunProcesses(runDir, run2.workerPid, true);
     await this.append(task, run2.runId, "worker_disconnected", {
       workerPid: run2.workerPid,
@@ -4509,7 +4676,7 @@ var TaskManager = class {
     task.currentTool = null;
     for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
     task.pending.clear();
-    const runDir = path12.join(task.dir, "runs", run2.runId);
+    const runDir = path13.join(task.dir, "runs", run2.runId);
     try {
       if (task.worker?.pid) {
         const pid = task.worker.pid;
@@ -4531,7 +4698,7 @@ var TaskManager = class {
       }
       if (run2.sessionId && run2.sessionConfirmed) {
         task.previousSessionId = run2.sessionId;
-        await writeFileAtomic(path12.join(task.dir, "session.json"), JSON.stringify({ sessionId: run2.sessionId, runId: run2.runId, updatedAt: endedAt, resultFile: path12.join(runDir, "resultado.json") }, null, 2));
+        await writeFileAtomic(path13.join(task.dir, "session.json"), JSON.stringify({ sessionId: run2.sessionId, runId: run2.runId, updatedAt: endedAt, resultFile: path13.join(runDir, "resultado.json") }, null, 2));
       }
       await this.writeCurrentRunBestEffort(task, { runId: run2.runId, runToken: run2.runToken, status, workerPid: null, workerStartedAt: run2.workerStartedAt, startedAt: run2.startedAt, workspace: run2.contract.workspace, writerLockKey: null, runDir });
       await this.writeDerivedNow(task, run2.runId, true, { status, code, message, exitCode, endedAt, failureStage });
@@ -4586,11 +4753,11 @@ var TaskManager = class {
     }
     if (clean) {
       this.locks.delete(key);
-      await fs13.rm(path12.join(this.locksDir(), `${key}.json`), { force: true });
+      await fs14.rm(path13.join(this.locksDir(), `${key}.json`), { force: true });
     } else {
       holder.quarantined = true;
       holder.quarantineNote = note;
-      await writeFileAtomic(path12.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      await writeFileAtomic(path13.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
     }
     run2.writerLockKey = null;
   }
@@ -4604,7 +4771,7 @@ var TaskManager = class {
    * than release work against an unrecorded state.
    */
   async writeCurrentRun(task, value) {
-    await writeFileAtomic(path12.join(task.dir, "current-run.json"), JSON.stringify(value, null, 2), { maxWaitMs: 3e3 });
+    await writeFileAtomic(path13.join(task.dir, "current-run.json"), JSON.stringify(value, null, 2), { maxWaitMs: 3e3 });
   }
   /** Same record, on paths that are already finishing and cannot abort. */
   async writeCurrentRunBestEffort(task, value) {
@@ -4638,7 +4805,7 @@ var TaskManager = class {
     }
   }
   async writeDerivedNow(task, runId, final, terminal) {
-    const runDir = path12.join(task.dir, "runs", runId);
+    const runDir = path13.join(task.dir, "runs", runId);
     const writer = task.writer && task.writer.directory === runDir ? task.writer : new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15e3, onTelemetryFailure: (failure) => {
       if (task.run) {
         task.run.telemetryFailures += 1;
@@ -4652,7 +4819,7 @@ var TaskManager = class {
     const status = { ...derived.status, llmUsage, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
     await writer.writeStatus(status);
     try {
-      await writeFileAtomic(path12.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
+      await writeFileAtomic(path13.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
     } catch {
     }
     if (final) {
@@ -4723,7 +4890,7 @@ var TaskManager = class {
       observed = await gitStatus(workspace);
       task.changedFilesCache = { at: Date.now(), observed };
     }
-    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path12.relative(workspace, file).replace(/\\/g, "/")) : [];
+    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path13.relative(workspace, file).replace(/\\/g, "/")) : [];
     return { observed, claudeAuthored: authored, observedAt: new Date(task.changedFilesCache?.at ?? Date.now()).toISOString() };
   }
   view(task) {
@@ -4797,23 +4964,23 @@ var TaskManager = class {
     return [...this.tasks.values()].filter((task) => !scope || task.record.taskId === scope).map((task) => this.view(task));
   }
   async runsOf(task) {
-    const dir = path12.join(task.dir, "runs");
+    const dir = path13.join(task.dir, "runs");
     let entries = [];
     try {
-      entries = await fs13.readdir(dir);
+      entries = await fs14.readdir(dir);
     } catch {
       return [];
     }
     const runs = [];
     for (const runId of entries.sort()) {
-      const status = await readJsonShared(path12.join(dir, runId, "status.json"));
+      const status = await readJsonShared(path13.join(dir, runId, "status.json"));
       runs.push({ runId, status: status.status === "ok" ? status.value.status ?? "UNKNOWN" : "UNKNOWN", startedAt: status.status === "ok" ? status.value.startedAt ?? null : null, endedAt: status.status === "ok" ? status.value.endedAt ?? null : null });
     }
     return runs;
   }
   async blobPage(task, blobId, page) {
     if (!/^blob-[a-f0-9-]{36}$/.test(blobId)) return null;
-    const read = await readJsonShared(path12.join(task.dir, "blobs", `${blobId}.json`));
+    const read = await readJsonShared(path13.join(task.dir, "blobs", `${blobId}.json`));
     if (read.status !== "ok") return null;
     const paged = previewPage(read.value.text, page);
     return { ...paged, truncated: read.value.truncated, totalChars: read.value.totalChars };
@@ -4853,8 +5020,8 @@ function normalizeRecord(record2) {
 // src/broker/singleton.ts
 import { closeSync as closeSync2, openSync as openSync2, readFileSync as readFileSync3, renameSync, statSync as statSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2, mkdirSync as mkdirSync2 } from "node:fs";
 import { spawn as spawn8 } from "node:child_process";
-import { createHash as createHash4 } from "node:crypto";
-import path13 from "node:path";
+import { createHash as createHash5 } from "node:crypto";
+import path14 from "node:path";
 function readOwner(file) {
   try {
     const parsed = JSON.parse(readFileSync3(file, "utf8"));
@@ -4926,9 +5093,9 @@ var SingletonBusyError = class extends Error {
   }
 };
 function acquireFileSingleton(stateRoot) {
-  const dir = path13.join(stateRoot, "broker");
+  const dir = path14.join(stateRoot, "broker");
   mkdirSync2(dir, { recursive: true });
-  const file = path13.join(dir, "broker.lock");
+  const file = path14.join(dir, "broker.lock");
   if (heldByLiveProcess(file)) throw new SingletonBusyError(readOwner(file));
   let descriptor;
   try {
@@ -4957,10 +5124,10 @@ function acquireFileSingleton(stateRoot) {
   };
 }
 async function acquireWindowsMutex(stateRoot) {
-  const dir = path13.join(stateRoot, "broker");
+  const dir = path14.join(stateRoot, "broker");
   mkdirSync2(dir, { recursive: true });
-  const file = path13.join(dir, "broker.lock");
-  const key = createHash4("sha256").update(path13.resolve(stateRoot).toLowerCase()).digest("hex").slice(0, 32);
+  const file = path14.join(dir, "broker.lock");
+  const key = createHash5("sha256").update(path14.resolve(stateRoot).toLowerCase()).digest("hex").slice(0, 32);
   const mutexName = `Local\\CodeOrquestra-${key}`;
   const script = [
     `$m=[Threading.Mutex]::new($false,'${mutexName}')`,
@@ -5084,8 +5251,8 @@ var Broker = class {
   singleton = null;
   constructor(options) {
     this.options = options;
-    this.brokerDir = path14.join(options.stateRoot, "broker");
-    this.logFile = path14.join(this.brokerDir, "broker.log");
+    this.brokerDir = path15.join(options.stateRoot, "broker");
+    this.logFile = path15.join(this.brokerDir, "broker.log");
     this.identity = new IdentityRegistry(this.brokerDir);
     this.assets = new StaticAssets(dashboardDir());
     this.tasks = new TaskManager({
@@ -5105,7 +5272,7 @@ var Broker = class {
     void appendTextSafe(this.logFile, text).catch(() => void 0);
   }
   async start() {
-    await fs14.mkdir(this.brokerDir, { recursive: true });
+    await fs15.mkdir(this.brokerDir, { recursive: true });
     this.singleton = await acquireBrokerSingleton(this.options.stateRoot);
     void this.singleton.lost.then(async () => {
       this.log("broker singleton ownership was lost; shutting down to prevent a second owner");
@@ -5134,7 +5301,7 @@ var Broker = class {
     this.baseUrl = `http://127.0.0.1:${this.port}`;
     const bootstrapUrl = `${this.baseUrl}/bootstrap?token=${this.identity.mintBootstrapToken(null)}`;
     const announcement = { event: "broker_listening", address: "127.0.0.1", port: this.port, baseUrl: this.baseUrl, bootstrapUrl, secretFile: this.identity.secretPath, stateRoot: this.options.stateRoot, pid: process.pid, cursorEpoch: this.cursorEpoch };
-    await writeFileAtomic(path14.join(this.brokerDir, "broker.json"), JSON.stringify({ pid: process.pid, port: this.port, baseUrl: this.baseUrl, startedAt: this.startedAt, secretFile: this.identity.secretPath, version: RUNTIME_VERSION, product: BRAND.name }, null, 2));
+    await writeFileAtomic(path15.join(this.brokerDir, "broker.json"), JSON.stringify({ pid: process.pid, port: this.port, baseUrl: this.baseUrl, startedAt: this.startedAt, secretFile: this.identity.secretPath, version: RUNTIME_VERSION, product: BRAND.name }, null, 2));
     this.log(`broker listening on ${this.baseUrl} (pid ${process.pid}, painel ${this.assets.dir ? "compilado" : "n\xE3o compilado"})`);
     return announcement;
   }
@@ -5146,7 +5313,7 @@ var Broker = class {
     await this.tasks.stop();
     if (this.server) await new Promise((resolve) => this.server.close(() => resolve()));
     try {
-      await fs14.rm(path14.join(this.brokerDir, "broker.json"), { force: true });
+      await fs15.rm(path15.join(this.brokerDir, "broker.json"), { force: true });
     } catch {
     }
     await this.singleton?.release();
@@ -5262,6 +5429,27 @@ var Broker = class {
     if (parts[1] === "locks" && method === "GET") {
       this.requireAdministrative(identity);
       return sendJson(res, 200, [...this.tasks.locks.values()].map((lock) => ({ workspaceKey: lock.workspaceKey, workspace: lock.workspace, holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, holderPid: lock.holderPid, acquiredAt: lock.acquiredAt, quarantined: lock.quarantined, ...lock.quarantineNote ? { note: lock.quarantineNote } : {} })));
+    }
+    if (parts[1] === "repos" && parts[2] === "worktree-policy" && method === "POST") {
+      this.requireAdministrative(identity);
+      const workspace = typeof body.repo === "string" ? body.repo : typeof body.workspace === "string" ? body.workspace : "";
+      if (!workspace) throw new HttpError(400, "WORKSPACE_REQUIRED", { message: 'Informe o caminho do reposit\xF3rio em "repo".' });
+      const repository = await resolveRepository(workspace);
+      const record2 = await this.tasks.worktreePolicy.enrol({
+        repoKey: repository.repoKey,
+        canonicalWorkspace: repository.topLevel,
+        enabledBy: "local-secret",
+        note: typeof body.note === "string" ? body.note : "",
+        maxParallelRuns: body.maxParallelRuns,
+        maxRetainedWorktrees: body.maxRetainedWorktrees,
+        worktreeRoot: body.worktreeRoot
+      });
+      this.log(`worktrees habilitados para ${repository.topLevel} (repoKey ${repository.repoKey})`);
+      return sendJson(res, 200, record2);
+    }
+    if (parts[1] === "worktrees" && method === "GET") {
+      this.requireAdministrative(identity);
+      return sendJson(res, 200, await this.tasks.worktreeInventory());
     }
     if (parts[1] === "quota" && method === "GET") {
       return sendJson(res, 200, this.tasks.quota.view("claude-fable-5-1"));
@@ -5419,13 +5607,13 @@ var Broker = class {
 
 // src/broker/client.ts
 import { spawn as spawn9 } from "node:child_process";
-import { promises as fs15 } from "node:fs";
-import path15 from "node:path";
+import { promises as fs16 } from "node:fs";
+import path16 from "node:path";
 async function readBrokerInfo(stateRoot) {
-  const read = await readJsonShared(path15.join(stateRoot, "broker", "broker.json"));
+  const read = await readJsonShared(path16.join(stateRoot, "broker", "broker.json"));
   if (read.status !== "ok") return null;
   try {
-    const secret = (await fs15.readFile(read.value.secretFile, "utf8")).trim();
+    const secret = (await fs16.readFile(read.value.secretFile, "utf8")).trim();
     const response = await fetch(`${read.value.baseUrl}/api/health`, { headers: { authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(3e3) });
     if (!response.ok) return null;
     const health = await response.json();
@@ -5437,7 +5625,7 @@ async function readBrokerInfo(stateRoot) {
 }
 async function ensureBroker(stateRoot) {
   const existing = await readBrokerInfo(stateRoot);
-  if (existing) return { baseUrl: existing.baseUrl, secret: (await fs15.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
+  if (existing) return { baseUrl: existing.baseUrl, secret: (await fs16.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
   const child = spawn9(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
     detached: true,
     stdio: "ignore",
@@ -5448,7 +5636,7 @@ async function ensureBroker(stateRoot) {
   const deadline = Date.now() + 2e4;
   while (Date.now() < deadline) {
     const info = await readBrokerInfo(stateRoot);
-    if (info) return { baseUrl: info.baseUrl, secret: (await fs15.readFile(info.secretFile, "utf8")).trim(), pid: info.pid, started: true };
+    if (info) return { baseUrl: info.baseUrl, secret: (await fs16.readFile(info.secretFile, "utf8")).trim(), pid: info.pid, started: true };
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error("O broker n\xE3o iniciou a tempo.");
@@ -5500,6 +5688,8 @@ function usage() {
     "  task register [--state-root <dir>] [--thread-id <id>]               registra a tarefa Codex atual e imprime o handle",
     "  task review [--task-handle <h>] [--note <texto>]                    confirma a revis\xE3o de uma execu\xE7\xE3o incerta",
     "  dashboard [--state-root <dir>] [--task-handle <h>]                  imprime um link de uso \xFAnico para o painel",
+    "  worktree enable --repo <dir> --note <motivo>                        habilita worktrees paralelos neste reposit\xF3rio",
+    "  worktree list                                                       lista reposit\xF3rios habilitados e worktrees \xF3rf\xE3os",
     "  start --job <job.json> --task-handle <h> [--state-root <dir>]       inicia uma execu\xE7\xE3o v2 na tarefa",
     "  doctor [--json]                                                     verifica o Claude Code instalado sem autenticar",
     "  --version"
@@ -5562,7 +5752,7 @@ async function main(argv = process.argv.slice(2)) {
 `);
     return 0;
   }
-  const stateRoot = typeof flags["state-root"] === "string" ? path16.resolve(flags["state-root"]) : defaultStateRoot();
+  const stateRoot = typeof flags["state-root"] === "string" ? path17.resolve(flags["state-root"]) : defaultStateRoot();
   const [command, sub] = positional;
   if (command === "broker" && sub === "start") {
     const supervision = parseSupervision();
@@ -5640,6 +5830,27 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
 `);
     return result.status === 200 ? 0 : 1;
   }
+  if (command === "worktree" && sub === "enable") {
+    const repo = typeof flags.repo === "string" ? flags.repo : process.cwd();
+    if (typeof flags.note !== "string" || !flags.note.trim()) {
+      process.stderr.write("Use: worktree enable --repo <caminho> --note <motivo>\nA nota fica registrada junto com a permiss\xE3o; permiss\xE3o sem motivo vale menos que nenhum registro.\n");
+      return 2;
+    }
+    const payload = { repo, note: flags.note };
+    if (typeof flags["max-parallel"] === "string") payload.maxParallelRuns = Number(flags["max-parallel"]);
+    if (typeof flags["max-retained"] === "string") payload.maxRetainedWorktrees = Number(flags["max-retained"]);
+    if (typeof flags["worktree-root"] === "string") payload.worktreeRoot = flags["worktree-root"];
+    const result = await api(stateRoot, "POST", "/api/repos/worktree-policy", payload);
+    process.stdout.write(`${JSON.stringify(result.body, null, 2)}
+`);
+    return result.status === 200 ? 0 : 1;
+  }
+  if (command === "worktree" && sub === "list") {
+    const result = await api(stateRoot, "GET", "/api/worktrees");
+    process.stdout.write(`${JSON.stringify(result.body, null, 2)}
+`);
+    return result.status === 200 ? 0 : 1;
+  }
   if (command === "dashboard") {
     const result = await api(stateRoot, "POST", "/api/dashboard-url", typeof flags["task-handle"] === "string" ? { taskHandle: flags["task-handle"] } : {});
     process.stdout.write(`${JSON.stringify(result.body, null, 2)}
@@ -5651,7 +5862,7 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
       process.stderr.write("Use: start --job <job.json> --task-handle <handle>\n");
       return 2;
     }
-    const job = JSON.parse(await fs16.readFile(flags.job, "utf8"));
+    const job = JSON.parse(await fs17.readFile(flags.job, "utf8"));
     const bound = await api(stateRoot, "POST", "/api/tasks/by-handle", { taskHandle: flags["task-handle"] });
     if (bound.status !== 200) {
       process.stdout.write(`${JSON.stringify(bound.body)}
@@ -5669,7 +5880,7 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
 `);
   return command ? 2 : 0;
 }
-var isEntry = process.argv[1] ? pathToFileURL(path16.resolve(process.argv[1])).href === import.meta.url : false;
+var isEntry = process.argv[1] ? pathToFileURL(path17.resolve(process.argv[1])).href === import.meta.url : false;
 if (isEntry) {
   main().then((code) => {
     if (code !== 0) process.exitCode = code;

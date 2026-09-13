@@ -14,6 +14,7 @@ import { SseHub } from './sse-hub.ts';
 import { TaskManager, type TaskState } from './task-manager.ts';
 import { dashboardDir } from './runtime-paths.ts';
 import { acquireBrokerSingleton, type SingletonLock } from './singleton.ts';
+import { resolveRepository } from './worktree.ts';
 import type { SupervisionThresholds } from '../worker/supervision.ts';
 
 export interface BrokerOptions {
@@ -254,6 +255,31 @@ export class Broker {
     if (parts[1] === 'locks' && method === 'GET') {
       this.requireAdministrative(identity);
       return sendJson(res, 200, [...this.tasks.locks.values()].map((lock) => ({ workspaceKey: lock.workspaceKey, workspace: lock.workspace, holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, holderPid: lock.holderPid, acquiredAt: lock.acquiredAt, quarantined: lock.quarantined, ...(lock.quarantineNote ? { note: lock.quarantineNote } : {}) })));
+    }
+    if (parts[1] === 'repos' && parts[2] === 'worktree-policy' && method === 'POST') {
+      // Enrolling a repository writes .git/worktrees/<n>, creates a lasting
+      // branch ref and materializes a second checkout. That is a persistent
+      // mutation of the user's repository, so it is a local administrative act
+      // — never something a task can grant itself, and never the browser.
+      this.requireAdministrative(identity);
+      const workspace = typeof body.repo === 'string' ? body.repo : typeof body.workspace === 'string' ? body.workspace : '';
+      if (!workspace) throw new HttpError(400, 'WORKSPACE_REQUIRED', { message: 'Informe o caminho do repositório em "repo".' });
+      const repository = await resolveRepository(workspace);
+      const record = await this.tasks.worktreePolicy.enrol({
+        repoKey: repository.repoKey,
+        canonicalWorkspace: repository.topLevel,
+        enabledBy: 'local-secret',
+        note: typeof body.note === 'string' ? body.note : '',
+        maxParallelRuns: body.maxParallelRuns,
+        maxRetainedWorktrees: body.maxRetainedWorktrees,
+        worktreeRoot: body.worktreeRoot,
+      });
+      this.log(`worktrees habilitados para ${repository.topLevel} (repoKey ${repository.repoKey})`);
+      return sendJson(res, 200, record);
+    }
+    if (parts[1] === 'worktrees' && method === 'GET') {
+      this.requireAdministrative(identity);
+      return sendJson(res, 200, await this.tasks.worktreeInventory());
     }
     if (parts[1] === 'quota' && method === 'GET') {
       return sendJson(res, 200, this.tasks.quota.view('claude-fable-5-1'));

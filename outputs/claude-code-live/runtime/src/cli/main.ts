@@ -55,6 +55,8 @@ function usage(): string {
     '  task register [--state-root <dir>] [--thread-id <id>]               registra a tarefa Codex atual e imprime o handle',
     '  task review [--task-handle <h>] [--note <texto>]                    confirma a revisão de uma execução incerta',
     '  dashboard [--state-root <dir>] [--task-handle <h>]                  imprime um link de uso único para o painel',
+    '  worktree enable --repo <dir> --note <motivo>                        habilita worktrees paralelos neste repositório',
+    '  worktree list                                                       lista repositórios habilitados e worktrees órfãos',
     '  start --job <job.json> --task-handle <h> [--state-root <dir>]       inicia uma execução v2 na tarefa',
     '  doctor [--json]                                                     verifica o Claude Code instalado sem autenticar',
     '  --version',
@@ -182,6 +184,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     const { taskId } = bound.body as { taskId: string };
     const result = await api(stateRoot, 'POST', `/api/tasks/${taskId}/acknowledge-review`, { taskHandle: flags['task-handle'], note: typeof flags.note === 'string' ? flags.note : null });
+    process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
+    return result.status === 200 ? 0 : 1;
+  }
+  if (command === 'worktree' && sub === 'enable') {
+    // Enrolling a repository is a local, explained decision by the user, not
+    // something a task can grant itself: creating a worktree writes into the
+    // repository's shared admin directory and leaves a lasting branch ref.
+    const repo = typeof flags.repo === 'string' ? flags.repo : process.cwd();
+    if (typeof flags.note !== 'string' || !flags.note.trim()) {
+      process.stderr.write('Use: worktree enable --repo <caminho> --note <motivo>\nA nota fica registrada junto com a permissão; permissão sem motivo vale menos que nenhum registro.\n');
+      return 2;
+    }
+    const payload: Record<string, unknown> = { repo, note: flags.note };
+    if (typeof flags['max-parallel'] === 'string') payload.maxParallelRuns = Number(flags['max-parallel']);
+    if (typeof flags['max-retained'] === 'string') payload.maxRetainedWorktrees = Number(flags['max-retained']);
+    if (typeof flags['worktree-root'] === 'string') payload.worktreeRoot = flags['worktree-root'];
+    const result = await api(stateRoot, 'POST', '/api/repos/worktree-policy', payload);
+    process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
+    return result.status === 200 ? 0 : 1;
+  }
+  if (command === 'worktree' && sub === 'list') {
+    const result = await api(stateRoot, 'GET', '/api/worktrees');
     process.stdout.write(`${JSON.stringify(result.body, null, 2)}\n`);
     return result.status === 200 ? 0 : 1;
   }

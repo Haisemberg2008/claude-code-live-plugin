@@ -279,6 +279,10 @@ describe('action protection', () => {
       ['/api/broker/shutdown', '{}'],
       ['/api/tasks/register', JSON.stringify({ codexThreadId: 'thread-x', source: 'browser' })],
       ['/api/dashboard-url', '{}'],
+      // Enrolling a repository for worktrees writes into its shared admin
+      // directory and leaves a lasting branch ref: a local decision, never
+      // something a panel session can grant.
+      ['/api/repos/worktree-policy', JSON.stringify({ repo: 'C:/qualquer', note: 'tentativa pelo navegador' })],
     ];
     for (const [route, payload] of administrative) {
       const response = await broker.api(route, { method: 'POST', headers: broker.browserActionHeaders(), body: payload });
@@ -293,6 +297,12 @@ describe('action protection', () => {
     const adminLocks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
     assert.equal(adminLocks.status, 200, adminLocks.text);
     assert.deepEqual(adminLocks.body, []);
+    const browserWorktrees = await broker.api('/api/worktrees', { headers: broker.browserHeaders() });
+    assert.equal(browserWorktrees.status, 403);
+    assert.deepEqual(browserWorktrees.body, { error: 'LOCAL_ADMIN_REQUIRED' });
+    const adminWorktrees = await broker.api('/api/worktrees', { headers: broker.bearerHeaders() });
+    assert.equal(adminWorktrees.status, 200, adminWorktrees.text);
+    assert.deepEqual(adminWorktrees.body, { policies: [], orphans: [] }, 'sem repositorio habilitado, o inventario e vazio e nao um erro');
   });
 
   test('the MCP label is refused for administrative routes as defence in depth', async () => {

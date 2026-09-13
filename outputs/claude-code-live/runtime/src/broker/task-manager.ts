@@ -23,7 +23,8 @@ import { resolvePreflight, type PreflightResult, type ProbeResult, type Resolved
 import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
 import { inventoryCustomizations, type Inventory } from '../trust/inventory.ts';
 import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
-import { gitStatus } from './worktree.ts';
+import { gitStatus, listOrphans } from './worktree.ts';
+import { WorktreePolicyStore, type WorktreePolicyRecord } from './worktree-policy.ts';
 import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
@@ -170,6 +171,7 @@ export class TaskManager {
   readonly stateRoot: string;
   readonly tasks = new Map<string, TaskState>();
   readonly trustStore: TrustStore;
+  readonly worktreePolicy: WorktreePolicyStore;
   readonly quota: QuotaService;
   readonly codexUsage: CodexUsageReader;
   readonly locks = new Map<string, LockRecord>();
@@ -193,6 +195,7 @@ export class TaskManager {
     this.options = options;
     this.stateRoot = options.stateRoot;
     this.trustStore = new TrustStore(options.stateRoot);
+    this.worktreePolicy = new WorktreePolicyStore(options.stateRoot);
     this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 30000 });
     this.codexUsage = options.codexUsage ?? (options.harness ? {
       refresh: async () => unavailableCodexUsage('CODEX_USAGE_DISABLED_IN_HARNESS', new Date().toISOString()),
@@ -516,6 +519,23 @@ export class TaskManager {
    * be proven gone: a writer is never restored while a survivor is possible.
    * The decision and its reason are recorded in the task log.
    */
+  /**
+   * What worktrees exist under this state root and which are unaccounted for.
+   *
+   * Ownership is decided here, not in the git module, because only the task
+   * manager knows which tasks are live and which locks are quarantined. A
+   * quarantined worktree is never reported as an orphan: a process of the
+   * previous run may still be able to write there, and the audited release
+   * path — not a sweep — is what ends that.
+   */
+  async worktreeInventory(): Promise<{ policies: WorktreePolicyRecord[]; orphans: Array<{ path: string; repoKey: string; taskId: string; dirtyFiles: string[] }> }> {
+    const ownedPrefixes = new Set<string>();
+    for (const task of this.tasks.values()) ownedPrefixes.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) ownedPrefixes.add(lock.holderTaskId.slice(0, 16));
+    const orphans = await listOrphans(this.stateRoot, (_repoKey, taskPrefix) => ownedPrefixes.has(taskPrefix));
+    return { policies: await this.worktreePolicy.list(), orphans };
+  }
+
   async releaseQuarantinedLock(workspaceKey: string, request: { note: string | null; confirmHistoricalRisk: boolean; expectedTaskId: string | null; expectedRunId: string | null }, source: ActionSource): Promise<{ released: boolean; workspaceKey: string; livePids: number[]; note: string; historicalAncestryConclusive: boolean }> {
     const lock = this.locks.get(workspaceKey);
     if (!lock) throw new HttpError(404, 'LOCK_NOT_FOUND');
