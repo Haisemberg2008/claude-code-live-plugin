@@ -21,9 +21,9 @@ import { redactSensitiveText } from '../events/redaction.ts';
 import { probeCli } from '../preflight/cli-probe.ts';
 import { resolvePreflight, type PreflightResult, type ProbeResult, type ResolvedExecutable } from '../preflight/cli-resolver.ts';
 import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
-import { inventoryCustomizations, type Inventory } from '../trust/inventory.ts';
+import { inventoryCustomizations, canonicalizeWorkspace, type Inventory } from '../trust/inventory.ts';
 import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
-import { gitStatus, listOrphans } from './worktree.ts';
+import { gitStatus, listOrphans, resolveRepository, worktreePathFor, ensureWorktree, removeWorktree, withRepositoryMutex, assertUsablePathLength, canonicalize, canonicalizePlanned, type Repository } from './worktree.ts';
 import { WorktreePolicyStore, type WorktreePolicyRecord } from './worktree-policy.ts';
 import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
@@ -54,6 +54,15 @@ interface QueueEntry extends QueueEntryView {
   text: string;
 }
 
+/** What a run needed to provision before it could start. */
+interface WorktreePlan {
+  repository: Repository;
+  policy: WorktreePolicyRecord;
+  path: string;
+  branch: string;
+  baseRef: string | null;
+}
+
 interface RunState {
   runId: string;
   runToken: string;
@@ -61,6 +70,13 @@ interface RunState {
   startedAt: string;
   endedAt: string | null;
   contract: JobContract;
+  /**
+   * The workspace the job declared, kept for the audit trail when the run
+   * actually executes somewhere else. `contract.workspace` is always the
+   * directory the CLI really runs in.
+   */
+  declaredWorkspace: string | null;
+  worktree: WorktreePlan | null;
   prompt: string;
   sessionConfirmed: boolean;
   requestedModel: string;
@@ -835,13 +851,6 @@ export class TaskManager {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, 'LEGACY_CONTRACT_USE_LEGACY_RUNNER', { message: 'Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2.' });
-    // The contract accepts and validates a worktree target before the broker can
-    // provision one. Refusing here, rather than silently running in the declared
-    // checkout, keeps the job's meaning honest: a caller that asked for an
-    // isolated tree never gets the shared one without being told.
-    if (contract.execution.mode === 'worktree') {
-      throw new HttpError(501, 'WORKTREE_NOT_IMPLEMENTED', { message: 'execution.mode "worktree" já é validado pelo contrato, mas o provisionamento ainda não existe neste broker. Use "checkout".' });
-    }
     // Admission stops the moment shutdown begins, before any reservation.
     if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker está encerrando; nenhuma execução nova é aceita.' });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
@@ -856,7 +865,16 @@ export class TaskManager {
     } catch {
       throw new HttpError(400, 'WORKSPACE_NOT_FOUND');
     }
-    const workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    // Everything a worktree run needs is resolved HERE, before the critical
+    // section, because the section itself must stay free of awaits: the writer
+    // lock has to be reserved atomically. The path is a pure function of
+    // (repository, task), so the key is computable without touching the disk.
+    let worktreePlan: WorktreePlan | null = null;
+    let workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    if (contract.execution.mode === 'worktree') {
+      worktreePlan = await this.planWorktree(task, contract, workspace);
+      workspaceKey = sha256(canonicalizePlanned(worktreePlan.path)).slice(0, 24);
+    }
 
     // --- synchronous critical section: no await until the reservation exists.
     if (task.run && !task.run.finalized) throw new HttpError(409, 'RUN_IN_PROGRESS', { runId: task.run.runId });
@@ -900,6 +918,8 @@ export class TaskManager {
       turns: 0,
       resumeMode: task.previousSessionId ? 'automatic' : 'new',
       simulated: false,
+      declaredWorkspace: worktreePlan ? workspace : null,
+      worktree: worktreePlan,
       writerLockKey: contract.capabilities.edit ? workspaceKey : null,
       finalized: false,
       finalizing: false,
@@ -910,7 +930,11 @@ export class TaskManager {
     };
     task.run = run;
     if (contract.capabilities.edit) {
-      this.locks.set(workspaceKey, { workspaceKey, workspace: canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run.startedAt, quarantined: false });
+      // The lock is over the WORKING TREE the run writes to, not over the
+      // repository. Two tasks in separate worktrees hold different locks and
+      // legitimately run at once; what still serializes is the shared .git,
+      // under the repository mutex.
+      this.locks.set(workspaceKey, { workspaceKey, workspace: worktreePlan ? canonicalizePlanned(worktreePlan.path) : canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run.startedAt, quarantined: false });
     }
     task.uncertain = false;
     task.disconnected = false;
@@ -926,8 +950,38 @@ export class TaskManager {
       await fs.mkdir(runDir, { recursive: true });
       run.prompt = contract.prompt ?? (contract.promptFile ? await fs.readFile(contract.promptFile, 'utf8') : '');
       if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante a preparação; nenhum worker será criado.' });
-      const { inventory, trust } = await this.inventoryFor(workspace);
+      // Provisioning happens BEFORE the inventory, never after. Trust has to be
+      // evaluated against the directory the CLI will actually run in; inverting
+      // this would approve the parent checkout and then launch somewhere whose
+      // customizations nobody inventoried.
+      let effectiveWorkspace = workspace;
+      if (worktreePlan) {
+        effectiveWorkspace = await this.provisionWorktree(task, run, worktreePlan);
+        if (this.stopping || task.run !== run) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante o provisionamento; nenhum worker será criado.' });
+      }
+      const { inventory, trust: initialTrust } = await this.inventoryFor(effectiveWorkspace);
+      let trust = initialTrust;
       if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante a preparação; nenhum worker será criado.' });
+      if (!trust.trusted && worktreePlan) {
+        // A worktree is a new canonical path, so it has no approval of its own
+        // and the first parallel run would die with WORKSPACE_NOT_TRUSTED —
+        // pushing the user to approve blind. Derivation reuses the parent's
+        // approval and only when every item matches by hash; it never mints one.
+        // The parent key must be spelled exactly as the trust record was
+        // written, so it comes from the inventory's own canonicalization rather
+        // than from the lock-key spelling used above.
+        const derived = await this.trustStore.deriveFromParent({ child: inventory, parentCanonicalWorkspace: canonicalizeWorkspace(workspace) });
+        if (derived) {
+          trust = await this.trustStore.check(inventory);
+          await this.append(task, runId, 'trust_derived', {
+            workspace: inventory.canonicalWorkspace,
+            from: canonicalWorkspace,
+            approvalRevision: derived.approvalRevision,
+            items: derived.approvedItems.length,
+            note: 'Aprovação herdada do checkout de origem: todo item bate por hash. Nenhum recurso novo foi autorizado.',
+          });
+        }
+      }
       if (!trust.trusted) {
         throw new HttpError(409, 'WORKSPACE_NOT_TRUSTED', { reason: trust.reason, pending: trust.pending, changed: trust.changed, fingerprint: inventory.fingerprint, incomplete: inventory.incomplete });
       }
@@ -942,7 +996,7 @@ export class TaskManager {
       // Ownership must be recorded before anything else happens; a failure here
       // aborts the launch and releases the reservation.
       try {
-        await this.writeCurrentRun(task, { runId, runToken, status: 'STARTING', workerPid: null, workerStartedAt: null, startedAt: run.startedAt, workspace, writerLockKey: run.writerLockKey, runDir });
+        await this.writeCurrentRun(task, { runId, runToken, status: 'STARTING', workerPid: null, workerStartedAt: null, startedAt: run.startedAt, workspace: effectiveWorkspace, writerLockKey: run.writerLockKey, runDir });
       } catch (error) {
         throw new HttpError(503, 'OWNERSHIP_RECORD_FAILED', {
           code: (error as { code?: string }).code ?? 'WRITE_FAILED',
@@ -954,7 +1008,8 @@ export class TaskManager {
         requestedModel: run.requestedModel,
         modelReason: run.modelReason,
         effort: contract.effort,
-        workspace,
+        workspace: effectiveWorkspace,
+        ...(worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: 'broker', policyEnabledAt: worktreePlan.policy.enabledAt } } : {}),
         profile: contract.profile,
         contractVersion: contract.version,
         coordination: contract.coordination,
@@ -982,6 +1037,106 @@ export class TaskManager {
       await this.releaseReservation(task, run);
       throw error;
     }
+  }
+
+  /**
+   * Decides where a worktree run will live, and whether it may start at all.
+   *
+   * Everything here is a lookup or a policy check: no directory is created, so
+   * a refusal leaves nothing behind. Runs before the critical section, because
+   * the section cannot await.
+   */
+  private async planWorktree(task: TaskState, contract: JobContract, declaredWorkspace: string): Promise<WorktreePlan> {
+    let repository: Repository;
+    let policy: WorktreePolicyRecord;
+    try {
+      repository = await resolveRepository(declaredWorkspace);
+      policy = await this.worktreePolicy.require(repository.repoKey);
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'WORKTREE_UNAVAILABLE';
+      throw new HttpError(code === 'WORKTREE_POLICY_REQUIRED' ? 403 : 400, code, { message: (error as Error).message });
+    }
+    // N sessions share one account, and observation is serialized while
+    // consumption is not. Without this cap, parallelism would quietly burn a
+    // week of quota with no visible decision anywhere.
+    const active = [...this.tasks.values()].filter((other) =>
+      other.record.taskId !== task.record.taskId
+      && other.run
+      && !other.run.finalized
+      && other.run.worktree?.repository.repoKey === repository.repoKey);
+    if (active.length >= policy.maxParallelRuns) {
+      throw new HttpError(429, 'FLEET_CAPACITY_REACHED', {
+        limit: policy.maxParallelRuns,
+        holders: active.map((other) => ({ taskId: other.record.taskId, threadId: other.record.threadId, runId: other.run?.runId ?? null })),
+        message: `Já existem ${active.length} execução(ões) em worktree neste repositório, o limite aprovado. Aguarde uma terminar ou ajuste maxParallelRuns na política.`,
+      });
+    }
+    const root = policy.worktreeRoot ?? this.stateRoot;
+    const location = worktreePathFor(root, repository.repoKey, task.record.taskId);
+    try {
+      assertUsablePathLength(location.path);
+    } catch (error) {
+      throw new HttpError(400, (error as { code?: string }).code ?? 'WORKTREE_PATH_TOO_LONG', { message: (error as Error).message });
+    }
+    // Uncommitted work is never deleted, so retention is what fills a disk.
+    // Refusing with a number beats discovering it when the volume is full.
+    const retained = await listOrphans(root, () => false);
+    const mine = retained.filter((entry) => entry.repoKey === repository.repoKey && canonicalize(entry.path) !== canonicalizePlanned(location.path));
+    if (mine.length >= policy.maxRetainedWorktrees) {
+      throw new HttpError(409, 'WORKTREE_RETENTION_LIMIT', {
+        limit: policy.maxRetainedWorktrees,
+        retained: mine.map((entry) => ({ path: entry.path, dirtyFiles: entry.dirtyFiles.length })),
+        message: `Há ${mine.length} worktree(s) retido(s) deste repositório, o limite aprovado. Revise e remova os concluídos com "codeorquestra worktree list".`,
+      });
+    }
+    return {
+      repository,
+      policy,
+      path: location.path,
+      branch: contract.execution.worktree?.branch ?? `codeorquestra/${task.record.taskId.slice(0, 16)}`,
+      baseRef: contract.execution.worktree?.baseRef ?? null,
+    };
+  }
+
+  /**
+   * Creates the run's worktree and makes it the effective workspace.
+   *
+   * The single substitution of `contract.workspace` is what carries the change
+   * everywhere else: the spawn cwd, the worker descriptor, the action context's
+   * containment checks, the inventory and the changed-file list all read it.
+   */
+  private async provisionWorktree(task: TaskState, run: RunState, plan: WorktreePlan): Promise<string> {
+    let outcome;
+    try {
+      outcome = await withRepositoryMutex(plan.repository.repoKey, () => ensureWorktree({
+        repository: plan.repository,
+        target: plan.path,
+        branch: plan.branch,
+        baseRef: plan.baseRef,
+      }));
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'WORKTREE_ADD_FAILED';
+      throw new HttpError(code === 'WORKTREE_DIRTY_FROM_PREVIOUS_RUN' ? 409 : 500, code, {
+        message: (error as Error).message,
+        ...((error as { detail?: string }).detail ? { detail: (error as { detail?: string }).detail } : {}),
+      });
+    }
+    run.contract = { ...run.contract, workspace: outcome.path };
+    // The record is what the panel and the ownership file report, so it names
+    // the directory the CLI really runs in. The declared one is not lost: it
+    // stays on the run and in run_started, for the audit trail.
+    task.record.workspace = outcome.path;
+    await this.append(task, run.runId, 'worktree_provisioned', {
+      path: outcome.path,
+      branch: outcome.branch,
+      baseRef: outcome.baseRef,
+      created: outcome.created,
+      repoKey: plan.repository.repoKey,
+      declaredWorkspace: run.declaredWorkspace,
+      provisionedBy: 'broker',
+      note: 'O Claude nunca cria worktrees; a política do repositório foi aprovada pelo usuário e o broker executou.',
+    });
+    return outcome.path;
   }
 
   private async releaseReservation(task: TaskState, run: RunState): Promise<void> {
@@ -1417,12 +1572,52 @@ export class TaskManager {
     if (clean) {
       this.locks.delete(key);
       await fs.rm(path.join(this.locksDir(), `${key}.json`), { force: true });
+      // Only a clean release may touch the worktree. A quarantined lock means a
+      // process of this run may still be able to write there, so the directory
+      // stays until the audited release path says otherwise.
+      if (run.worktree) await this.settleWorktree(task, run, run.worktree);
     } else {
       holder.quarantined = true;
       holder.quarantineNote = note;
       await writeFileAtomic(path.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      if (run.worktree) {
+        await this.append(task, run.runId, 'worktree_retained', {
+          path: run.worktree.path,
+          reason: 'quarantine',
+          note: 'A trava do worktree ficou em quarentena; o diretório é preservado e não será reutilizado até a liberação explícita.',
+        });
+      }
     }
     run.writerLockKey = null;
+  }
+
+  /**
+   * Decides what happens to a worktree once its run released the lock cleanly.
+   *
+   * Uncommitted work is NEVER deleted. `commit` can never belong to Claude, so
+   * the normal end state of a successful run is exactly that: work sitting in
+   * the tree, waiting for the coordinator. Deleting it would destroy the
+   * deliverable, so a dirty tree is retained and reported, and only a tree git
+   * itself agrees is clean is removed.
+   */
+  private async settleWorktree(task: TaskState, run: RunState, plan: WorktreePlan): Promise<void> {
+    const dirty = await gitStatus(plan.path);
+    if (dirty.length > 0) {
+      await this.append(task, run.runId, 'worktree_retained', {
+        path: plan.path,
+        branch: plan.branch,
+        reason: 'uncommitted_work',
+        files: dirty.slice(0, 50),
+        note: 'Trabalho não commitado preservado: commit nunca pertence ao Claude, então este é o estado normal de uma execução bem-sucedida. Commite a partir deste caminho ou remova o worktree explicitamente.',
+      });
+      return;
+    }
+    const removal = await withRepositoryMutex(plan.repository.repoKey, () => removeWorktree(plan.repository, plan.path));
+    await this.append(task, run.runId, removal.removed ? 'worktree_removed' : 'worktree_retained', {
+      path: plan.path,
+      branch: plan.branch,
+      ...(removal.removed ? {} : { reason: 'git_refused', detail: removal.reason ?? null }),
+    });
   }
 
   /**

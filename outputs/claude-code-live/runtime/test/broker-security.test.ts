@@ -19,6 +19,15 @@ import { ENV } from './helpers/scenario.ts';
 import { IdentityRegistry, BOOTSTRAP_TOKEN_TTL_MS } from '../src/broker/identity.ts';
 import { acquireBrokerSingleton, SingletonBusyError } from '../src/broker/singleton.ts';
 
+import { isPwshAvailable } from './helpers/pwsh.ts';
+
+const isWindows = process.platform === 'win32';
+const pwsh = isWindows && (await isPwshAvailable());
+// The kernel-mutex singleton needs PowerShell 7, which a stock Windows install
+// does not have; without it the runtime falls back to the file singleton and
+// these regressions are about a path that is not in use.
+const needsKernelMutex = !pwsh && (isWindows ? 'pwsh nao instalado: o singleton usa arquivo de trava' : 'Windows kernel mutex');
+
 const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
 let temp: TempRoot;
@@ -107,7 +116,7 @@ describe('broker singleton', () => {
     await second.release();
   });
 
-  test('a lock left behind by a dead process is reclaimed instead of wedging the state root', async () => {
+  test('a lock left behind by a dead process is reclaimed instead of wedging the state root', { skip: needsKernelMutex }, async () => {
     const root = path.join(temp.root, 'singleton-stale');
     await mkdir(path.join(root, 'broker'), { recursive: true });
     const lockFile = path.join(root, 'broker', 'broker.lock');
@@ -134,7 +143,7 @@ describe('broker singleton', () => {
     }
   });
 
-  test('two contenders reclaiming the same abandoned lock cannot both end up owning it', { skip: process.platform !== 'win32' && 'safe automatic reclamation relies on Windows file sharing' }, async () => {
+  test('two contenders reclaiming the same abandoned lock cannot both end up owning it', { skip: needsKernelMutex || (process.platform !== 'win32' && 'safe automatic reclamation relies on Windows file sharing') }, async () => {
     const root = path.join(temp.root, 'singleton-reclaim-race');
     await mkdir(path.join(root, 'broker'), { recursive: true });
     const lockFile = path.join(root, 'broker', 'broker.lock');
@@ -184,7 +193,7 @@ describe('broker singleton', () => {
     }
   });
 
-  test('losing the Windows mutex helper is observable and releases kernel ownership', { skip: process.platform !== 'win32' && 'Windows kernel mutex' }, async () => {
+  test('losing the Windows mutex helper is observable and releases kernel ownership', { skip: needsKernelMutex }, async () => {
     const root = path.join(temp.root, 'singleton-helper-loss');
     const lock = await acquireBrokerSingleton(root);
     assert.ok(lock.monitorPid);

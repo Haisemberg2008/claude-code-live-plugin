@@ -23,6 +23,8 @@ export interface TrustRecord {
   approvedItems: Array<{ relativePath: string; sha256: string; kind: InventoryItem['kind']; scope: InventoryItem['scope'] }>;
   mcpServers: Record<string, { approved: boolean; externalMutations: 'escalate' }>;
   file: string;
+  /** Present when this approval was inherited from another checkout's record. */
+  derivedFrom?: { canonicalWorkspace: string; approvalRevision: number; fingerprint: string };
 }
 
 export type TrustCheck =
@@ -91,6 +93,61 @@ export class TrustStore {
     return read.status === 'ok' ? read.value : null;
   }
 
+  /**
+   * Reuses a parent checkout's approval for a worktree of the same repository.
+   *
+   * A worktree is a new canonical path, so it has no record of its own and the
+   * first parallel run would be refused with WORKSPACE_NOT_TRUSTED — pushing
+   * the user to approve without reading anything. Derivation avoids that
+   * without weakening the invariant, stated precisely:
+   *
+   *   no resource executes whose exact content hash the user has not already
+   *   approved for this project.
+   *
+   * So every item in the child must have an identical (relativePath, sha256)
+   * among the parent's approved items. One new or changed file and this returns
+   * null, falling through to the normal refusal with pending/changed populated.
+   * It reuses an approval; it never manufactures one.
+   *
+   * The child may legitimately be a strict SUBSET — ancestor-scope items the
+   * state-root worktree does not have — which is why absence is not a mismatch.
+   *
+   * Known and deliberate limit: comparison is over bytes, so a repository whose
+   * checkout settings rewrite text on checkout (notably `core.autocrlf=true` on
+   * Windows, where the worktree gets CRLF while the parent working tree holds
+   * LF) produces different hashes for the same instruction file, and derivation
+   * refuses. That refusal is correct — the bytes the CLI would load really are
+   * different — and the cost is bounded: the worktree path is deterministic per
+   * task, so the user approves it once, not once per run. Normalizing line
+   * endings before hashing would make trust equality mean something weaker than
+   * "these exact bytes", which is not a trade worth making here.
+   */
+  async deriveFromParent(input: { child: InventorySnapshot; parentCanonicalWorkspace: string }): Promise<TrustRecord | null> {
+    if (input.child.incomplete) return null;
+    const parent = await this.load(input.parentCanonicalWorkspace);
+    if (!parent) return null;
+    const approved = new Map(parent.approvedItems.map((item) => [item.relativePath, item.sha256]));
+    for (const item of input.child.items) {
+      if (approved.get(item.relativePath) !== item.sha256) return null;
+    }
+    const file = this.fileFor(input.child.canonicalWorkspace);
+    const record: TrustRecord = {
+      canonicalWorkspace: input.child.canonicalWorkspace,
+      fingerprint: input.child.fingerprint,
+      identity: parent.identity,
+      approvalRevision: parent.approvalRevision,
+      approvedAt: new Date().toISOString(),
+      note: `Herdado de ${parent.canonicalWorkspace}: todo item bate por hash com uma aprovação existente.`,
+      approvedItems: input.child.items.map((item) => ({ relativePath: item.relativePath, sha256: item.sha256, kind: item.kind, scope: item.scope })),
+      mcpServers: parent.mcpServers,
+      file,
+      derivedFrom: { canonicalWorkspace: parent.canonicalWorkspace, approvalRevision: parent.approvalRevision, fingerprint: parent.fingerprint },
+    };
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await writeFileAtomic(file, JSON.stringify(record, null, 2));
+    return record;
+  }
+
   async check(inventory: InventorySnapshot): Promise<TrustCheck> {
     const all = inventory.items.map((item) => item.relativePath).sort();
     if (inventory.incomplete) return { trusted: false, reason: 'INVENTORY_INCOMPLETE', changed: [], pending: all };
@@ -98,6 +155,15 @@ export class TrustStore {
     if (!record) {
       if (all.length === 0) return { trusted: true, approvalRevision: null, pending: [], changed: [], reason: 'NO_CUSTOMIZATIONS' };
       return { trusted: false, reason: 'NOT_APPROVED', changed: [], pending: all };
+    }
+    // A derived record is only as valid as the one it came from. Without this,
+    // revoking a project's trust would leave every worktree derived from it
+    // still trusted — the approval would outlive its own withdrawal.
+    if (record.derivedFrom) {
+      const parent = await this.load(record.derivedFrom.canonicalWorkspace);
+      if (!parent || parent.fingerprint !== record.derivedFrom.fingerprint) {
+        return { trusted: false, reason: 'NOT_APPROVED', changed: [], pending: all };
+      }
     }
     const approved = new Map(record.approvedItems.map((item) => [item.relativePath, item.sha256]));
     const current = new Map(inventory.items.map((item) => [item.relativePath, item.sha256]));

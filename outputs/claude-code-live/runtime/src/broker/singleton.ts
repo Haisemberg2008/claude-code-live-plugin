@@ -262,5 +262,26 @@ async function acquireWindowsMutex(stateRoot: string): Promise<SingletonLock> {
 }
 
 export async function acquireBrokerSingleton(stateRoot: string): Promise<SingletonLock> {
-  return process.platform === 'win32' ? acquireWindowsMutex(stateRoot) : acquireFileSingleton(stateRoot);
+  if (process.platform !== 'win32') return acquireFileSingleton(stateRoot);
+  try {
+    return await acquireWindowsMutex(stateRoot);
+  } catch (error) {
+    // PowerShell 7 is not part of a stock Windows install, and without it the
+    // kernel-mutex singleton cannot be taken at all — the runtime would simply
+    // not start. The file singleton is the same mechanism POSIX already relies
+    // on: an exclusive lock file held open for the process lifetime, which
+    // still admits exactly one broker per state root. Only a missing
+    // interpreter falls back; a BUSY mutex or a timeout still fails.
+    if (!isMissingInterpreter(error)) throw error;
+    process.stderr.write(
+      'CodeOrquestra: PowerShell 7 (pwsh) não está instalado; o singleton do broker passa a usar arquivo de trava exclusivo, '
+      + 'o mesmo mecanismo já usado fora do Windows. Continua valendo um broker por state root.\n',
+    );
+    return acquireFileSingleton(stateRoot);
+  }
+}
+
+/** True only for "the interpreter is not installed", never for a taken mutex. */
+function isMissingInterpreter(error: unknown): boolean {
+  return /ENOENT/.test(error instanceof Error ? error.message : String(error));
 }

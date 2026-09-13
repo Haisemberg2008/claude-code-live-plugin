@@ -49,6 +49,35 @@ interface Holder {
 // which is the opposite of what parallel worktrees need.
 const localChains = new Map<string, Promise<unknown>>();
 
+/** True only for "the interpreter is not installed", never for a lock failure. */
+function isMissingInterpreter(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (error as { code?: string }).code === 'QUOTA_LOCK_UNAVAILABLE' && /ENOENT/.test(message);
+}
+
+let pwshFallbackReported = false;
+
+/**
+ * Says once, loudly, that the kernel mutex is unavailable.
+ *
+ * Degrading a mutual-exclusion property silently is exactly what this codebase
+ * refuses to do elsewhere, so it is stated even though the reasoning shows the
+ * protected property is vacuous without pwsh.
+ */
+function reportPwshFallback(): void {
+  if (pwshFallbackReported) return;
+  pwshFallbackReported = true;
+  process.stderr.write(
+    'CodeOrquestra: PowerShell 7 (pwsh) não está instalado; o mutex de quota passa a usar arquivo de trava. '
+    + 'Isso ainda exclui outros brokers v2. A exclusão mútua com o runner legado v1 não se aplica aqui, porque o v1 também é executado por pwsh.\n',
+  );
+}
+
+/** Whether the kernel-mutex path has already fallen back in this process. */
+export function kernelMutexUnavailable(): boolean {
+  return pwshFallbackReported;
+}
+
 function acquireWindows(name: string, waitMs: number, attemptedAt: string): Promise<Holder> {
   return new Promise((resolve, reject) => {
     const child = spawn('pwsh', ['-NoProfile', '-NonInteractive', '-Command', HOLDER_SCRIPT], {
@@ -151,7 +180,24 @@ export async function withNamedMutex<T>(name: string, fn: () => Promise<T>, opti
   // counterpart should ask for 'file' and work everywhere.
   const useKernelMutex = process.platform === 'win32' && (options.transport ?? 'auto') === 'auto';
   const run = async (): Promise<MutexOutcome<T>> => {
-    const holder = useKernelMutex ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
+    let holder: Holder;
+    if (useKernelMutex) {
+      try {
+        holder = await acquireWindows(name, waitMs, attemptedAt);
+      } catch (error) {
+        // Without pwsh the kernel mutex is unreachable — and so is the legacy
+        // runner, which is itself invoked as `pwsh -File start-live.ps1`. The
+        // property this name protects is mutual exclusion with v1; if v1
+        // cannot run at all, there is nothing to be excluded from, so the file
+        // lock (which still excludes other v2 brokers) is sufficient rather
+        // than a silent downgrade. Anything else here still fails.
+        if (!isMissingInterpreter(error)) throw error;
+        reportPwshFallback();
+        holder = await acquireLockFile(name, waitMs, attemptedAt);
+      }
+    } else {
+      holder = await acquireLockFile(name, waitMs, attemptedAt);
+    }
     const waitedMs = Date.now() - started;
     try {
       const value = await fn();

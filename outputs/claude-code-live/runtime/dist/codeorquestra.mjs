@@ -2288,6 +2288,18 @@ var HOLDER_SCRIPT = [
   "[Console]::Out.WriteLine('RELEASED'); [Console]::Out.Flush()"
 ].join("; ");
 var localChains = /* @__PURE__ */ new Map();
+function isMissingInterpreter(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return error.code === "QUOTA_LOCK_UNAVAILABLE" && /ENOENT/.test(message);
+}
+var pwshFallbackReported = false;
+function reportPwshFallback() {
+  if (pwshFallbackReported) return;
+  pwshFallbackReported = true;
+  process.stderr.write(
+    "CodeOrquestra: PowerShell 7 (pwsh) n\xE3o est\xE1 instalado; o mutex de quota passa a usar arquivo de trava. Isso ainda exclui outros brokers v2. A exclus\xE3o m\xFAtua com o runner legado v1 n\xE3o se aplica aqui, porque o v1 tamb\xE9m \xE9 executado por pwsh.\n"
+  );
+}
 function acquireWindows(name, waitMs, attemptedAt) {
   return new Promise((resolve, reject) => {
     const child = spawn2("pwsh", ["-NoProfile", "-NonInteractive", "-Command", HOLDER_SCRIPT], {
@@ -2385,7 +2397,18 @@ async function withNamedMutex(name, fn, options = {}) {
   const started = Date.now();
   const useKernelMutex = process.platform === "win32" && (options.transport ?? "auto") === "auto";
   const run2 = async () => {
-    const holder = useKernelMutex ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
+    let holder;
+    if (useKernelMutex) {
+      try {
+        holder = await acquireWindows(name, waitMs, attemptedAt);
+      } catch (error) {
+        if (!isMissingInterpreter(error)) throw error;
+        reportPwshFallback();
+        holder = await acquireLockFile(name, waitMs, attemptedAt);
+      }
+    } else {
+      holder = await acquireLockFile(name, waitMs, attemptedAt);
+    }
     const waitedMs = Date.now() - started;
     try {
       const value = await fn();
@@ -2408,6 +2431,7 @@ async function withGlobalQuotaMutex(fn, options = {}) {
 
 // src/broker/worktree.ts
 var GIT_TIMEOUT_MS = 2e4;
+var GIT_PROVISION_TIMEOUT_MS = 12e4;
 var MAX_CHANGED_FILES = 500;
 var WorktreeError = class extends Error {
   code;
@@ -2461,6 +2485,22 @@ function canonicalize(target) {
   const normalized = target.replace(/\\/g, "/").replace(/\/+$/, "");
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
+function canonicalizePlanned(target) {
+  const absolute = path8.resolve(target);
+  const trailing = [];
+  let probe = absolute;
+  for (; ; ) {
+    try {
+      const real = realpathSync2.native(probe);
+      return canonicalize(trailing.length ? path8.join(real, ...trailing.reverse()) : real);
+    } catch {
+      const parent = path8.dirname(probe);
+      if (parent === probe) return canonicalize(absolute);
+      trailing.push(path8.basename(probe));
+      probe = parent;
+    }
+  }
+}
 async function resolveRepository(workspace) {
   const result = await git(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"], workspace);
   if (result.code !== 0) {
@@ -2473,6 +2513,70 @@ async function resolveRepository(workspace) {
     throw new WorktreeError("NOT_A_GIT_REPOSITORY", "N\xE3o foi poss\xEDvel identificar o reposit\xF3rio do workspace declarado.");
   }
   return { commonDir: canonicalize(commonDir), topLevel: canonicalize(topLevel), repoKey: sha256(canonicalize(commonDir)).slice(0, 24) };
+}
+async function withRepositoryMutex(repoKey, fn) {
+  const outcome = await withNamedMutex(`CodeOrquestraRepo-${repoKey}`, fn, { waitMs: 6e4, transport: "file" });
+  return outcome.value;
+}
+function worktreePathFor(stateRoot, repoKey, taskId) {
+  const root = path8.join(stateRoot, "worktrees", repoKey);
+  return { root, path: path8.join(root, taskId.slice(0, 16)) };
+}
+function assertUsablePathLength(target) {
+  if (process.platform === "win32" && target.length > 150) {
+    throw new WorktreeError(
+      "WORKTREE_PATH_TOO_LONG",
+      `O caminho do worktree tem ${target.length} caracteres; ferramentas que n\xE3o habilitaram caminhos longos falhariam dentro dele. Configure um worktreeRoot mais curto na pol\xEDtica do reposit\xF3rio.`
+    );
+  }
+}
+async function inspectExisting(target, repository) {
+  try {
+    await fs8.access(target);
+  } catch {
+    return null;
+  }
+  const common = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], target);
+  if (common.code !== 0 || canonicalize(common.stdout.trim()) !== repository.commonDir) {
+    throw new WorktreeError("WORKTREE_PATH_OCCUPIED", "J\xE1 existe um diret\xF3rio nesse caminho que n\xE3o \xE9 um worktree deste reposit\xF3rio. Nada foi removido; resolva manualmente.");
+  }
+  return { reusable: true, dirty: await gitStatus(target) };
+}
+async function ensureWorktree(options) {
+  const { repository, target, branch, baseRef } = options;
+  assertUsablePathLength(target);
+  const existing = await inspectExisting(target, repository);
+  if (existing) {
+    if (existing.dirty.length > 0) {
+      throw new WorktreeError(
+        "WORKTREE_DIRTY_FROM_PREVIOUS_RUN",
+        `O worktree desta tarefa ainda tem ${existing.dirty.length} arquivo(s) com altera\xE7\xF5es n\xE3o commitadas de uma execu\xE7\xE3o anterior. Revise e commite ou descarte antes de iniciar outra.`,
+        existing.dirty.slice(0, 20).join(", ")
+      );
+    }
+    return { path: target, branch, baseRef, created: false };
+  }
+  await fs8.mkdir(path8.dirname(target), { recursive: true });
+  const args = ["worktree", "add", "--no-track", "-b", branch, target];
+  if (baseRef) args.push(baseRef);
+  const result = await git(args, repository.topLevel, GIT_PROVISION_TIMEOUT_MS);
+  if (result.code !== 0) {
+    await git(["worktree", "prune"], repository.topLevel).catch(() => void 0);
+    throw new WorktreeError(
+      result.timedOut ? "WORKTREE_ADD_TIMEOUT" : "WORKTREE_ADD_FAILED",
+      result.timedOut ? "git worktree add excedeu o tempo limite; nada foi iniciado." : "git worktree add falhou; nada foi iniciado.",
+      result.stderr.trim().slice(0, 400)
+    );
+  }
+  return { path: target, branch, baseRef, created: true };
+}
+async function removeWorktree(repository, target) {
+  const result = await git(["worktree", "remove", target], repository.topLevel);
+  if (result.code === 0) {
+    await git(["worktree", "prune"], repository.topLevel).catch(() => void 0);
+    return { removed: true };
+  }
+  return { removed: false, reason: result.stderr.trim().slice(0, 400) || "git worktree remove recusou a remo\xE7\xE3o." };
 }
 async function listOrphans(stateRoot, isOwned) {
   const root = path8.join(stateRoot, "worktrees");
@@ -2647,6 +2751,60 @@ var TrustStore = class {
     const read = await readJsonShared(this.fileFor(canonicalWorkspace));
     return read.status === "ok" ? read.value : null;
   }
+  /**
+   * Reuses a parent checkout's approval for a worktree of the same repository.
+   *
+   * A worktree is a new canonical path, so it has no record of its own and the
+   * first parallel run would be refused with WORKSPACE_NOT_TRUSTED — pushing
+   * the user to approve without reading anything. Derivation avoids that
+   * without weakening the invariant, stated precisely:
+   *
+   *   no resource executes whose exact content hash the user has not already
+   *   approved for this project.
+   *
+   * So every item in the child must have an identical (relativePath, sha256)
+   * among the parent's approved items. One new or changed file and this returns
+   * null, falling through to the normal refusal with pending/changed populated.
+   * It reuses an approval; it never manufactures one.
+   *
+   * The child may legitimately be a strict SUBSET — ancestor-scope items the
+   * state-root worktree does not have — which is why absence is not a mismatch.
+   *
+   * Known and deliberate limit: comparison is over bytes, so a repository whose
+   * checkout settings rewrite text on checkout (notably `core.autocrlf=true` on
+   * Windows, where the worktree gets CRLF while the parent working tree holds
+   * LF) produces different hashes for the same instruction file, and derivation
+   * refuses. That refusal is correct — the bytes the CLI would load really are
+   * different — and the cost is bounded: the worktree path is deterministic per
+   * task, so the user approves it once, not once per run. Normalizing line
+   * endings before hashing would make trust equality mean something weaker than
+   * "these exact bytes", which is not a trade worth making here.
+   */
+  async deriveFromParent(input) {
+    if (input.child.incomplete) return null;
+    const parent = await this.load(input.parentCanonicalWorkspace);
+    if (!parent) return null;
+    const approved = new Map(parent.approvedItems.map((item) => [item.relativePath, item.sha256]));
+    for (const item of input.child.items) {
+      if (approved.get(item.relativePath) !== item.sha256) return null;
+    }
+    const file = this.fileFor(input.child.canonicalWorkspace);
+    const record2 = {
+      canonicalWorkspace: input.child.canonicalWorkspace,
+      fingerprint: input.child.fingerprint,
+      identity: parent.identity,
+      approvalRevision: parent.approvalRevision,
+      approvedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      note: `Herdado de ${parent.canonicalWorkspace}: todo item bate por hash com uma aprova\xE7\xE3o existente.`,
+      approvedItems: input.child.items.map((item) => ({ relativePath: item.relativePath, sha256: item.sha256, kind: item.kind, scope: item.scope })),
+      mcpServers: parent.mcpServers,
+      file,
+      derivedFrom: { canonicalWorkspace: parent.canonicalWorkspace, approvalRevision: parent.approvalRevision, fingerprint: parent.fingerprint }
+    };
+    await fs10.mkdir(path10.dirname(file), { recursive: true });
+    await writeFileAtomic(file, JSON.stringify(record2, null, 2));
+    return record2;
+  }
   async check(inventory) {
     const all = inventory.items.map((item) => item.relativePath).sort();
     if (inventory.incomplete) return { trusted: false, reason: "INVENTORY_INCOMPLETE", changed: [], pending: all };
@@ -2654,6 +2812,12 @@ var TrustStore = class {
     if (!record2) {
       if (all.length === 0) return { trusted: true, approvalRevision: null, pending: [], changed: [], reason: "NO_CUSTOMIZATIONS" };
       return { trusted: false, reason: "NOT_APPROVED", changed: [], pending: all };
+    }
+    if (record2.derivedFrom) {
+      const parent = await this.load(record2.derivedFrom.canonicalWorkspace);
+      if (!parent || parent.fingerprint !== record2.derivedFrom.fingerprint) {
+        return { trusted: false, reason: "NOT_APPROVED", changed: [], pending: all };
+      }
     }
     const approved = new Map(record2.approvedItems.map((item) => [item.relativePath, item.sha256]));
     const current = new Map(inventory.items.map((item) => [item.relativePath, item.sha256]));
@@ -4214,9 +4378,6 @@ var TaskManager = class {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, "LEGACY_CONTRACT_USE_LEGACY_RUNNER", { message: "Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2." });
-    if (contract.execution.mode === "worktree") {
-      throw new HttpError(501, "WORKTREE_NOT_IMPLEMENTED", { message: 'execution.mode "worktree" j\xE1 \xE9 validado pelo contrato, mas o provisionamento ainda n\xE3o existe neste broker. Use "checkout".' });
-    }
     if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker est\xE1 encerrando; nenhuma execu\xE7\xE3o nova \xE9 aceita." });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
       throw new HttpError(409, "REQUIRES_REVIEW", { message: "A \xFAltima execu\xE7\xE3o ficou incerta ou desconectada; confirme a revis\xE3o (acknowledgeReview: true) antes de iniciar outra.", reason: task.record.reviewReason });
@@ -4230,7 +4391,12 @@ var TaskManager = class {
     } catch {
       throw new HttpError(400, "WORKSPACE_NOT_FOUND");
     }
-    const workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    let worktreePlan = null;
+    let workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    if (contract.execution.mode === "worktree") {
+      worktreePlan = await this.planWorktree(task, contract, workspace);
+      workspaceKey = sha256(canonicalizePlanned(worktreePlan.path)).slice(0, 24);
+    }
     if (task.run && !task.run.finalized) throw new HttpError(409, "RUN_IN_PROGRESS", { runId: task.run.runId });
     const holder = this.locks.get(workspaceKey);
     if (contract.capabilities.edit && holder && holder.holderTaskId !== task.record.taskId) {
@@ -4268,6 +4434,8 @@ var TaskManager = class {
       turns: 0,
       resumeMode: task.previousSessionId ? "automatic" : "new",
       simulated: false,
+      declaredWorkspace: worktreePlan ? workspace : null,
+      worktree: worktreePlan,
       writerLockKey: contract.capabilities.edit ? workspaceKey : null,
       finalized: false,
       finalizing: false,
@@ -4278,7 +4446,7 @@ var TaskManager = class {
     };
     task.run = run2;
     if (contract.capabilities.edit) {
-      this.locks.set(workspaceKey, { workspaceKey, workspace: canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run2.startedAt, quarantined: false });
+      this.locks.set(workspaceKey, { workspaceKey, workspace: worktreePlan ? canonicalizePlanned(worktreePlan.path) : canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run2.startedAt, quarantined: false });
     }
     task.uncertain = false;
     task.disconnected = false;
@@ -4292,8 +4460,27 @@ var TaskManager = class {
       await fs14.mkdir(runDir, { recursive: true });
       run2.prompt = contract.prompt ?? (contract.promptFile ? await fs14.readFile(contract.promptFile, "utf8") : "");
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
-      const { inventory, trust } = await this.inventoryFor(workspace);
+      let effectiveWorkspace = workspace;
+      if (worktreePlan) {
+        effectiveWorkspace = await this.provisionWorktree(task, run2, worktreePlan);
+        if (this.stopping || task.run !== run2) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante o provisionamento; nenhum worker ser\xE1 criado." });
+      }
+      const { inventory, trust: initialTrust } = await this.inventoryFor(effectiveWorkspace);
+      let trust = initialTrust;
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
+      if (!trust.trusted && worktreePlan) {
+        const derived = await this.trustStore.deriveFromParent({ child: inventory, parentCanonicalWorkspace: canonicalizeWorkspace(workspace) });
+        if (derived) {
+          trust = await this.trustStore.check(inventory);
+          await this.append(task, runId, "trust_derived", {
+            workspace: inventory.canonicalWorkspace,
+            from: canonicalWorkspace,
+            approvalRevision: derived.approvalRevision,
+            items: derived.approvedItems.length,
+            note: "Aprova\xE7\xE3o herdada do checkout de origem: todo item bate por hash. Nenhum recurso novo foi autorizado."
+          });
+        }
+      }
       if (!trust.trusted) {
         throw new HttpError(409, "WORKSPACE_NOT_TRUSTED", { reason: trust.reason, pending: trust.pending, changed: trust.changed, fingerprint: inventory.fingerprint, incomplete: inventory.incomplete });
       }
@@ -4309,7 +4496,7 @@ var TaskManager = class {
         await writeFileAtomic(path13.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       try {
-        await this.writeCurrentRun(task, { runId, runToken, status: "STARTING", workerPid: null, workerStartedAt: null, startedAt: run2.startedAt, workspace, writerLockKey: run2.writerLockKey, runDir });
+        await this.writeCurrentRun(task, { runId, runToken, status: "STARTING", workerPid: null, workerStartedAt: null, startedAt: run2.startedAt, workspace: effectiveWorkspace, writerLockKey: run2.writerLockKey, runDir });
       } catch (error) {
         throw new HttpError(503, "OWNERSHIP_RECORD_FAILED", {
           code: error.code ?? "WRITE_FAILED",
@@ -4321,7 +4508,8 @@ var TaskManager = class {
         requestedModel: run2.requestedModel,
         modelReason: run2.modelReason,
         effort: contract.effort,
-        workspace,
+        workspace: effectiveWorkspace,
+        ...worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: "broker", policyEnabledAt: worktreePlan.policy.enabledAt } } : {},
         profile: contract.profile,
         contractVersion: contract.version,
         coordination: contract.coordination,
@@ -4346,6 +4534,92 @@ var TaskManager = class {
       await this.releaseReservation(task, run2);
       throw error;
     }
+  }
+  /**
+   * Decides where a worktree run will live, and whether it may start at all.
+   *
+   * Everything here is a lookup or a policy check: no directory is created, so
+   * a refusal leaves nothing behind. Runs before the critical section, because
+   * the section cannot await.
+   */
+  async planWorktree(task, contract, declaredWorkspace) {
+    let repository;
+    let policy;
+    try {
+      repository = await resolveRepository(declaredWorkspace);
+      policy = await this.worktreePolicy.require(repository.repoKey);
+    } catch (error) {
+      const code = error.code ?? "WORKTREE_UNAVAILABLE";
+      throw new HttpError(code === "WORKTREE_POLICY_REQUIRED" ? 403 : 400, code, { message: error.message });
+    }
+    const active = [...this.tasks.values()].filter((other) => other.record.taskId !== task.record.taskId && other.run && !other.run.finalized && other.run.worktree?.repository.repoKey === repository.repoKey);
+    if (active.length >= policy.maxParallelRuns) {
+      throw new HttpError(429, "FLEET_CAPACITY_REACHED", {
+        limit: policy.maxParallelRuns,
+        holders: active.map((other) => ({ taskId: other.record.taskId, threadId: other.record.threadId, runId: other.run?.runId ?? null })),
+        message: `J\xE1 existem ${active.length} execu\xE7\xE3o(\xF5es) em worktree neste reposit\xF3rio, o limite aprovado. Aguarde uma terminar ou ajuste maxParallelRuns na pol\xEDtica.`
+      });
+    }
+    const root = policy.worktreeRoot ?? this.stateRoot;
+    const location = worktreePathFor(root, repository.repoKey, task.record.taskId);
+    try {
+      assertUsablePathLength(location.path);
+    } catch (error) {
+      throw new HttpError(400, error.code ?? "WORKTREE_PATH_TOO_LONG", { message: error.message });
+    }
+    const retained = await listOrphans(root, () => false);
+    const mine = retained.filter((entry) => entry.repoKey === repository.repoKey && canonicalize(entry.path) !== canonicalizePlanned(location.path));
+    if (mine.length >= policy.maxRetainedWorktrees) {
+      throw new HttpError(409, "WORKTREE_RETENTION_LIMIT", {
+        limit: policy.maxRetainedWorktrees,
+        retained: mine.map((entry) => ({ path: entry.path, dirtyFiles: entry.dirtyFiles.length })),
+        message: `H\xE1 ${mine.length} worktree(s) retido(s) deste reposit\xF3rio, o limite aprovado. Revise e remova os conclu\xEDdos com "codeorquestra worktree list".`
+      });
+    }
+    return {
+      repository,
+      policy,
+      path: location.path,
+      branch: contract.execution.worktree?.branch ?? `codeorquestra/${task.record.taskId.slice(0, 16)}`,
+      baseRef: contract.execution.worktree?.baseRef ?? null
+    };
+  }
+  /**
+   * Creates the run's worktree and makes it the effective workspace.
+   *
+   * The single substitution of `contract.workspace` is what carries the change
+   * everywhere else: the spawn cwd, the worker descriptor, the action context's
+   * containment checks, the inventory and the changed-file list all read it.
+   */
+  async provisionWorktree(task, run2, plan) {
+    let outcome;
+    try {
+      outcome = await withRepositoryMutex(plan.repository.repoKey, () => ensureWorktree({
+        repository: plan.repository,
+        target: plan.path,
+        branch: plan.branch,
+        baseRef: plan.baseRef
+      }));
+    } catch (error) {
+      const code = error.code ?? "WORKTREE_ADD_FAILED";
+      throw new HttpError(code === "WORKTREE_DIRTY_FROM_PREVIOUS_RUN" ? 409 : 500, code, {
+        message: error.message,
+        ...error.detail ? { detail: error.detail } : {}
+      });
+    }
+    run2.contract = { ...run2.contract, workspace: outcome.path };
+    task.record.workspace = outcome.path;
+    await this.append(task, run2.runId, "worktree_provisioned", {
+      path: outcome.path,
+      branch: outcome.branch,
+      baseRef: outcome.baseRef,
+      created: outcome.created,
+      repoKey: plan.repository.repoKey,
+      declaredWorkspace: run2.declaredWorkspace,
+      provisionedBy: "broker",
+      note: "O Claude nunca cria worktrees; a pol\xEDtica do reposit\xF3rio foi aprovada pelo usu\xE1rio e o broker executou."
+    });
+    return outcome.path;
   }
   async releaseReservation(task, run2) {
     if (run2.writerLockKey) {
@@ -4754,12 +5028,48 @@ var TaskManager = class {
     if (clean) {
       this.locks.delete(key);
       await fs14.rm(path13.join(this.locksDir(), `${key}.json`), { force: true });
+      if (run2.worktree) await this.settleWorktree(task, run2, run2.worktree);
     } else {
       holder.quarantined = true;
       holder.quarantineNote = note;
       await writeFileAtomic(path13.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      if (run2.worktree) {
+        await this.append(task, run2.runId, "worktree_retained", {
+          path: run2.worktree.path,
+          reason: "quarantine",
+          note: "A trava do worktree ficou em quarentena; o diret\xF3rio \xE9 preservado e n\xE3o ser\xE1 reutilizado at\xE9 a libera\xE7\xE3o expl\xEDcita."
+        });
+      }
     }
     run2.writerLockKey = null;
+  }
+  /**
+   * Decides what happens to a worktree once its run released the lock cleanly.
+   *
+   * Uncommitted work is NEVER deleted. `commit` can never belong to Claude, so
+   * the normal end state of a successful run is exactly that: work sitting in
+   * the tree, waiting for the coordinator. Deleting it would destroy the
+   * deliverable, so a dirty tree is retained and reported, and only a tree git
+   * itself agrees is clean is removed.
+   */
+  async settleWorktree(task, run2, plan) {
+    const dirty = await gitStatus(plan.path);
+    if (dirty.length > 0) {
+      await this.append(task, run2.runId, "worktree_retained", {
+        path: plan.path,
+        branch: plan.branch,
+        reason: "uncommitted_work",
+        files: dirty.slice(0, 50),
+        note: "Trabalho n\xE3o commitado preservado: commit nunca pertence ao Claude, ent\xE3o este \xE9 o estado normal de uma execu\xE7\xE3o bem-sucedida. Commite a partir deste caminho ou remova o worktree explicitamente."
+      });
+      return;
+    }
+    const removal = await withRepositoryMutex(plan.repository.repoKey, () => removeWorktree(plan.repository, plan.path));
+    await this.append(task, run2.runId, removal.removed ? "worktree_removed" : "worktree_retained", {
+      path: plan.path,
+      branch: plan.branch,
+      ...removal.removed ? {} : { reason: "git_refused", detail: removal.reason ?? null }
+    });
   }
   /**
    * Writes the authoritative ownership record of the task.
@@ -5229,7 +5539,19 @@ async function acquireWindowsMutex(stateRoot) {
   };
 }
 async function acquireBrokerSingleton(stateRoot) {
-  return process.platform === "win32" ? acquireWindowsMutex(stateRoot) : acquireFileSingleton(stateRoot);
+  if (process.platform !== "win32") return acquireFileSingleton(stateRoot);
+  try {
+    return await acquireWindowsMutex(stateRoot);
+  } catch (error) {
+    if (!isMissingInterpreter2(error)) throw error;
+    process.stderr.write(
+      "CodeOrquestra: PowerShell 7 (pwsh) n\xE3o est\xE1 instalado; o singleton do broker passa a usar arquivo de trava exclusivo, o mesmo mecanismo j\xE1 usado fora do Windows. Continua valendo um broker por state root.\n"
+    );
+    return acquireFileSingleton(stateRoot);
+  }
+}
+function isMissingInterpreter2(error) {
+  return /ENOENT/.test(error instanceof Error ? error.message : String(error));
 }
 
 // src/broker/broker.ts

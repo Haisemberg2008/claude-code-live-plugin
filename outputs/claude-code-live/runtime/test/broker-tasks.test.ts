@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdir, readFile, readdir, writeFile, symlink } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { git } from '../src/broker/worktree.ts';
 import { startTestBroker, DEFAULT_FAKE_ADAPTER, CLIENT_HEADER_NAME, CSRF_HEADER_NAME, CSRF_HEADER_VALUE, type TestBroker } from './helpers/broker-client.ts';
 import { makeTempRoot, waitFor, sleep, type TempRoot } from './helpers/temp.ts';
 import { isProcessAlive } from './helpers/process.ts';
@@ -73,6 +74,7 @@ let broker: TestBroker;
 let workspaceA: string;
 let workspaceB: string;
 let traceDir: string;
+let repoWorkspace = '';
 const fakeAdapter = DEFAULT_FAKE_ADAPTER;
 
 async function register(threadId: string): Promise<{ taskId: string; taskHandle: string }> {
@@ -211,6 +213,16 @@ before(async () => {
   await mkdir(path.join(workspaceB, 'src'), { recursive: true });
   await mkdir(traceDir, { recursive: true });
   await writeFile(path.join(workspaceA, 'CLAUDE.md'), '# projeto A\n');
+  // A real repository, for the worktree tests: worktrees need a ref to branch
+  // from, and the plain workspaces above deliberately have no .git.
+  repoWorkspace = path.join(temp.root, 'ws-repo');
+  await mkdir(path.join(repoWorkspace, 'src'), { recursive: true });
+  await writeFile(path.join(repoWorkspace, 'CLAUDE.md'), '# projeto com git\n');
+  await writeFile(path.join(repoWorkspace, 'src', 'index.ts'), 'export const ok = true;\n');
+  for (const args of [['init', '--initial-branch=main'], ['config', 'user.email', 'h@example.invalid'], ['config', 'user.name', 'H'], ['config', 'commit.gpgsign', 'false'], ['config', 'core.autocrlf', 'false'], ['add', '.'], ['commit', '-m', 'base']]) {
+    const result = await git(args, repoWorkspace);
+    assert.equal(result.code, 0, `git ${args.join(' ')}: ${result.stderr}`);
+  }
   broker = await startTestBroker({
     stateRoot: path.join(temp.root, 'state'),
     fakeAdapterPath: fakeAdapter,
@@ -662,25 +674,6 @@ describe('supervision alerts and coordinator presence', () => {
 });
 
 describe('locks and scoped termination', () => {
-  test('a worktree target is refused before any reservation, so no lock is left behind', async () => {
-    const { taskId, taskHandle } = await register('thread-worktree-unimplemented');
-    await approveTrust(taskId, workspaceA);
-    const job = devJob(workspaceA, 'say: nao deve iniciar', { execution: { mode: 'worktree' } });
-    const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job }) });
-    assert.equal(response.status, 501, response.text);
-    assert.equal((response.body as { error?: string }).error, 'WORKTREE_NOT_IMPLEMENTED');
-    // The refusal must happen before the synchronous critical section. If it
-    // ever moves below the reservation, this task would hold the checkout and
-    // the next start would fail with WORKSPACE_WRITER_LOCKED instead.
-    const locks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
-    assert.equal(locks.status, 200, locks.text);
-    assert.deepEqual(locks.body, [], 'nenhuma trava pode sobrar de um job recusado');
-    const view = await task(taskId);
-    assert.equal(view.currentRun, null, 'nenhuma execução pode ter sido registrada');
-    // The same task can still start a normal run: nothing was consumed.
-    await startRun(taskId, taskHandle, devJob(workspaceA, 'say: agora com checkout'));
-  });
-
   test('same-task runs serialize, and the workspace writer lock spans tasks while reads coexist', async () => {
     const first = await register('thread-lock-1');
     await startRun(first.taskId, first.taskHandle, devJob(workspaceB, script(['say: editando', 'sleep: 3000'])));
@@ -1239,5 +1232,110 @@ describe('model selection between turns', () => {
     assert.equal(uncertain.requiresReview, true);
     assert.equal(uncertain.currentRun?.turns, 1, 'the queued turn did not start on an unknown model');
     assert.equal(uncertain.queue.find((entry) => entry.messageId === (queued.body as { messageId: string }).messageId)?.state, 'queued');
+  });
+});
+
+describe('parallel worktrees', () => {
+  async function enrol(): Promise<void> {
+    const response = await broker.api('/api/repos/worktree-policy', {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ repo: repoWorkspace, note: 'paralelismo no harness' }),
+    });
+    assert.equal(response.status, 200, response.text);
+  }
+
+  test('a worktree target in an unenrolled repository is refused before any reservation', async () => {
+    const { taskId, taskHandle } = await register('thread-worktree-unenrolled');
+    await approveTrust(taskId, workspaceA);
+    const job = devJob(workspaceA, 'say: nao deve iniciar', { execution: { mode: 'worktree' } });
+    const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job }) });
+    // workspaceA is a plain directory, not a repository: the first thing that
+    // fails says so, and it fails before anything is reserved.
+    assert.ok(response.status === 400 || response.status === 403, response.text);
+    assert.ok(['NOT_A_GIT_REPOSITORY', 'WORKTREE_POLICY_REQUIRED'].includes((response.body as { error?: string }).error ?? ''), response.text);
+    // The refusal must happen before the synchronous critical section. If it
+    // ever moves below the reservation, this task would hold the checkout and
+    // the next start would fail with WORKSPACE_WRITER_LOCKED instead.
+    const locks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
+    assert.equal(locks.status, 200, locks.text);
+    const mine = (locks.body as Array<{ holderTaskId: string }>).filter((lock) => lock.holderTaskId === taskId);
+    assert.deepEqual(mine, [], 'nenhuma trava pode sobrar de um job recusado');
+    const view = await task(taskId);
+    assert.equal(view.currentRun, null, 'nenhuma execução pode ter sido registrada');
+    // The same task can still start a normal run: nothing was consumed.
+    await startRun(taskId, taskHandle, devJob(workspaceA, 'say: agora com checkout'));
+    // Ended here rather than left to the shared cleanup, so this task leaves
+    // nothing behind for the tests that follow.
+    await broker.api(`/api/tasks/${taskId}/end`, { method: 'POST', headers: broker.bearerHeaders(), body: '{}' });
+    await waitFor(
+      async () => !((await broker.api('/api/locks', { headers: broker.bearerHeaders() })).body as Array<{ holderTaskId: string }>).some((lock) => lock.holderTaskId === taskId),
+      { description: 'a trava do checkout desta tarefa deve ser liberada' },
+    );
+  });
+
+  test('two tasks run at once in separate worktrees, each holding its own lock', async () => {
+    await enrol();
+    const first = await register('thread-wt-paralelo-a');
+    const second = await register('thread-wt-paralelo-b');
+    await approveTrust(first.taskId, repoWorkspace);
+
+    const job = (prompt: string) => devJob(repoWorkspace, prompt, { execution: { mode: 'worktree' } });
+    await startRun(first.taskId, first.taskHandle, job('sleep: 1500'));
+    // The inverse of WORKSPACE_WRITER_LOCKED: the same repository, at the same
+    // time, from a different task — and it is accepted, because the lock is
+    // over the working tree and each task has its own.
+    await startRun(second.taskId, second.taskHandle, job('sleep: 1500'));
+
+    const locks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
+    assert.equal(locks.status, 200, locks.text);
+    const all = locks.body as Array<{ workspaceKey: string; holderTaskId: string; workspace: string }>;
+    // Scoped to these two tasks: the shared broker may still hold locks from
+    // earlier tests, and a global count would make this assert about them.
+    const mine = all.filter((lock) => lock.holderTaskId === first.taskId || lock.holderTaskId === second.taskId);
+    assert.equal(mine.length, 2, JSON.stringify(all));
+    assert.notEqual(mine[0]?.workspaceKey, mine[1]?.workspaceKey, 'árvores de trabalho diferentes, chaves diferentes');
+    // Neither lock is over the declared checkout: both are over provisioned
+    // worktrees, which is what lets them coexist.
+    for (const lock of mine) {
+      assert.ok(lock.workspace.includes('/worktrees/'), lock.workspace);
+      assert.ok(!lock.workspace.endsWith('ws-repo'), lock.workspace);
+    }
+
+    const firstView = await task(first.taskId);
+    assert.ok(firstView.workspace && firstView.workspace !== repoWorkspace, 'a execução roda no worktree, não no checkout declarado');
+  });
+
+  test('the fleet cap refuses the next run and names who holds the slots', async () => {
+    // Its own repository: the cap counts live runs, so sharing one with the
+    // test above would make this assert about that test's leftovers.
+    const capRepo = path.join(temp.root, 'ws-repo-teto');
+    await mkdir(path.join(capRepo, 'src'), { recursive: true });
+    await writeFile(path.join(capRepo, 'CLAUDE.md'), '# projeto do teto\n');
+    for (const args of [['init', '--initial-branch=main'], ['config', 'user.email', 'h@example.invalid'], ['config', 'user.name', 'H'], ['config', 'commit.gpgsign', 'false'], ['config', 'core.autocrlf', 'false'], ['add', '.'], ['commit', '-m', 'base']]) {
+      const result = await git(args, capRepo);
+      assert.equal(result.code, 0, `git ${args.join(' ')}: ${result.stderr}`);
+    }
+    const response = await broker.api('/api/repos/worktree-policy', {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ repo: capRepo, note: 'teto de um', maxParallelRuns: 1 }),
+    });
+    assert.equal(response.status, 200, response.text);
+    const first = await register('thread-wt-teto-a');
+    const second = await register('thread-wt-teto-b');
+    await approveTrust(first.taskId, capRepo);
+    const job = (prompt: string) => devJob(capRepo, prompt, { execution: { mode: 'worktree' } });
+    await startRun(first.taskId, first.taskHandle, job('sleep: 1500'));
+
+    const refused = await broker.api(`/api/tasks/${second.taskId}/runs`, {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ taskHandle: second.taskHandle, job: job('say: nao deve iniciar') }),
+    });
+    assert.equal(refused.status, 429, refused.text);
+    const body = refused.body as { error?: string; limit?: number; holders?: Array<{ taskId: string }> };
+    assert.equal(body.error, 'FLEET_CAPACITY_REACHED');
+    assert.equal(body.limit, 1);
+    // Naming the holders is the point: N sessions share one account, so the
+    // user has to know what to wait for.
+    assert.deepEqual(body.holders?.map((holder) => holder.taskId), [first.taskId]);
   });
 });
