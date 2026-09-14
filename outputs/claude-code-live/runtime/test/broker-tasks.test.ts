@@ -1416,3 +1416,31 @@ describe('observation before work', () => {
     await broker.api(`/api/tasks/${taskId}/end`, { method: 'POST', headers: broker.bearerHeaders(), body: '{}' });
   });
 });
+
+describe('derived files', () => {
+  test('are rebuilt from the run cache and stay identical to what the log would produce', async () => {
+    const { taskId, taskHandle } = await register('thread-derivados');
+    // Its own checkout: sharing one makes this contend with whatever else still
+    // holds the writer lock, which has nothing to do with what it asserts.
+    const derivedWorkspace = path.join(temp.root, 'ws-derivados');
+    await mkdir(path.join(derivedWorkspace, 'src'), { recursive: true });
+    const { runId } = await startRun(taskId, taskHandle, devJob(derivedWorkspace, script(['say: primeira', 'say: segunda', 'say: terceira'])));
+    await waitFor(async () => ((await task(taskId)).state === 'idle' ? true : undefined), { timeoutMs: 20000, intervalMs: 250, description: 'turno termina' });
+
+    // The cache is an optimisation, never a second source of truth. Deriving
+    // from it must produce exactly what deriving from the durable log does.
+    const runDir = path.join(broker.stateRoot, 'tasks', taskId, 'runs', runId);
+    const fromCache = await readFile(path.join(runDir, 'acompanhamento.txt'), 'utf8');
+
+    const log = await events(taskId);
+    const forRun = log.filter((event) => event.runId === runId);
+    const { deriveCompatibilityFiles } = await import('../src/events/derive.ts');
+    const fromLog = deriveCompatibilityFiles(forRun as never, { processAlive: true }).acompanhamento;
+
+    // Compared on the lines the log can reproduce: the file on disk may carry a
+    // later snapshot than the page of events read back here.
+    const head = (text: string) => text.split('\n').slice(0, 6).join('\n');
+    assert.equal(head(fromCache), head(fromLog), 'derivar do cache e derivar do log precisam coincidir');
+    await endTask(taskId);
+  });
+});

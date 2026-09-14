@@ -4236,6 +4236,7 @@ var TaskManager = class {
       pending: /* @__PURE__ */ new Map(),
       resolvedRequests: /* @__PURE__ */ new Set(),
       alertsRaised: /* @__PURE__ */ new Set(),
+      derivedCache: null,
       lastDecisionAlertAt: null,
       uncertain: record2.requiresReview,
       disconnected: false,
@@ -4471,6 +4472,7 @@ var TaskManager = class {
       const record2 = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...toolUseId ? { toolUseId } : {}, data, gseq });
       task.lastActivityAt = Date.now();
       task.derivedDirty = true;
+      if (task.derivedCache?.runId === runId) task.derivedCache.events.push(record2);
       task.updatedAt = record2.ts;
       this.options.onEvent(record2);
       return record2;
@@ -4810,6 +4812,7 @@ var TaskManager = class {
     task.currentTool = null;
     task.alertsRaised.clear();
     task.lastDecisionAlertAt = null;
+    task.derivedCache = { runId, events: [] };
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
@@ -5510,7 +5513,8 @@ var TaskManager = class {
         void this.reportTelemetryFailure(task, task.run, failure.file, failure.code);
       }
     } });
-    const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
+    const cached = task.derivedCache?.runId === runId ? task.derivedCache.events : null;
+    const events = cached ? [...cached] : (await task.log.readFrom(0)).filter((event) => event.runId === runId);
     if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: "run_ended", taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
     const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
     const llmUsage = this.usageView(task);
@@ -5529,6 +5533,7 @@ var TaskManager = class {
         this.options.log(`task ${task.record.taskId}: resultado final N\xC3O persistido (${error.code ?? "erro"})`);
         throw error;
       }
+      if (task.derivedCache?.runId === runId) task.derivedCache = null;
     }
   }
   // ------------------------------------------------------------ supervision
