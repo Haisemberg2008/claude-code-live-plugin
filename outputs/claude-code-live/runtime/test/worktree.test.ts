@@ -3,7 +3,7 @@
 // and the refusals are the ones git itself produces.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, rm, access } from 'node:fs/promises';
+import { mkdir, writeFile, rm, access, symlink } from 'node:fs/promises';
 import path from 'node:path';
 import { makeTempRoot, type TempRoot } from './helpers/temp.ts';
 import { assertRejectsCode } from './helpers/assert-code.ts';
@@ -246,5 +246,27 @@ describe('administrative removal', () => {
     const removed = await removeWorktree(repository, target, { force: true });
     assert.equal(removed.removed, true, removed.reason);
     await assert.rejects(access(target));
+  });
+});
+
+describe('one directory, one key', () => {
+  test('two spellings of the same repository produce the same identity', async () => {
+    // What CI exposed: git always reports the long name, while os.tmpdir() and
+    // an inherited environment can report a Windows 8.3 short name. Compared
+    // lexically, `c:/users/runner~1/...` and `c:/users/runneradmin/...` look
+    // like different directories — and for a writer-lock key that means two
+    // runs would each think they own the tree.
+    //
+    // A junction is the portable way to get a second spelling of one directory.
+    const alias = path.join(temp.root, 'atalho-para-o-repo');
+    try {
+      await symlink(repoDir, alias, 'junction');
+    } catch {
+      return; // no symlink privilege here; the invariant is unchanged
+    }
+    assert.equal(canonicalize(alias), canonicalize(repoDir), 'duas grafias, uma chave');
+    const viaAlias = await resolveRepository(alias);
+    assert.equal(viaAlias.repoKey, repository.repoKey, 'a chave do repositorio nao pode depender da grafia');
+    assert.equal(viaAlias.topLevel, repository.topLevel);
   });
 });

@@ -127,10 +127,32 @@ export interface Repository {
   repoKey: string;
 }
 
-/** Canonical spelling used for identity: one path, one key, on every platform. */
-export function canonicalize(target: string): string {
+/** Separator and case normalization only; no filesystem access. */
+function lexical(target: string): string {
   const normalized = target.replace(/\\/g, '/').replace(/\/+$/, '');
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * Canonical spelling used for identity: one path, one key, on every platform.
+ *
+ * Resolves through the filesystem, because the values compared here arrive from
+ * different sources with different spellings of the same directory. git always
+ * reports the long name; `os.tmpdir()` and an inherited environment can report
+ * a Windows 8.3 short name. Comparing `c:/users/runner~1/…` with
+ * `c:/users/runneradmin/…` lexically says "different directory", which for a
+ * writer-lock key means two runs would both think they own a tree.
+ *
+ * Falls back to lexical normalization when the path does not exist — a planned
+ * worktree is canonicalized before it is created, and `canonicalizePlanned`
+ * handles that case by resolving the deepest existing ancestor.
+ */
+export function canonicalize(target: string): string {
+  try {
+    return lexical(realpathSync.native(target));
+  } catch {
+    return lexical(target);
+  }
 }
 
 /**

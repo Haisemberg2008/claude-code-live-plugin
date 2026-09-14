@@ -2595,9 +2595,16 @@ function normalizeStatusPath(field) {
   }
   return value;
 }
-function canonicalize(target) {
+function lexical(target) {
   const normalized = target.replace(/\\/g, "/").replace(/\/+$/, "");
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+function canonicalize(target) {
+  try {
+    return lexical(realpathSync2.native(target));
+  } catch {
+    return lexical(target);
+  }
 }
 function canonicalizePlanned(target) {
   const absolute = path9.resolve(target);
