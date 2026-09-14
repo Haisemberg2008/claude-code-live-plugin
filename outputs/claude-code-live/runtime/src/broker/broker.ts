@@ -374,7 +374,11 @@ export class Broker {
           page = await task.log.readPage(cursor, limit);
         }
         const last = page.events.at(-1);
-        return sendJson(res, 200, { events: page.events, cursor: last ? last.seq : cursor, gapped: page.gapped, cursorEpoch: this.cursorEpoch, task: this.tasks.view(task) });
+        // Summary by default: this is the coordinator's polling loop, and the
+        // panel reads task views over SSE rather than from here. `taskView=full`
+        // restores the complete view for anything that needs it.
+        const wantsFull = url.searchParams.get('taskView') === 'full';
+        return sendJson(res, 200, { events: page.events, cursor: last ? last.seq : cursor, gapped: page.gapped, cursorEpoch: this.cursorEpoch, task: wantsFull ? this.tasks.view(task) : this.tasks.summaryView(task) });
       }
       if (action === 'blobs' && parts[4] && method === 'GET') {
         this.bindHandle(identity, task, body, url);

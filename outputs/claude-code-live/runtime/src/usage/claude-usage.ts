@@ -78,6 +78,14 @@ function add(total: MutableTotal, usage: NormalizedClaudeTurnUsage): void {
   total.partial ||= usage.quality === 'partial';
 }
 
+export interface ClaudeUsageSnapshot {
+  version: 1;
+  seen: string[];
+  total: MutableTotal;
+  models: Array<[string, MutableTotal]>;
+  lastObservedAt: string | null;
+}
+
 export class ClaudeUsageAccumulator {
   private readonly seen = new Set<string>();
   private readonly total = emptyTotal();
@@ -87,6 +95,43 @@ export class ClaudeUsageAccumulator {
   static fromEvents(events: EventRecord[]): ClaudeUsageAccumulator {
     const accumulator = new ClaudeUsageAccumulator();
     for (const event of events) accumulator.addEvent(event);
+    return accumulator;
+  }
+
+  /**
+   * The accumulator's own state, so it can be restored without replaying the
+   * log that produced it.
+   *
+   * `seen` is part of the state, not an optimisation: it is what makes
+   * addEvent idempotent per (runId, turn), so a restored accumulator that
+   * later sees a repeated turn must still refuse to count it twice.
+   */
+  toJSON(): ClaudeUsageSnapshot {
+    return {
+      version: 1,
+      seen: [...this.seen],
+      total: { ...this.total },
+      models: [...this.models.entries()].map(([model, total]) => [model, { ...total }]),
+      lastObservedAt: this.lastObservedAt,
+    };
+  }
+
+  /** Returns null for anything it does not fully recognise, so the caller replays the log. */
+  static fromJSON(value: unknown): ClaudeUsageAccumulator | null {
+    if (!value || typeof value !== 'object') return null;
+    const snapshot = value as Partial<ClaudeUsageSnapshot>;
+    if (snapshot.version !== 1 || !Array.isArray(snapshot.seen) || !Array.isArray(snapshot.models) || !snapshot.total) return null;
+    const accumulator = new ClaudeUsageAccumulator();
+    for (const key of snapshot.seen) {
+      if (typeof key !== 'string') return null;
+      accumulator.seen.add(key);
+    }
+    Object.assign(accumulator.total, snapshot.total);
+    for (const entry of snapshot.models) {
+      if (!Array.isArray(entry) || typeof entry[0] !== 'string' || !entry[1]) return null;
+      accumulator.models.set(entry[0], { ...(entry[1] as MutableTotal) });
+    }
+    accumulator.lastObservedAt = typeof snapshot.lastObservedAt === 'string' ? snapshot.lastObservedAt : null;
     return accumulator;
   }
 

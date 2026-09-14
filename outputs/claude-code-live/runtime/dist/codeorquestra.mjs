@@ -3107,6 +3107,41 @@ var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
     for (const event of events) accumulator.addEvent(event);
     return accumulator;
   }
+  /**
+   * The accumulator's own state, so it can be restored without replaying the
+   * log that produced it.
+   *
+   * `seen` is part of the state, not an optimisation: it is what makes
+   * addEvent idempotent per (runId, turn), so a restored accumulator that
+   * later sees a repeated turn must still refuse to count it twice.
+   */
+  toJSON() {
+    return {
+      version: 1,
+      seen: [...this.seen],
+      total: { ...this.total },
+      models: [...this.models.entries()].map(([model, total]) => [model, { ...total }]),
+      lastObservedAt: this.lastObservedAt
+    };
+  }
+  /** Returns null for anything it does not fully recognise, so the caller replays the log. */
+  static fromJSON(value) {
+    if (!value || typeof value !== "object") return null;
+    const snapshot = value;
+    if (snapshot.version !== 1 || !Array.isArray(snapshot.seen) || !Array.isArray(snapshot.models) || !snapshot.total) return null;
+    const accumulator = new _ClaudeUsageAccumulator();
+    for (const key of snapshot.seen) {
+      if (typeof key !== "string") return null;
+      accumulator.seen.add(key);
+    }
+    Object.assign(accumulator.total, snapshot.total);
+    for (const entry of snapshot.models) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || !entry[1]) return null;
+      accumulator.models.set(entry[0], { ...entry[1] });
+    }
+    accumulator.lastObservedAt = typeof snapshot.lastObservedAt === "string" ? snapshot.lastObservedAt : null;
+    return accumulator;
+  }
   addEvent(event) {
     if (!["turn_completed", "turn_interrupted", "turn_failed"].includes(event.type)) return false;
     const turn = token(event.data.turn);
@@ -4217,7 +4252,10 @@ var TaskManager = class {
     const existing = this.tasks.get(record2.taskId);
     if (existing) return existing;
     const log = await EventLog.open(path14.join(dir, "events.jsonl"));
-    const history = await log.readFrom(0);
+    const usageFile = path14.join(dir, "usage.json");
+    const persistedUsage = await readJsonShared(usageFile);
+    let claudeUsage = persistedUsage.status === "ok" ? ClaudeUsageAccumulator.fromJSON(persistedUsage.value) : null;
+    if (!claudeUsage) claudeUsage = ClaudeUsageAccumulator.fromEvents(await log.readFrom(0));
     const queue = await this.loadQueue(dir);
     const pointer = await readJsonShared(path14.join(dir, "session.json"));
     const task = {
@@ -4242,7 +4280,7 @@ var TaskManager = class {
       disconnected: false,
       previousSessionId: pointer.status === "ok" && typeof pointer.value.sessionId === "string" ? pointer.value.sessionId : null,
       quota: null,
-      claudeUsage: ClaudeUsageAccumulator.fromEvents(history),
+      claudeUsage,
       codexUsage: unavailableCodexUsage(),
       usageRefresh: null,
       writer: null,
@@ -4255,6 +4293,13 @@ var TaskManager = class {
     };
     this.tasks.set(record2.taskId, task);
     return task;
+  }
+  /** Best effort: a missing or stale snapshot only costs a log replay at startup. */
+  async persistUsage(task) {
+    try {
+      await writeFileAtomic(path14.join(task.dir, "usage.json"), JSON.stringify(task.claudeUsage.toJSON(), null, 2));
+    } catch {
+    }
   }
   async persistRecord(task) {
     await writeFileAtomic(path14.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
@@ -4360,7 +4405,55 @@ var TaskManager = class {
     for (const task of this.tasks.values()) ownedPrefixes.add(task.record.taskId.slice(0, 16));
     for (const lock of this.locks.values()) if (lock.quarantined) ownedPrefixes.add(lock.holderTaskId.slice(0, 16));
     const orphans = await listOrphans(this.stateRoot, (_repoKey, taskPrefix) => ownedPrefixes.has(taskPrefix));
-    return { policies: await this.worktreePolicy.list(), orphans };
+    const policies = await this.worktreePolicy.list();
+    const fleet = this.fleetView();
+    for (const entry of fleet.byRepository) {
+      entry.limit = policies.find((policy) => policy.repoKey === entry.repoKey)?.maxParallelRuns ?? null;
+    }
+    return { policies, orphans, fleet };
+  }
+  /**
+   * What N parallel runs are costing, on one account.
+   *
+   * The fleet cap is a number in a policy record, which tells you when you are
+   * refused but not what you are spending. Observation of /usage is serialized;
+   * consumption is not — so approving parallelism without seeing the draw is
+   * approving a cost nobody is shown. This puts the two next to each other:
+   * how many runs are live per repository, what they have drawn so far, and
+   * what the account has left.
+   */
+  fleetView() {
+    const runs = [];
+    const perRepo = /* @__PURE__ */ new Map();
+    for (const task of this.tasks.values()) {
+      const run2 = task.run;
+      if (!run2 || run2.finalized) continue;
+      const repoKey = run2.worktree?.repository.repoKey ?? null;
+      if (repoKey) perRepo.set(repoKey, (perRepo.get(repoKey) ?? 0) + 1);
+      const usage2 = task.claudeUsage.snapshot();
+      runs.push({
+        taskId: task.record.taskId,
+        threadId: task.record.threadId,
+        repoKey,
+        branch: run2.worktree?.branch ?? null,
+        model: run2.observedModel ?? run2.requestedModel,
+        turns: run2.turns,
+        tokens: usage2.quality === "unavailable" ? null : usage2.totalObservedTokens,
+        startedAt: run2.startedAt
+      });
+    }
+    const quota = this.quota.view("claude-fable-5-1");
+    return {
+      runs,
+      byRepository: [...perRepo.entries()].map(([repoKey, active]) => ({ repoKey, active, limit: null })),
+      // Percentages only, exactly as the panel already reports them: never raw
+      // account figures.
+      account: {
+        session: quota.snapshot?.session.remainingPercent ?? null,
+        week: quota.snapshot?.allModels.remainingPercent ?? null,
+        observedAt: quota.observedAt ?? null
+      }
+    };
   }
   /**
    * Removes a retained worktree, on the operator's explicit instruction.
@@ -5178,7 +5271,7 @@ var TaskManager = class {
       }
       case "event": {
         const event = await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
-        task.claudeUsage.addEvent(event);
+        if (task.claudeUsage.addEvent(event)) void this.persistUsage(task);
         this.applyEvent(task, run2, message.type, message.data, message.toolUseId);
         if (message.type === "permission_requested" || message.type === "question_asked") this.changed(task);
         break;
@@ -5625,6 +5718,45 @@ var TaskManager = class {
     }
     const authored = task.run ? [...task.run.claudeAuthored].map((file) => path14.relative(workspace, file).replace(/\\/g, "/")) : [];
     return { observed, claudeAuthored: authored, observedAt: new Date(task.changedFilesCache?.at ?? Date.now()).toISOString() };
+  }
+  /**
+   * What a coordinator polling for changes actually needs.
+   *
+   * The long-poll loop is the orchestrator's main loop, and its context is
+   * finite. The full view carries up to 500 changed paths, the whole quota
+   * block, every queue entry and an input preview per pending request — resent
+   * on every poll whether or not any of it moved. Re-spending the coordinator's
+   * context on unchanged data shortens the session it is trying to run.
+   *
+   * Counts replace lists where a count is what a decision turns on; the full
+   * view stays one query parameter away.
+   */
+  summaryView(task) {
+    const full = this.view(task);
+    return {
+      taskId: full.taskId,
+      threadId: full.threadId,
+      state: full.state,
+      requiresReview: full.requiresReview,
+      coordinatorPresence: full.coordinatorPresence,
+      alerts: full.alerts,
+      workspace: full.workspace,
+      ...full.worktree ? { worktree: { branch: full.worktree.branch, path: full.worktree.path } } : {},
+      currentRun: full.currentRun ? {
+        runId: full.currentRun.runId,
+        status: full.currentRun.status,
+        requestedModel: full.currentRun.requestedModel,
+        observedModel: full.currentRun.observedModel,
+        currentTool: full.currentRun.currentTool,
+        turns: full.currentRun.turns,
+        startedAt: full.currentRun.startedAt
+      } : null,
+      // Kept in full: a pending decision is the thing the coordinator has to
+      // act on, and trimming it would hide what it is deciding about.
+      pendingRequests: full.pendingRequests,
+      queuedMessages: full.queue.filter((entry) => entry.state === "queued").length,
+      changedFiles: { claudeAuthored: full.changedFiles.claudeAuthored, observedCount: full.changedFiles.observed.length }
+    };
   }
   view(task) {
     const run2 = task.run;
@@ -6312,7 +6444,8 @@ var Broker = class {
           page = await task.log.readPage(cursor, limit);
         }
         const last = page.events.at(-1);
-        return sendJson(res, 200, { events: page.events, cursor: last ? last.seq : cursor, gapped: page.gapped, cursorEpoch: this.cursorEpoch, task: this.tasks.view(task) });
+        const wantsFull = url.searchParams.get("taskView") === "full";
+        return sendJson(res, 200, { events: page.events, cursor: last ? last.seq : cursor, gapped: page.gapped, cursorEpoch: this.cursorEpoch, task: wantsFull ? this.tasks.view(task) : this.tasks.summaryView(task) });
       }
       if (action === "blobs" && parts[4] && method === "GET") {
         this.bindHandle(identity, task, body, url);

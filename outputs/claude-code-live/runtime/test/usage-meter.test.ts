@@ -115,3 +115,36 @@ function terminalEvent(
     data: { turn, model, usage },
   };
 }
+
+describe('usage snapshot', () => {
+  test('restoring from the snapshot equals replaying the log, and stays idempotent', () => {
+    const events = [
+      terminalEvent(1, 'run-a', 1, 'claude-fable-5-1', { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 20, cache_creation_input_tokens: 3 }),
+      terminalEvent(2, 'run-a', 2, 'claude-fable-5-1', { input_tokens: 7, output_tokens: 11 }),
+      terminalEvent(3, 'run-b', 1, 'claude-opus-5', { input_tokens: 100, output_tokens: 50 }),
+    ];
+    const replayed = ClaudeUsageAccumulator.fromEvents(events);
+
+    // The snapshot exists so a broker restart does not have to re-read a log
+    // that grows with everything the task ever did. It is only worth anything
+    // if it agrees with that replay exactly.
+    const restored = ClaudeUsageAccumulator.fromJSON(JSON.parse(JSON.stringify(replayed.toJSON())));
+    assert.ok(restored, 'o snapshot precisa ser reconhecido');
+    assert.deepEqual(restored.snapshot(), replayed.snapshot());
+
+    // `seen` is part of the state, not an optimisation: a restored accumulator
+    // that meets a turn it already counted must still refuse it.
+    assert.equal(restored.addEvent(events[0]!), false, 'turno repetido nao pode contar duas vezes');
+    assert.deepEqual(restored.snapshot(), replayed.snapshot());
+
+    // A new turn still counts after restoring.
+    assert.equal(restored.addEvent(terminalEvent(4, 'run-b', 2, 'claude-opus-5', { input_tokens: 1, output_tokens: 1 })), true);
+    assert.equal(restored.snapshot().turns, replayed.snapshot().turns + 1);
+  });
+
+  test('an unrecognised or corrupt snapshot is refused so the caller replays the log', () => {
+    for (const bad of [null, undefined, 42, 'x', {}, { version: 2 }, { version: 1, seen: 'no', models: [], total: {} }, { version: 1, seen: [], models: [['m']], total: {} }]) {
+      assert.equal(ClaudeUsageAccumulator.fromJSON(bad), null, JSON.stringify(bad));
+    }
+  });
+});

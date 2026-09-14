@@ -58,7 +58,7 @@ O adaptador stdio (`mcp-stdio.mjs`) se conecta ao broker ja em execucao — nunc
 |---|---|
 | `codeorquestra_status` | saude do broker, sem dados de tarefas |
 | `codeorquestra_start` | inicia uma execucao v2 na tarefa do handle (job `contractVersion: 2`) |
-| `codeorquestra_wait` | long-poll de eventos a partir de um cursor; atualiza a presenca do coordenador |
+| `codeorquestra_wait` | long-poll de eventos a partir de um cursor; atualiza a presenca do coordenador. O campo `task` vem resumido por padrao (`taskView=full` na rota HTTP devolve a view completa) |
 | `codeorquestra_list` | execucao ativa e historico da tarefa |
 | `codeorquestra_pair` | pareia com a tarefa do painel usando o codigo curto da tela; devolve o taskHandle |
 | `codeorquestra_message` | enfileira orientacao para o proximo turno |
@@ -245,3 +245,17 @@ passados dois minutos entra `decision_pending`, que diz a outra coisa
 verdadeira: ninguem respondeu e nada avanca. O alerta **repete** enquanto
 continuar valendo, e some quando a decisao e respondida. Como todo alerta de
 supervisao, ele so avisa: nada e encerrado.
+
+## Custo da frota
+
+`GET /api/worktrees` (administrativa) passou a devolver tambem `fleet`: quais
+execucoes estao vivas, em que branch, com quantos turnos e tokens observados,
+quantas por repositorio contra o limite aprovado, e o restante da conta em
+percentual.
+
+Existe porque o teto de paralelismo diz quando voce e recusado, nao quanto esta
+gastando. A leitura de `/usage` e serializada; o **consumo nao**. Aprovar N
+execucoes sem ver a conta e aprovar um custo que ninguem mostra.
+
+Somente percentuais, como o painel ja faz: numeros brutos da conta nunca sao
+expostos.
