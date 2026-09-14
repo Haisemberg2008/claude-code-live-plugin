@@ -2959,7 +2959,19 @@ var TrustStore = class {
 var SUPERVISION = {
   inactivityAlertMs: 12e5,
   elapsedAlertMs: 72e5,
-  coordinatorAbsentMs: 9e4
+  coordinatorAbsentMs: 9e4,
+  /**
+   * Waiting for a decision is not idleness — but it is not progress either.
+   *
+   * A run blocked on a permission or a question makes no events, so it is
+   * deliberately exempt from the inactivity alert. The consequence was that it
+   * could sit for hours emitting nothing at all, which from outside is
+   * indistinguishable from work in progress. This threshold says the other true
+   * thing: nobody has answered, and the run is going nowhere until someone
+   * does. Two minutes, because the cost of the alert is a line in the feed and
+   * the cost of missing it is an afternoon.
+   */
+  decisionPendingMs: 12e4
 };
 var COORDINATOR_ABSENT_LABEL = "aguardando coordenador";
 function evaluateSupervision(input) {
@@ -2978,6 +2990,7 @@ function evaluateSupervision(input) {
   const waiting = input.phase === "waiting_permission" || input.phase === "waiting_question" || input.pendingRequests > 0;
   const alerts = [];
   if (!waiting && input.now - input.lastActivityAt >= thresholds.inactivityAlertMs) alerts.push("inactivity_20m");
+  if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push("decision_pending");
   if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push("elapsed_2h");
   const state = waiting && input.phase !== "waiting_permission" && input.phase !== "waiting_question" ? "waiting_permission" : input.phase;
   return { state, alerts, action: "none", coordinatorPresence, coordinatorLabel, requiresReview: false };
@@ -4180,6 +4193,7 @@ var TaskManager = class {
       pending: /* @__PURE__ */ new Map(),
       resolvedRequests: /* @__PURE__ */ new Set(),
       alertsRaised: /* @__PURE__ */ new Set(),
+      lastDecisionAlertAt: null,
       uncertain: record2.requiresReview,
       disconnected: false,
       previousSessionId: pointer.status === "ok" && typeof pointer.value.sessionId === "string" ? pointer.value.sessionId : null,
@@ -4729,6 +4743,7 @@ var TaskManager = class {
     task.phase = "starting";
     task.currentTool = null;
     task.alertsRaised.clear();
+    task.lastDecisionAlertAt = null;
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
@@ -5453,12 +5468,22 @@ var TaskManager = class {
   // ------------------------------------------------------------ supervision
   superviseAll() {
     for (const task of this.tasks.values()) {
+      try {
+        this.superviseTask(task);
+      } catch (error) {
+        this.options.log(`supervis\xE3o falhou para ${task.record.taskId}: ${error.name}`);
+      }
+    }
+  }
+  superviseTask(task) {
+    {
       const run2 = task.run;
-      if (!run2 || run2.finalized) continue;
+      if (!run2 || run2.finalized) return;
       const evaluation = evaluateSupervision({
         now: Date.now(),
         runStartedAt: Date.parse(run2.startedAt),
         lastActivityAt: task.lastActivityAt,
+        oldestPendingRequestAt: oldestPendingAt(task),
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5468,9 +5493,29 @@ var TaskManager = class {
         thresholds: this.thresholds
       });
       for (const alert of evaluation.alerts) {
+        if (alert === "decision_pending") {
+          const now = Date.now();
+          const period = (this.options.supervision ?? SUPERVISION).decisionPendingMs;
+          if (task.lastDecisionAlertAt !== null && now - task.lastDecisionAlertAt < period) continue;
+          task.lastDecisionAlertAt = now;
+          task.alertsRaised.add(alert);
+          const oldest = oldestPendingAt(task);
+          void this.append(task, run2.runId, "alert", {
+            alert,
+            action: "none",
+            pendingRequests: task.pending.size,
+            waitingForSeconds: oldest === null ? null : Math.round((now - oldest) / 1e3),
+            note: "Uma decis\xE3o pendente bloqueia o turno. Esperar n\xE3o \xE9 ociosidade, mas tamb\xE9m n\xE3o \xE9 progresso: nada avan\xE7a at\xE9 algu\xE9m responder."
+          }).then(() => this.changed(task));
+          continue;
+        }
         if (task.alertsRaised.has(alert)) continue;
         task.alertsRaised.add(alert);
         void this.append(task, run2.runId, "alert", { alert, action: "none", note: "Alerta de supervis\xE3o; nenhum encerramento autom\xE1tico." }).then(() => this.changed(task));
+      }
+      if (task.pending.size === 0 && task.lastDecisionAlertAt !== null) {
+        task.lastDecisionAlertAt = null;
+        task.alertsRaised.delete("decision_pending");
       }
     }
   }
@@ -5517,6 +5562,7 @@ var TaskManager = class {
       now,
       runStartedAt: run2 ? Date.parse(run2.startedAt) : now,
       lastActivityAt: task.lastActivityAt,
+      oldestPendingRequestAt: oldestPendingAt(task),
       phase: run2 && run2.finalizing && !run2.finalized ? "busy_model" : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)) || Boolean(run2 && run2.finalizing && !run2.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5635,6 +5681,15 @@ var TaskManager = class {
     return { events: collected, gapped };
   }
 };
+function oldestPendingAt(task) {
+  let oldest = null;
+  for (const request of task.pending.values()) {
+    const at = Date.parse(request.createdAt);
+    if (Number.isNaN(at)) continue;
+    if (oldest === null || at < oldest) oldest = at;
+  }
+  return oldest;
+}
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -6361,7 +6416,7 @@ function parseSupervision() {
   if (!raw || !isHarness()) return void 0;
   try {
     const parsed = JSON.parse(raw);
-    return { inactivityAlertMs: parsed.inactivityAlertMs ?? 12e5, elapsedAlertMs: parsed.elapsedAlertMs ?? 72e5, coordinatorAbsentMs: parsed.coordinatorAbsentMs ?? 9e4 };
+    return { inactivityAlertMs: parsed.inactivityAlertMs ?? 12e5, elapsedAlertMs: parsed.elapsedAlertMs ?? 72e5, coordinatorAbsentMs: parsed.coordinatorAbsentMs ?? 9e4, decisionPendingMs: parsed.decisionPendingMs ?? 12e4 };
   } catch {
     return void 0;
   }

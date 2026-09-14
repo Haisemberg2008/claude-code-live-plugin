@@ -5,6 +5,18 @@ export const SUPERVISION = {
   inactivityAlertMs: 1_200_000,
   elapsedAlertMs: 7_200_000,
   coordinatorAbsentMs: 90_000,
+  /**
+   * Waiting for a decision is not idleness — but it is not progress either.
+   *
+   * A run blocked on a permission or a question makes no events, so it is
+   * deliberately exempt from the inactivity alert. The consequence was that it
+   * could sit for hours emitting nothing at all, which from outside is
+   * indistinguishable from work in progress. This threshold says the other true
+   * thing: nobody has answered, and the run is going nowhere until someone
+   * does. Two minutes, because the cost of the alert is a line in the feed and
+   * the cost of missing it is an afternoon.
+   */
+  decisionPendingMs: 120_000,
 } as const;
 
 export const COORDINATOR_ABSENT_LABEL = 'aguardando coordenador';
@@ -13,6 +25,7 @@ export interface SupervisionThresholds {
   inactivityAlertMs: number;
   elapsedAlertMs: number;
   coordinatorAbsentMs: number;
+  decisionPendingMs: number;
 }
 
 export interface SupervisionInput {
@@ -23,6 +36,8 @@ export interface SupervisionInput {
   processAlive: boolean;
   coordinatorLastSeenAt: number | null;
   pendingRequests: number;
+  /** When the oldest unanswered request arrived; null when none is pending. */
+  oldestPendingRequestAt: number | null;
   brokerRestartedDuringRun: boolean;
   terminal: boolean;
   thresholds?: SupervisionThresholds;
@@ -53,6 +68,9 @@ export function evaluateSupervision(input: SupervisionInput): SupervisionResult 
   const waiting = input.phase === 'waiting_permission' || input.phase === 'waiting_question' || input.pendingRequests > 0;
   const alerts: string[] = [];
   if (!waiting && input.now - input.lastActivityAt >= thresholds.inactivityAlertMs) alerts.push('inactivity_20m');
+  // A separate claim from inactivity, not a replacement for it: `inactivity_20m`
+  // still correctly stays silent while waiting, because waiting is not idling.
+  if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push('decision_pending');
   if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push('elapsed_2h');
   const state: TaskState = waiting && input.phase !== 'waiting_permission' && input.phase !== 'waiting_question' ? 'waiting_permission' : input.phase;
   return { state, alerts, action: 'none', coordinatorPresence, coordinatorLabel, requiresReview: false };

@@ -147,6 +147,8 @@ export interface TaskState {
   pending: Map<string, PendingRequestView>;
   resolvedRequests: Set<string>;
   alertsRaised: Set<string>;
+  /** Last time the still-blocking decision alert was raised; null when none is pending. */
+  lastDecisionAlertAt: number | null;
   uncertain: boolean;
   disconnected: boolean;
   previousSessionId: string | null;
@@ -492,6 +494,7 @@ export class TaskManager {
       pending: new Map(),
       resolvedRequests: new Set(),
       alertsRaised: new Set(),
+      lastDecisionAlertAt: null,
       uncertain: record.requiresReview,
       disconnected: false,
       previousSessionId: pointer.status === 'ok' && typeof pointer.value.sessionId === 'string' ? pointer.value.sessionId : null,
@@ -1112,6 +1115,7 @@ export class TaskManager {
     task.phase = 'starting';
     task.currentTool = null;
     task.alertsRaised.clear();
+    task.lastDecisionAlertAt = null;
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
@@ -1903,12 +1907,27 @@ export class TaskManager {
 
   private superviseAll(): void {
     for (const task of this.tasks.values()) {
+      // Per task, because supervision runs on a timer over every task at once:
+      // without this, one task that throws stops the tick and silently blinds
+      // supervision for every other task in the broker — the failure mode being
+      // exactly the silence these alerts exist to break.
+      try {
+        this.superviseTask(task);
+      } catch (error) {
+        this.options.log(`supervisão falhou para ${task.record.taskId}: ${(error as Error).name}`);
+      }
+    }
+  }
+
+  private superviseTask(task: TaskState): void {
+    {
       const run = task.run;
-      if (!run || run.finalized) continue;
+      if (!run || run.finalized) return;
       const evaluation = evaluateSupervision({
         now: Date.now(),
         runStartedAt: Date.parse(run.startedAt),
         lastActivityAt: task.lastActivityAt,
+        oldestPendingRequestAt: oldestPendingAt(task),
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -1918,9 +1937,35 @@ export class TaskManager {
         thresholds: this.thresholds,
       });
       for (const alert of evaluation.alerts) {
+        // `decision_pending` repeats while it is still true, because the whole
+        // point is that nobody has answered yet: raising it once and going
+        // quiet again would reproduce the silence it exists to break. Every
+        // other alert stays one-shot.
+        if (alert === 'decision_pending') {
+          const now = Date.now();
+          const period = (this.options.supervision ?? SUPERVISION).decisionPendingMs;
+          if (task.lastDecisionAlertAt !== null && now - task.lastDecisionAlertAt < period) continue;
+          task.lastDecisionAlertAt = now;
+          task.alertsRaised.add(alert);
+          const oldest = oldestPendingAt(task);
+          void this.append(task, run.runId, 'alert', {
+            alert,
+            action: 'none',
+            pendingRequests: task.pending.size,
+            waitingForSeconds: oldest === null ? null : Math.round((now - oldest) / 1000),
+            note: 'Uma decisão pendente bloqueia o turno. Esperar não é ociosidade, mas também não é progresso: nada avança até alguém responder.',
+          }).then(() => this.changed(task));
+          continue;
+        }
         if (task.alertsRaised.has(alert)) continue;
         task.alertsRaised.add(alert);
         void this.append(task, run.runId, 'alert', { alert, action: 'none', note: 'Alerta de supervisão; nenhum encerramento automático.' }).then(() => this.changed(task));
+      }
+      // Answered: the alert stops being true, so it stops being reported and
+      // may fire again cleanly for the next decision.
+      if (task.pending.size === 0 && task.lastDecisionAlertAt !== null) {
+        task.lastDecisionAlertAt = null;
+        task.alertsRaised.delete('decision_pending');
       }
     }
   }
@@ -1971,6 +2016,7 @@ export class TaskManager {
       now,
       runStartedAt: run ? Date.parse(run.startedAt) : now,
       lastActivityAt: task.lastActivityAt,
+      oldestPendingRequestAt: oldestPendingAt(task),
       phase: run && run.finalizing && !run.finalized ? 'busy_model' : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)) || Boolean(run && run.finalizing && !run.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2108,6 +2154,17 @@ export class TaskManager {
 }
 
 /** A plain object, for validating loosely typed request bodies. */
+/** When the oldest unanswered request arrived, for the decision alert. */
+function oldestPendingAt(task: TaskState): number | null {
+  let oldest: number | null = null;
+  for (const request of task.pending.values()) {
+    const at = Date.parse(request.createdAt);
+    if (Number.isNaN(at)) continue;
+    if (oldest === null || at < oldest) oldest = at;
+  }
+  return oldest;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

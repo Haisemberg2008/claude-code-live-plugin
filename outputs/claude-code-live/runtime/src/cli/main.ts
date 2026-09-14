@@ -70,7 +70,7 @@ function parseSupervision(): SupervisionThresholds | undefined {
   if (!raw || !isHarness()) return undefined;
   try {
     const parsed = JSON.parse(raw) as Partial<SupervisionThresholds>;
-    return { inactivityAlertMs: parsed.inactivityAlertMs ?? 1_200_000, elapsedAlertMs: parsed.elapsedAlertMs ?? 7_200_000, coordinatorAbsentMs: parsed.coordinatorAbsentMs ?? 90_000 };
+    return { inactivityAlertMs: parsed.inactivityAlertMs ?? 1_200_000, elapsedAlertMs: parsed.elapsedAlertMs ?? 7_200_000, coordinatorAbsentMs: parsed.coordinatorAbsentMs ?? 90_000, decisionPendingMs: parsed.decisionPendingMs ?? 120_000 };
   } catch {
     return undefined;
   }
