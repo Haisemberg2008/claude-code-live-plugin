@@ -202,14 +202,14 @@ var init_cli_resolver = __esm({
 });
 
 // src/cli/main.ts
-import { promises as fs15 } from "node:fs";
-import path15 from "node:path";
+import { promises as fs18 } from "node:fs";
+import path18 from "node:path";
 import { pathToFileURL } from "node:url";
 
 // src/broker/broker.ts
 import http from "node:http";
-import { promises as fs13 } from "node:fs";
-import path13 from "node:path";
+import { promises as fs16 } from "node:fs";
+import path16 from "node:path";
 import { randomUUID as randomUUID2 } from "node:crypto";
 
 // src/shared/types.ts
@@ -337,10 +337,10 @@ var StateWriter = class {
     this.createDirectory = options.createDirectory !== false;
     this.onTelemetryFailure = options.onTelemetryFailure;
   }
-  async writeTelemetry(fileName, record) {
+  async writeTelemetry(fileName, record2) {
     const target = path.join(this.directory, fileName);
     try {
-      await writeFileAtomic(target, JSON.stringify(record, null, 2), { maxWaitMs: this.telemetryMaxWaitMs, createDirectory: this.createDirectory });
+      await writeFileAtomic(target, JSON.stringify(record2, null, 2), { maxWaitMs: this.telemetryMaxWaitMs, createDirectory: this.createDirectory });
       return { ok: true, file: fileName };
     } catch (error) {
       const code = error instanceof StateFileError ? error.code : "STATE_FILE_WRITE_FAILED";
@@ -350,19 +350,19 @@ var StateWriter = class {
       return { ok: false, file: fileName, code };
     }
   }
-  writeStatus(record) {
-    return this.writeTelemetry("status.json", record);
+  writeStatus(record2) {
+    return this.writeTelemetry("status.json", record2);
   }
-  async writeFinalResult(record, fileName = "resultado.json") {
+  async writeFinalResult(record2, fileName = "resultado.json") {
     const primary = path.join(this.directory, fileName);
     try {
-      const outcome = await writeFileAtomic(primary, JSON.stringify(record, null, 2), { maxWaitMs: this.finalMaxWaitMs, createDirectory: this.createDirectory });
+      const outcome = await writeFileAtomic(primary, JSON.stringify(record2, null, 2), { maxWaitMs: this.finalMaxWaitMs, createDirectory: this.createDirectory });
       return { ok: true, path: primary, fallback: false, attempts: outcome.attempts };
     } catch (primaryError) {
       const primaryCode = primaryError instanceof StateFileError ? primaryError.code : "STATE_FILE_WRITE_FAILED";
       const fallbackPath = path.join(this.directory, this.fallbackFileName);
       const fallbackRecord = {
-        ...record,
+        ...record2,
         persistence: {
           primaryFile: fileName,
           code: primaryCode,
@@ -434,6 +434,9 @@ import { createHash, randomBytes as randomBytes2, timingSafeEqual } from "node:c
 import { promises as fs2 } from "node:fs";
 import path2 from "node:path";
 var BOOTSTRAP_TOKEN_TTL_MS = 10 * 6e4;
+var PAIRING_CODE_TTL_MS = 5 * 6e4;
+var PAIRING_CODE_LENGTH = 6;
+var PAIRING_ALPHABET = "234679ACDEFGHJKMNPQRTUVWXYZ";
 function randomToken(bytes = 32) {
   return randomBytes2(bytes).toString("base64url");
 }
@@ -449,6 +452,7 @@ var IdentityRegistry = class {
   secret = "";
   secretFile;
   bootstrapTokens = /* @__PURE__ */ new Map();
+  pairingCodes = /* @__PURE__ */ new Map();
   sessions = /* @__PURE__ */ new Map();
   constructor(brokerDir) {
     this.secretFile = path2.join(brokerDir, "secret");
@@ -480,25 +484,64 @@ var IdentityRegistry = class {
     }
   }
   mintBootstrapToken(taskScope) {
-    const token = randomToken(32);
+    const token2 = randomToken(32);
     this.pruneBootstrapTokens();
-    this.bootstrapTokens.set(token, { taskScope, createdAt: Date.now(), used: false });
-    return token;
+    this.bootstrapTokens.set(token2, { taskScope, createdAt: Date.now(), used: false });
+    return token2;
   }
   /** Single use AND time limited: an old unused link stops working on its own. */
-  redeemBootstrapToken(token, now = Date.now()) {
-    this.pruneBootstrapTokens(now, token);
-    const entry = this.bootstrapTokens.get(token);
+  redeemBootstrapToken(token2, now = Date.now()) {
+    this.pruneBootstrapTokens(now, token2);
+    const entry = this.bootstrapTokens.get(token2);
     if (!entry) return { ok: false, code: "BOOTSTRAP_TOKEN_INVALID" };
     if (entry.used) return { ok: false, code: "BOOTSTRAP_TOKEN_USED" };
     if (now - entry.createdAt > BOOTSTRAP_TOKEN_TTL_MS) {
-      this.bootstrapTokens.delete(token);
+      this.bootstrapTokens.delete(token2);
       return { ok: false, code: "BOOTSTRAP_TOKEN_EXPIRED" };
     }
     entry.used = true;
     const session = { sessionId: `sess-${randomToken(8)}`, cookie: randomToken(32), taskScope: entry.taskScope, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
     this.sessions.set(session.cookie, session);
     return { ok: true, session };
+  }
+  /** Drops expired codes. `keep` is evaluated by the caller, so its own expiry stays reportable. */
+  prunePairingCodes(now = Date.now(), keep) {
+    for (const [key, value] of this.pairingCodes) {
+      if (key !== keep && now - value.createdAt > PAIRING_CODE_TTL_MS) this.pairingCodes.delete(key);
+    }
+  }
+  /**
+   * A short code a person reads off the panel and hands to the coordinator.
+   *
+   * Short because it has to be repeatable by a human, which is the whole point:
+   * the alternative is copying a 43-character handle out of a terminal. Its
+   * shortness is affordable because it is single use, expires in five minutes,
+   * and can only be minted by a browser session — which itself only exists
+   * after someone redeemed a single-use, time-limited link on this machine.
+   */
+  mintPairingCode(taskId) {
+    this.prunePairingCodes();
+    let code = "";
+    do {
+      code = Array.from(randomBytes2(PAIRING_CODE_LENGTH), (byte) => PAIRING_ALPHABET[byte % PAIRING_ALPHABET.length]).join("");
+    } while (this.pairingCodes.has(code));
+    const createdAt = Date.now();
+    this.pairingCodes.set(code, { taskId, createdAt, used: false });
+    return { code, expiresAt: new Date(createdAt + PAIRING_CODE_TTL_MS).toISOString() };
+  }
+  /** Single use AND time limited, exactly like the bootstrap link. */
+  redeemPairingCode(raw, now = Date.now()) {
+    const code = raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    this.prunePairingCodes(now, code);
+    const entry = this.pairingCodes.get(code);
+    if (!entry) return { ok: false, code: "PAIRING_CODE_INVALID" };
+    if (entry.used) return { ok: false, code: "PAIRING_CODE_USED" };
+    if (now - entry.createdAt > PAIRING_CODE_TTL_MS) {
+      this.pairingCodes.delete(code);
+      return { ok: false, code: "PAIRING_CODE_EXPIRED" };
+    }
+    entry.used = true;
+    return { ok: true, taskId: entry.taskId };
   }
   sessionForCookie(cookie) {
     return this.sessions.get(cookie) ?? null;
@@ -569,8 +612,8 @@ function parseCookies(header) {
 function resolveIdentity(req, registry) {
   const authorization = req.headers.authorization;
   if (typeof authorization === "string" && authorization.startsWith("Bearer ")) {
-    const token = authorization.slice("Bearer ".length).trim();
-    if (registry.verifySecret(token)) {
+    const token2 = authorization.slice("Bearer ".length).trim();
+    if (registry.verifySecret(token2)) {
       const client = String(req.headers[CLIENT_HEADER] ?? "").toLowerCase();
       return { source: client === "mcp" ? "mcp" : "local-secret", taskScope: null, sessionId: null };
     }
@@ -724,6 +767,20 @@ data: ${JSON.stringify({ reason: "REPLAY_BUFFER_OVERFLOW", from: null, epoch: op
     client.bufferedBytes = 0;
     return client;
   }
+  /**
+   * How many live subscribers would receive this task's events.
+   *
+   * Attachment is not attention: a background tab, a reconnect still pending, a
+   * curl that never closed its connection all count. This proves a channel
+   * exists and nothing more, which is the most any broker can actually verify —
+   * so the text built on it must say "um canal está anexado", never "alguém
+   * está olhando".
+   */
+  observerCount(taskId) {
+    let total = 0;
+    for (const client of this.clients) if (this.visible(client, taskId)) total += 1;
+    return total;
+  }
   visible(client, taskId) {
     if (client.taskScope && client.taskScope !== taskId) return false;
     if (client.taskId && client.taskId !== taskId) return false;
@@ -794,10 +851,10 @@ data: ${JSON.stringify(frame)}
 };
 
 // src/broker/task-manager.ts
-import { spawn as spawn5 } from "node:child_process";
+import { spawn as spawn7 } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs12, realpathSync as realpathSync2 } from "node:fs";
-import path11 from "node:path";
+import { promises as fs15, realpathSync as realpathSync3 } from "node:fs";
+import path14 from "node:path";
 
 // src/contract/job-contract.ts
 var CONTRACT_VERSION = 2;
@@ -967,6 +1024,56 @@ function resolveAuth(job) {
   for (const key of Object.keys(raw)) if (key !== "allowApiBilling") throw new ContractError("AUTH_INVALID", `auth cont\xE9m o campo inesperado ${key}.`);
   return { allowApiBilling: allow === true };
 }
+var REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/;
+function resolveRefName(value, field) {
+  if (value === void 0 || value === null) return null;
+  if (typeof value !== "string") throw new ContractError("EXECUTION_BRANCH_INVALID", `execution.worktree.${field} deve ser texto ou null.`);
+  const invalid = (why) => {
+    throw new ContractError("EXECUTION_BRANCH_INVALID", `execution.worktree.${field} ${why}`);
+  };
+  if (!REF_NAME.test(value)) invalid("aceita apenas letras, d\xEDgitos, ponto, h\xEDfen, barra e sublinhado, come\xE7ando por letra ou d\xEDgito, com no m\xE1ximo 101 caracteres.");
+  if (value.includes("..")) invalid('n\xE3o pode conter "..".');
+  if (value.endsWith("/") || value.endsWith(".")) invalid('n\xE3o pode terminar em "/" nem ".".');
+  for (const part of value.split("/")) {
+    if (part === "") invalid('n\xE3o pode conter componentes vazios ("//").');
+    if (part.startsWith(".")) invalid('n\xE3o pode ter componente come\xE7ando com ".".');
+    if (part.endsWith(".lock")) invalid('n\xE3o pode ter componente terminando em ".lock".');
+  }
+  return value;
+}
+function resolveExecution(job, coordination, profile) {
+  const raw = own(job, "execution");
+  if (raw === void 0 || raw === null) return { mode: "checkout", worktree: null };
+  if (!isDict(raw)) throw new ContractError("EXECUTION_INVALID", "execution deve ser um objeto.");
+  for (const key of Object.keys(raw)) {
+    if (key !== "mode" && key !== "worktree") throw new ContractError("EXECUTION_INVALID", `execution cont\xE9m o campo inesperado ${key}.`);
+  }
+  const mode = own(raw, "mode");
+  if (mode !== "checkout" && mode !== "worktree") throw new ContractError("EXECUTION_INVALID", "execution.mode deve ser checkout ou worktree.");
+  const worktreeRaw = own(raw, "worktree");
+  if (mode === "checkout") {
+    if (worktreeRaw !== void 0 && worktreeRaw !== null) throw new ContractError("EXECUTION_INVALID", "execution.worktree s\xF3 \xE9 aceito quando execution.mode \xE9 worktree.");
+    return { mode: "checkout", worktree: null };
+  }
+  if (profile === "read") throw new ContractError("WORKTREE_NOT_APPLICABLE", "O perfil read n\xE3o toma trava de escrita e deve inspecionar a mesma \xE1rvore que o usu\xE1rio v\xEA.");
+  if (coordination.phase !== "execution") throw new ContractError("WORKTREE_NOT_APPLICABLE", "Um worktree s\xF3 \xE9 provisionado na fase de execu\xE7\xE3o.");
+  if (coordination.responsibilities.implementation !== "claude") throw new ContractError("WORKTREE_NOT_APPLICABLE", "Um worktree s\xF3 \xE9 provisionado quando implementation pertence ao Claude.");
+  if (worktreeRaw === void 0 || worktreeRaw === null) return { mode: "worktree", worktree: { branch: null, baseRef: null, onExistingWork: "refuse" } };
+  if (!isDict(worktreeRaw)) throw new ContractError("EXECUTION_INVALID", "execution.worktree deve ser um objeto ou null.");
+  for (const key of Object.keys(worktreeRaw)) {
+    if (key !== "branch" && key !== "baseRef" && key !== "onExistingWork") throw new ContractError("EXECUTION_INVALID", `execution.worktree cont\xE9m o campo inesperado ${key}.`);
+  }
+  const onExistingWork = own(worktreeRaw, "onExistingWork");
+  if (onExistingWork !== void 0 && onExistingWork !== "refuse") throw new ContractError("EXECUTION_INVALID", 'execution.worktree.onExistingWork aceita apenas "refuse".');
+  return {
+    mode: "worktree",
+    worktree: {
+      branch: resolveRefName(own(worktreeRaw, "branch"), "branch"),
+      baseRef: resolveRefName(own(worktreeRaw, "baseRef"), "baseRef"),
+      onExistingWork: "refuse"
+    }
+  };
+}
 function resolveV2(job) {
   for (const legacyField of ["mode", "allowedCommands", "modelPolicy", "timeoutPolicy", "timeoutSeconds"]) {
     if (Object.prototype.hasOwnProperty.call(job, legacyField)) throw new ContractError("LEGACY_FIELD_IN_V2", `O campo legado ${legacyField} n\xE3o existe no contrato v2.`);
@@ -980,6 +1087,7 @@ function resolveV2(job) {
   const model = resolveModelV2(own(job, "model"));
   const effort = resolveEffortV2(own(job, "effort"));
   const scope = resolveScope(own(job, "scope"), coordination.phase);
+  const execution = resolveExecution(job, coordination, profileRaw);
   const codexThreadId = resolveThreadId(own(job, "codexThreadId"));
   const auth = resolveAuth(job);
   const resumeFrom = stringField(own(job, "resumeFrom"));
@@ -999,6 +1107,7 @@ function resolveV2(job) {
     effort,
     coordination,
     scope,
+    execution,
     launch: { permissionMode: "default", safeMode: false, permissionPromptsDisabled: false, restricted: false, strictMcpConfig: true },
     capabilities,
     limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
@@ -1048,6 +1157,9 @@ function resolveLegacyTimeoutPolicy(policy, timeoutSeconds) {
   return { mode: "adaptive", renewEverySeconds: renew, idleAfterSeconds: idle, hardStopAfterSeconds: hard };
 }
 function resolveLegacy(job) {
+  if (Object.prototype.hasOwnProperty.call(job, "execution")) {
+    throw new ContractError("V2_FIELD_IN_LEGACY", "O campo execution pertence ao contrato v2 (contractVersion: 2); o runner legado executa sempre no checkout declarado.");
+  }
   const workspace = resolveWorkspace(own(job, "workspace"));
   const { prompt, promptFile } = resolvePrompt(job);
   const coordination = resolveCoordination(own(job, "coordination"));
@@ -1099,6 +1211,10 @@ function resolveLegacy(job) {
     effort,
     coordination,
     scope: { summary: coordination.planSummary, paths: [], wholeWorkspace: false },
+    // The legacy runner has no worktree provisioning; a v1 job always runs in
+    // the declared checkout. An `execution` field here is refused above rather
+    // than ignored, so it can never look accepted.
+    execution: { mode: "checkout", worktree: null },
     launch: { permissionMode: "dontAsk", safeMode: true, permissionPromptsDisabled: true, restricted: profileRaw === "restricted", strictMcpConfig: true },
     capabilities,
     limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
@@ -1401,9 +1517,9 @@ function scanForbidden(value, trail = []) {
     return null;
   }
   if (value && typeof value === "object") {
-    const record = value;
-    if (typeof record.type === "string" && HIDDEN_BLOCK_TYPES.has(record.type)) return [...trail, `type=${record.type}`].join(".");
-    for (const [key, child] of Object.entries(record)) {
+    const record2 = value;
+    if (typeof record2.type === "string" && HIDDEN_BLOCK_TYPES.has(record2.type)) return [...trail, `type=${record2.type}`].join(".");
+    for (const [key, child] of Object.entries(record2)) {
       if (FORBIDDEN_KEYS.has(key.toLowerCase())) return [...trail, key].join(".");
       const hit = scanForbidden(child, [...trail, key]);
       if (hit) return hit;
@@ -1434,8 +1550,8 @@ var EventLog = class _EventLog {
   get lastSeq() {
     return this.nextSeq - 1;
   }
-  pushCache(record, bytes) {
-    this.cache.push(record);
+  pushCache(record2, bytes) {
+    this.cache.push(record2);
     this.cacheBytes += bytes;
     while (this.cache.length > CACHE_MAX_RECORDS || this.cacheBytes > CACHE_MAX_BYTES && this.cache.length > 1) {
       const dropped = this.cache.shift();
@@ -1443,7 +1559,7 @@ var EventLog = class _EventLog {
       this.cacheBytes -= Buffer.byteLength(JSON.stringify(dropped), "utf8");
       this.cacheStartSeq = this.cache[0]?.seq ?? this.nextSeq;
     }
-    if (this.cache.length === 1) this.cacheStartSeq = record.seq;
+    if (this.cache.length === 1) this.cacheStartSeq = record2.seq;
   }
   async load() {
     let handle;
@@ -1565,7 +1681,7 @@ var EventLog = class _EventLog {
       const data = JSON.parse(JSON.stringify(input.data ?? {}));
       const forbidden = scanForbidden(data);
       if (forbidden) throw new EventLogError("EVENT_FORBIDDEN_FIELD", `Conte\xFAdo oculto ou sens\xEDvel em evento: ${forbidden}`);
-      const record = {
+      const record2 = {
         seq: this.nextSeq,
         ...input.gseq !== void 0 ? { gseq: input.gseq } : {},
         ts: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1576,7 +1692,7 @@ var EventLog = class _EventLog {
         ...input.toolUseId !== void 0 ? { toolUseId: input.toolUseId } : {},
         data
       };
-      const serialized = JSON.stringify(record);
+      const serialized = JSON.stringify(record2);
       const bytes = Buffer.byteLength(serialized, "utf8");
       if (bytes > MAX_RECORD_BYTES) {
         throw new EventLogError("EVENT_RECORD_TOO_LARGE", `Evento ${input.type} com ${bytes} bytes excede o limite de ${MAX_RECORD_BYTES}; use uma pr\xE9via limitada com armazenamento externo.`);
@@ -1585,14 +1701,14 @@ var EventLog = class _EventLog {
 `, "utf8");
       this.needsSeparator = false;
       this.nextSeq += 1;
-      this.pushCache(record, bytes);
+      this.pushCache(record2, bytes);
       for (const listener of this.listeners) {
         try {
-          listener(structuredClone(record));
+          listener(structuredClone(record2));
         } catch {
         }
       }
-      return structuredClone(record);
+      return structuredClone(record2);
     };
     const next = this.chain.then(run2, run2);
     this.chain = next.catch(() => void 0);
@@ -1609,9 +1725,9 @@ var EventLog = class _EventLog {
    */
   async readPage(cursor, limit = 2e3, byteBudget = REPLAY_MAX_BYTES) {
     await this.chain.catch(() => void 0);
-    const window = new RollingWindow(limit, byteBudget);
+    const window2 = new RollingWindow(limit, byteBudget);
     if (cursor + 1 >= this.cacheStartSeq) {
-      for (const event of this.cache) if (event.seq > cursor) window.push(structuredClone(event));
+      for (const event of this.cache) if (event.seq > cursor) window2.push(structuredClone(event));
     } else {
       const reader = readline.createInterface({ input: createReadStream(this.file, { encoding: "utf8" }), crlfDelay: Infinity });
       try {
@@ -1619,7 +1735,7 @@ var EventLog = class _EventLog {
           if (!line) continue;
           try {
             const parsed = JSON.parse(line);
-            if (parsed.seq > cursor) window.push(parsed);
+            if (parsed.seq > cursor) window2.push(parsed);
           } catch {
           }
         }
@@ -1627,8 +1743,8 @@ var EventLog = class _EventLog {
         reader.close();
       }
     }
-    const page = window.events;
-    return { events: page, gapped: window.dropped, firstSeq: page[0]?.seq ?? null };
+    const page = window2.events;
+    return { events: page, gapped: window2.dropped, firstSeq: page[0]?.seq ?? null };
   }
   /**
    * Reads the page immediately BEFORE `seq`, so a client can walk backwards
@@ -1638,12 +1754,12 @@ var EventLog = class _EventLog {
   async readBefore(seq, limit = 200, byteBudget = REPLAY_MAX_BYTES) {
     await this.chain.catch(() => void 0);
     if (seq <= 1) return { events: [], more: false };
-    const window = new RollingWindow(limit, byteBudget);
+    const window2 = new RollingWindow(limit, byteBudget);
     let oldestSeen = null;
     const consider = (event) => {
       if (event.seq >= seq) return;
       if (oldestSeen === null || event.seq < oldestSeen) oldestSeen = event.seq;
-      window.push(event);
+      window2.push(event);
     };
     if (this.cacheStartSeq <= 1 || seq > this.cacheStartSeq) {
       for (const event of this.cache) consider(structuredClone(event));
@@ -1668,7 +1784,7 @@ var EventLog = class _EventLog {
       }
       if (disk.events.length) return { events: disk.events, more: (disk.events[0]?.seq ?? 1) > 1 };
     }
-    const events = window.events;
+    const events = window2.events;
     return { events, more: (events[0]?.seq ?? 1) > 1 };
   }
   subscribe(listener) {
@@ -1839,8 +1955,18 @@ async function readIf(file) {
     return null;
   }
 }
+function realpathOrResolve(target) {
+  try {
+    return realpathNative(target);
+  } catch {
+    return path6.resolve(target);
+  }
+}
 function rel(root, file) {
-  return path6.relative(root, file).replace(/\\/g, "/");
+  const relative = path6.relative(root, file).replace(/\\/g, "/");
+  if (!relative.startsWith("../")) return relative;
+  const retried = path6.relative(realpathOrResolve(root), realpathOrResolve(file)).replace(/\\/g, "/");
+  return retried.startsWith("../") ? relative : retried;
 }
 function mcpDetails(config) {
   const url = typeof config.url === "string" ? config.url : null;
@@ -1855,12 +1981,12 @@ function mcpDetails(config) {
   return { transport: "stdio", command: typeof config.command === "string" ? path6.basename(config.command) : null };
 }
 function commandTokens(command) {
-  return command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+  return command.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token2) => token2.replace(/^["']|["']$/g, "")) ?? [];
 }
 var VARIABLE_PATTERN = /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?|%([A-Za-z_][A-Za-z0-9_]*)%/g;
-function expandHookVariables(token, workspace) {
+function expandHookVariables(token2, workspace) {
   const unresolved = [];
-  const value = token.replace(VARIABLE_PATTERN, (match, dollar, percent) => {
+  const value = token2.replace(VARIABLE_PATTERN, (match, dollar, percent) => {
     const name = dollar ?? percent ?? "";
     if (name === "CLAUDE_PROJECT_DIR") return workspace;
     unresolved.push(name);
@@ -1872,15 +1998,15 @@ async function collectHookScripts(collector, command, root, rootCanonical, scope
   const scripts = [];
   for (const rawToken of commandTokens(command)) {
     const expansion = expandHookVariables(rawToken, workspace);
-    const token = expansion.value;
-    const looksLikeScript = SCRIPT_EXTENSIONS.test(token) || token.includes("/") || token.includes("\\");
-    if (!looksLikeScript || /^https?:\/\//i.test(token)) continue;
+    const token2 = expansion.value;
+    const looksLikeScript = SCRIPT_EXTENSIONS.test(token2) || token2.includes("/") || token2.includes("\\");
+    if (!looksLikeScript || /^https?:\/\//i.test(token2)) continue;
     if (expansion.unresolved.length > 0) {
       collector.skipped.push({ path: `${referencedBy} -> ${rawToken}`, reason: `UNRESOLVED_HOOK_ENTRYPOINT:${expansion.unresolved.join(",")}` });
       collector.incomplete = true;
       continue;
     }
-    const absolute = path6.resolve(root, token);
+    const absolute = path6.resolve(root, token2);
     let real;
     try {
       real = realpathNative(absolute);
@@ -1889,7 +2015,7 @@ async function collectHookScripts(collector, command, root, rootCanonical, scope
     }
     const canonical = canonicalizeWorkspace(real);
     if (canonical !== rootCanonical && !canonical.startsWith(`${rootCanonical}/`)) {
-      collector.skipped.push({ path: token, reason: "HOOK_SCRIPT_OUTSIDE_ROOT" });
+      collector.skipped.push({ path: token2, reason: "HOOK_SCRIPT_OUTSIDE_ROOT" });
       collector.incomplete = true;
       continue;
     }
@@ -2085,7 +2211,7 @@ async function collectChildren(collector, workspace, workspaceCanonical, dir, de
   }
 }
 async function inventoryCustomizations(workspace, options = {}) {
-  const resolved = path6.resolve(workspace);
+  const resolved = realpathOrResolve(workspace);
   const canonicalWorkspace = canonicalizeWorkspace(resolved);
   const collector = { items: [], skipped: [], incomplete: false, configs: {} };
   const toRel = (file) => rel(resolved, file);
@@ -2197,173 +2323,77 @@ function resolveLaunchCustomizations(input) {
   };
 }
 
-// src/trust/trust-store.ts
-import { createHash as createHash3 } from "node:crypto";
-import { promises as fs7 } from "node:fs";
+// src/policy/action-classifier.ts
+import fs7 from "node:fs";
 import path7 from "node:path";
-var TrustStoreError = class extends Error {
-  code;
-  constructor(code, message) {
-    super(message);
-    this.name = "TrustStoreError";
-    this.code = code;
-  }
-};
-var TrustStore = class {
-  root;
-  constructor(root) {
-    this.root = root;
-  }
-  fileFor(canonicalWorkspace) {
-    return path7.join(this.root, "trust", `${createHash3("sha256").update(canonicalWorkspace).digest("hex")}.json`);
-  }
-  async approve(input) {
-    if (input.inventory.incomplete) throw new TrustStoreError("INVENTORY_INCOMPLETE", "O invent\xE1rio est\xE1 incompleto; aprove somente ap\xF3s a descoberta completa.");
-    const approvedSet = input.approvedItems === "all" ? null : new Set(input.approvedItems);
-    const approvedItems = input.inventory.items.filter((item) => approvedSet === null || approvedSet.has(item.relativePath)).map((item) => ({ relativePath: item.relativePath, sha256: item.sha256, kind: item.kind, scope: item.scope }));
-    const mcpServers = {};
-    for (const item of approvedItems) {
-      if (item.kind !== "mcp") continue;
-      const name = item.relativePath.split("#").pop() ?? "";
-      if (name && name !== "parse-error") mcpServers[name] = { approved: true, externalMutations: "escalate" };
-    }
-    const file = this.fileFor(input.inventory.canonicalWorkspace);
-    const record = {
-      canonicalWorkspace: input.inventory.canonicalWorkspace,
-      fingerprint: input.inventory.fingerprint,
-      identity: input.identity,
-      approvalRevision: input.approvalRevision,
-      approvedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      note: input.approvedRevisionNote ?? null,
-      approvedItems,
-      mcpServers,
-      file
-    };
-    await fs7.mkdir(path7.dirname(file), { recursive: true });
-    await writeFileAtomic(file, JSON.stringify(record, null, 2));
-    return record;
-  }
-  async load(canonicalWorkspace) {
-    const read = await readJsonShared(this.fileFor(canonicalWorkspace));
-    return read.status === "ok" ? read.value : null;
-  }
-  async check(inventory) {
-    const all = inventory.items.map((item) => item.relativePath).sort();
-    if (inventory.incomplete) return { trusted: false, reason: "INVENTORY_INCOMPLETE", changed: [], pending: all };
-    const record = await this.load(inventory.canonicalWorkspace);
-    if (!record) {
-      if (all.length === 0) return { trusted: true, approvalRevision: null, pending: [], changed: [], reason: "NO_CUSTOMIZATIONS" };
-      return { trusted: false, reason: "NOT_APPROVED", changed: [], pending: all };
-    }
-    const approved = new Map(record.approvedItems.map((item) => [item.relativePath, item.sha256]));
-    const current = new Map(inventory.items.map((item) => [item.relativePath, item.sha256]));
-    const changed = [...current.entries()].filter(([key, hash]) => approved.has(key) && approved.get(key) !== hash).map(([key]) => key);
-    for (const key of approved.keys()) if (!current.has(key)) changed.push(key);
-    changed.sort();
-    const pending = [...current.keys()].filter((key) => !approved.has(key)).sort();
-    if (changed.length) return { trusted: false, reason: "FINGERPRINT_CHANGED", changed, pending };
-    if (pending.length) return { trusted: false, reason: "PENDING_RESOURCES", changed: [], pending };
-    return { trusted: true, approvalRevision: record.approvalRevision, pending: [], changed: [], reason: "TRUSTED" };
-  }
-  async revoke(canonicalWorkspace) {
-    await fs7.rm(this.fileFor(canonicalWorkspace), { force: true });
-  }
-};
-
-// src/worker/supervision.ts
-var SUPERVISION = {
-  inactivityAlertMs: 12e5,
-  elapsedAlertMs: 72e5,
-  coordinatorAbsentMs: 9e4
-};
-var COORDINATOR_ABSENT_LABEL = "aguardando coordenador";
-function evaluateSupervision(input) {
-  const thresholds = input.thresholds ?? SUPERVISION;
-  const coordinatorPresence = input.coordinatorLastSeenAt !== null && input.now - input.coordinatorLastSeenAt < thresholds.coordinatorAbsentMs ? "present" : "absent";
-  const coordinatorLabel = coordinatorPresence === "absent" ? COORDINATOR_ABSENT_LABEL : null;
-  if (input.terminal || input.phase === "terminal") {
-    return { state: "terminal", alerts: [], action: "none", coordinatorPresence, coordinatorLabel, requiresReview: false };
-  }
-  if (input.brokerRestartedDuringRun) {
-    return { state: "uncertain", alerts: [], action: "none", coordinatorPresence, coordinatorLabel, requiresReview: true };
-  }
-  if (!input.processAlive) {
-    return { state: "disconnected", alerts: [], action: "none", coordinatorPresence, coordinatorLabel, requiresReview: true };
-  }
-  const waiting = input.phase === "waiting_permission" || input.phase === "waiting_question" || input.pendingRequests > 0;
-  const alerts = [];
-  if (!waiting && input.now - input.lastActivityAt >= thresholds.inactivityAlertMs) alerts.push("inactivity_20m");
-  if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push("elapsed_2h");
-  const state = waiting && input.phase !== "waiting_permission" && input.phase !== "waiting_question" ? "waiting_permission" : input.phase;
-  return { state, alerts, action: "none", coordinatorPresence, coordinatorLabel, requiresReview: false };
+var SENSITIVE_PATH_PATTERNS = [
+  /(^|[\\/])\.env(\.[^\\/]*)?$/i,
+  /(^|[\\/])\.envrc$/i,
+  /(^|[\\/])id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
+  /\.(pem|key|pfx|p12|jks|keystore)$/i,
+  /(^|[\\/])(credentials|secrets?)(\.[^\\/]*)?\.(json|ya?ml|toml|ini|txt)$/i,
+  /(^|[\\/])service-account[^\\/]*\.json$/i,
+  /(^|[\\/])\.git[\\/](config|credentials)$/i,
+  /(^|[\\/])\.(npmrc|netrc|pypirc|yarnrc(\.yml)?|git-credentials)$/i,
+  /(^|[\\/])\.aws[\\/]/i,
+  /(^|[\\/])\.ssh[\\/]/i,
+  /(^|[\\/])\.gnupg[\\/]/i,
+  /(^|[\\/])\.claude[\\/]\.credentials\.json$/i,
+  /(^|[\\/])\.claude\.json$/i,
+  /(^|[\\/])secrets?[\\/]/i,
+  /(^|[\\/])\.docker[\\/]config\.json$/i,
+  /(^|[\\/])\.kube[\\/]config$/i,
+  /(^|[\\/])\.codex[\\/](auth\.json|config\.toml)$/i
+];
+function normalizeForCompare(p) {
+  const normalized = path7.normalize(p).replace(/[\\/]+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
-
-// src/shared/env.ts
-var ENV_PREFIX = "CODEORQUESTRA_";
-function readEnv(name, env = process.env) {
-  return env[`${ENV_PREFIX}${name}`];
-}
-function envName(name) {
-  return `${ENV_PREFIX}${name}`;
-}
-function isHarness(env = process.env) {
-  return readEnv("TEST_HARNESS", env) === "1";
-}
-
-// src/broker/runtime-paths.ts
-import { promises as fs8, existsSync, readFileSync } from "node:fs";
-import os2 from "node:os";
-import path8 from "node:path";
-import { fileURLToPath } from "node:url";
-var here = fileURLToPath(import.meta.url);
-var SOURCE_MODE = here.endsWith(".ts");
-var RUNTIME_BASE = SOURCE_MODE ? path8.resolve(path8.dirname(here), "..", "..") : path8.dirname(here);
-function workerEntry() {
-  return readEnv("WORKER_ENTRY") ?? (SOURCE_MODE ? path8.join(RUNTIME_BASE, "src", "worker", "main.ts") : path8.join(RUNTIME_BASE, "worker.mjs"));
-}
-function cliEntry() {
-  return SOURCE_MODE ? path8.join(RUNTIME_BASE, "src", "cli", "main.ts") : path8.join(RUNTIME_BASE, "codeorquestra.mjs");
-}
-function nodeExecArgv() {
-  return SOURCE_MODE ? ["--experimental-strip-types", "--disable-warning=ExperimentalWarning"] : [];
-}
-function dashboardDir() {
-  const candidates = [
-    readEnv("DASHBOARD_DIR"),
-    SOURCE_MODE ? path8.join(RUNTIME_BASE, "dist", "dashboard") : path8.join(RUNTIME_BASE, "dashboard")
-  ].filter((candidate) => Boolean(candidate));
-  for (const candidate of candidates) if (existsSync(path8.join(candidate, "index.html"))) return candidate;
-  return null;
-}
-function defaultStateRoot() {
-  const base = process.platform === "win32" ? process.env.LOCALAPPDATA ?? path8.join(os2.homedir(), "AppData", "Local") : path8.join(os2.homedir(), ".local", "state");
-  return path8.join(base, "CodexClaudeLive", "v2");
-}
-function engineInfo() {
-  return { runtimeVersion: RUNTIME_VERSION, productName: BRAND.name };
-}
-async function findClaudeLauncher(env = process.env) {
-  const override = readEnv("TEST_CLI", env) ?? readEnv("CLAUDE_LAUNCHER", env);
-  if (override) return override;
-  const names = process.platform === "win32" ? ["claude.ps1", "claude.cmd", "claude.exe", "claude"] : ["claude"];
-  for (const dir of (env.PATH ?? "").split(path8.delimiter).filter(Boolean)) {
-    for (const name of names) {
-      const candidate = path8.join(dir, name);
-      try {
-        await fs8.access(candidate);
-        return candidate;
-      } catch {
-      }
+function realpathContained(target) {
+  let probe = target;
+  const trailing = [];
+  for (; ; ) {
+    try {
+      const real = fs7.realpathSync.native(probe);
+      return trailing.length ? path7.join(real, ...trailing.reverse()) : real;
+    } catch {
+      const parent = path7.dirname(probe);
+      if (parent === probe) return target;
+      trailing.push(path7.basename(probe));
+      probe = parent;
     }
   }
-  return null;
 }
+function isInside(parent, child) {
+  const rel2 = path7.relative(normalizeForCompare(parent), normalizeForCompare(child));
+  return rel2 === "" || !rel2.startsWith("..") && !path7.isAbsolute(rel2);
+}
+function resolveWorkspacePath(workspace, candidate) {
+  const absolute = path7.resolve(workspace, candidate);
+  const workspaceReal = realpathContained(workspace);
+  const resolved = realpathContained(absolute);
+  return {
+    absolute,
+    resolved,
+    inside: isInside(workspaceReal, resolved),
+    redirected: normalizeForCompare(absolute) !== normalizeForCompare(resolved)
+  };
+}
+function isSensitivePath(candidate) {
+  const text = candidate.replace(/["']/g, "");
+  return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+// src/broker/worktree.ts
+import { spawn as spawn3 } from "node:child_process";
+import { promises as fs9, realpathSync as realpathSync2 } from "node:fs";
+import path9 from "node:path";
 
 // src/quota/global-mutex.ts
 import { spawn as spawn2 } from "node:child_process";
-import { promises as fs9 } from "node:fs";
-import os3 from "node:os";
-import path9 from "node:path";
+import { promises as fs8 } from "node:fs";
+import os2 from "node:os";
+import path8 from "node:path";
 var QUOTA_MUTEX_NAME = "Local\\ClaudeLiveQuota";
 var QuotaLockError = class extends Error {
   code;
@@ -2385,7 +2415,19 @@ var HOLDER_SCRIPT = [
   "$mutex.ReleaseMutex(); $mutex.Dispose()",
   "[Console]::Out.WriteLine('RELEASED'); [Console]::Out.Flush()"
 ].join("; ");
-var localChain = Promise.resolve();
+var localChains = /* @__PURE__ */ new Map();
+function isMissingInterpreter(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return error.code === "QUOTA_LOCK_UNAVAILABLE" && /ENOENT/.test(message);
+}
+var pwshFallbackReported = false;
+function reportPwshFallback() {
+  if (pwshFallbackReported) return;
+  pwshFallbackReported = true;
+  process.stderr.write(
+    "CodeOrquestra: PowerShell 7 (pwsh) n\xE3o est\xE1 instalado; o mutex de quota passa a usar arquivo de trava. Isso ainda exclui outros brokers v2. A exclus\xE3o m\xFAtua com o runner legado v1 n\xE3o se aplica aqui, porque o v1 tamb\xE9m \xE9 executado por pwsh.\n"
+  );
+}
 function acquireWindows(name, waitMs, attemptedAt) {
   return new Promise((resolve, reject) => {
     const child = spawn2("pwsh", ["-NoProfile", "-NonInteractive", "-Command", HOLDER_SCRIPT], {
@@ -2444,22 +2486,22 @@ function acquireWindows(name, waitMs, attemptedAt) {
   });
 }
 async function acquireLockFile(name, waitMs, attemptedAt) {
-  const file = path9.join(os3.tmpdir(), `${name.replace(/[^A-Za-z0-9]/g, "_")}.lock`);
+  const file = path8.join(os2.tmpdir(), `${name.replace(/[^A-Za-z0-9]/g, "_")}.lock`);
   const deadline = Date.now() + waitMs;
   for (; ; ) {
     try {
-      const handle = await fs9.open(file, "wx");
+      const handle = await fs8.open(file, "wx");
       await handle.writeFile(String(process.pid));
       await handle.close();
       return { async release() {
-        await fs9.rm(file, { force: true });
+        await fs8.rm(file, { force: true });
       } };
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       try {
-        const pid = Number(await fs9.readFile(file, "utf8"));
+        const pid = Number(await fs8.readFile(file, "utf8"));
         if (pid && !isAlive(pid)) {
-          await fs9.rm(file, { force: true });
+          await fs8.rm(file, { force: true });
           continue;
         }
       } catch {
@@ -2477,13 +2519,24 @@ function isAlive(pid) {
     return false;
   }
 }
-async function withGlobalQuotaMutex(fn, options = {}) {
+async function withNamedMutex(name, fn, options = {}) {
   const waitMs = options.waitMs ?? 3e4;
-  const name = options.name ?? QUOTA_MUTEX_NAME;
   const attemptedAt = (/* @__PURE__ */ new Date()).toISOString();
   const started = Date.now();
+  const useKernelMutex = process.platform === "win32" && (options.transport ?? "auto") === "auto";
   const run2 = async () => {
-    const holder = process.platform === "win32" ? await acquireWindows(name, waitMs, attemptedAt) : await acquireLockFile(name, waitMs, attemptedAt);
+    let holder;
+    if (useKernelMutex) {
+      try {
+        holder = await acquireWindows(name, waitMs, attemptedAt);
+      } catch (error) {
+        if (!isMissingInterpreter(error)) throw error;
+        reportPwshFallback();
+        holder = await acquireLockFile(name, waitMs, attemptedAt);
+      }
+    } else {
+      holder = await acquireLockFile(name, waitMs, attemptedAt);
+    }
     const waitedMs = Date.now() - started;
     try {
       const value = await fn();
@@ -2492,9 +2545,908 @@ async function withGlobalQuotaMutex(fn, options = {}) {
       await holder.release();
     }
   };
-  const next = localChain.then(run2, run2);
-  localChain = next.catch(() => void 0);
+  const previous = localChains.get(name) ?? Promise.resolve();
+  const next = previous.then(run2, run2);
+  const settled = next.catch(() => void 0).then(() => {
+    if (localChains.get(name) === settled) localChains.delete(name);
+  });
+  localChains.set(name, settled);
   return next;
+}
+async function withGlobalQuotaMutex(fn, options = {}) {
+  return withNamedMutex(options.name ?? QUOTA_MUTEX_NAME, fn, options.waitMs === void 0 ? {} : { waitMs: options.waitMs });
+}
+
+// src/broker/worktree.ts
+var GIT_TIMEOUT_MS = 2e4;
+var GIT_PROVISION_TIMEOUT_MS = 12e4;
+var MAX_CHANGED_FILES = 500;
+var WorktreeError = class extends Error {
+  code;
+  detail;
+  constructor(code, message, detail) {
+    super(message);
+    this.name = "WorktreeError";
+    this.code = code;
+    this.detail = detail;
+  }
+};
+function git(args, cwd, timeoutMs = GIT_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const child = spawn3("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ code: null, stdout, stderr: String(error), timedOut });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr, timedOut });
+    });
+  });
+}
+async function gitStatus(workspace) {
+  try {
+    await fs9.access(path9.join(workspace, ".git"));
+  } catch {
+    return [];
+  }
+  const result = await git(["status", "--porcelain", "--untracked-files=all"], workspace, 5e3);
+  if (result.code !== 0) return [];
+  return result.stdout.split("\n").map((line) => normalizeStatusPath(line.slice(3).trim())).filter(Boolean).slice(0, MAX_CHANGED_FILES);
+}
+function normalizeStatusPath(field) {
+  let value = field;
+  const arrow = value.lastIndexOf(" -> ");
+  if (arrow >= 0) value = value.slice(arrow + 4).trim();
+  if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+    const body = value.slice(1, -1);
+    try {
+      const bytes = [];
+      for (let index = 0; index < body.length; index += 1) {
+        if (body[index] !== "\\") {
+          bytes.push(body.charCodeAt(index));
+          continue;
+        }
+        const next = body[index + 1] ?? "";
+        if (/[0-7]/.test(next)) {
+          bytes.push(parseInt(body.slice(index + 1, index + 4), 8));
+          index += 3;
+        } else {
+          bytes.push({ n: 10, t: 9, r: 13, '"': 34, "\\": 92 }[next] ?? body.charCodeAt(index + 1));
+          index += 1;
+        }
+      }
+      value = Buffer.from(bytes).toString("utf8");
+    } catch {
+      return field;
+    }
+  }
+  return value;
+}
+function lexical(target) {
+  const normalized = target.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+function canonicalize(target) {
+  try {
+    return lexical(realpathSync2.native(target));
+  } catch {
+    return lexical(target);
+  }
+}
+function canonicalizePlanned(target) {
+  const absolute = path9.resolve(target);
+  const trailing = [];
+  let probe = absolute;
+  for (; ; ) {
+    try {
+      const real = realpathSync2.native(probe);
+      return canonicalize(trailing.length ? path9.join(real, ...trailing.reverse()) : real);
+    } catch {
+      const parent = path9.dirname(probe);
+      if (parent === probe) return canonicalize(absolute);
+      trailing.push(path9.basename(probe));
+      probe = parent;
+    }
+  }
+}
+async function resolveRepository(workspace) {
+  const result = await git(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"], workspace);
+  if (result.code !== 0) {
+    throw new WorktreeError("NOT_A_GIT_REPOSITORY", "O workspace declarado n\xE3o pertence a um reposit\xF3rio git; worktrees exigem um.", result.stderr.trim().slice(0, 400));
+  }
+  const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  const commonDir = lines[0];
+  const topLevel = lines[1];
+  if (!commonDir || !topLevel) {
+    throw new WorktreeError("NOT_A_GIT_REPOSITORY", "N\xE3o foi poss\xEDvel identificar o reposit\xF3rio do workspace declarado.");
+  }
+  return { commonDir: canonicalize(commonDir), topLevel: canonicalize(topLevel), repoKey: sha256(canonicalize(commonDir)).slice(0, 24) };
+}
+async function withRepositoryMutex(repoKey, fn) {
+  const outcome = await withNamedMutex(`CodeOrquestraRepo-${repoKey}`, fn, { waitMs: 6e4, transport: "file" });
+  return outcome.value;
+}
+function worktreePathFor(stateRoot, repoKey, taskId) {
+  const root = path9.join(stateRoot, "worktrees", repoKey);
+  return { root, path: path9.join(root, taskId.slice(0, 16)) };
+}
+function assertUsablePathLength(target) {
+  if (process.platform === "win32" && target.length > 150) {
+    throw new WorktreeError(
+      "WORKTREE_PATH_TOO_LONG",
+      `O caminho do worktree tem ${target.length} caracteres; ferramentas que n\xE3o habilitaram caminhos longos falhariam dentro dele. Configure um worktreeRoot mais curto na pol\xEDtica do reposit\xF3rio.`
+    );
+  }
+}
+async function inspectExisting(target, repository) {
+  try {
+    await fs9.access(target);
+  } catch {
+    return null;
+  }
+  const common = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], target);
+  if (common.code !== 0 || canonicalize(common.stdout.trim()) !== repository.commonDir) {
+    throw new WorktreeError("WORKTREE_PATH_OCCUPIED", "J\xE1 existe um diret\xF3rio nesse caminho que n\xE3o \xE9 um worktree deste reposit\xF3rio. Nada foi removido; resolva manualmente.");
+  }
+  return { reusable: true, dirty: await gitStatus(target) };
+}
+async function ensureWorktree(options) {
+  const { repository, target, branch, baseRef } = options;
+  assertUsablePathLength(target);
+  const existing = await inspectExisting(target, repository);
+  if (existing) {
+    if (existing.dirty.length > 0) {
+      throw new WorktreeError(
+        "WORKTREE_DIRTY_FROM_PREVIOUS_RUN",
+        `O worktree desta tarefa ainda tem ${existing.dirty.length} arquivo(s) com altera\xE7\xF5es n\xE3o commitadas de uma execu\xE7\xE3o anterior. Revise e commite ou descarte antes de iniciar outra.`,
+        existing.dirty.slice(0, 20).join(", ")
+      );
+    }
+    return { path: target, branch, baseRef, created: false };
+  }
+  await fs9.mkdir(path9.dirname(target), { recursive: true });
+  const args = ["worktree", "add", "--no-track", "-b", branch, target];
+  if (baseRef) args.push(baseRef);
+  const result = await git(args, repository.topLevel, GIT_PROVISION_TIMEOUT_MS);
+  if (result.code !== 0) {
+    await git(["worktree", "prune"], repository.topLevel).catch(() => void 0);
+    throw new WorktreeError(
+      result.timedOut ? "WORKTREE_ADD_TIMEOUT" : "WORKTREE_ADD_FAILED",
+      result.timedOut ? "git worktree add excedeu o tempo limite; nada foi iniciado." : "git worktree add falhou; nada foi iniciado.",
+      result.stderr.trim().slice(0, 400)
+    );
+  }
+  return { path: target, branch, baseRef, created: true };
+}
+async function removeWorktree(repository, target, options = {}) {
+  const result = await git(["worktree", "remove", ...options.force ? ["--force"] : [], target], repository.topLevel);
+  if (result.code === 0) {
+    await git(["worktree", "prune"], repository.topLevel).catch(() => void 0);
+    return { removed: true };
+  }
+  return { removed: false, reason: result.stderr.trim().slice(0, 400) || "git worktree remove recusou a remo\xE7\xE3o." };
+}
+async function listOrphans(stateRoot, isOwned) {
+  const root = path9.join(stateRoot, "worktrees");
+  let repoDirs;
+  try {
+    repoDirs = (await fs9.readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+  const orphans = [];
+  for (const repoKey of repoDirs) {
+    let taskDirs;
+    try {
+      taskDirs = (await fs9.readdir(path9.join(root, repoKey), { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    } catch {
+      continue;
+    }
+    for (const taskPrefix of taskDirs) {
+      if (isOwned(repoKey, taskPrefix)) continue;
+      const target = path9.join(root, repoKey, taskPrefix);
+      orphans.push({ path: target, repoKey, taskId: taskPrefix, dirtyFiles: await gitStatus(target) });
+    }
+  }
+  return orphans;
+}
+
+// src/broker/worktree-policy.ts
+import { createHash as createHash3 } from "node:crypto";
+import { promises as fs10 } from "node:fs";
+import path10 from "node:path";
+var DEFAULT_MAX_RETAINED = 8;
+var DEFAULT_MAX_PARALLEL = 3;
+var WorktreePolicyError = class extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "WorktreePolicyError";
+    this.code = code;
+  }
+};
+function boundedInteger(value, field, min, max, fallback) {
+  if (value === void 0 || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    throw new WorktreePolicyError("WORKTREE_POLICY_INVALID", `${field} deve ser inteiro entre ${min} e ${max}.`);
+  }
+  return value;
+}
+var WorktreePolicyStore = class {
+  root;
+  constructor(root) {
+    this.root = root;
+  }
+  fileFor(repoKey) {
+    return path10.join(this.root, "worktree-policy", `${createHash3("sha256").update(repoKey).digest("hex")}.json`);
+  }
+  /**
+   * Records the user's decision to allow worktrees in this repository.
+   *
+   * A note is mandatory, exactly as releasing a quarantine requires one: an
+   * unexplained standing permission to mutate a repository is worth less than
+   * no record at all.
+   */
+  async enrol(input) {
+    const note = typeof input.note === "string" ? input.note.trim() : "";
+    if (!note) throw new WorktreePolicyError("WORKTREE_POLICY_NOTE_REQUIRED", "Habilitar worktrees exige uma nota dizendo por qu\xEA; a permiss\xE3o fica registrada.");
+    let worktreeRoot = null;
+    if (input.worktreeRoot !== void 0 && input.worktreeRoot !== null) {
+      if (typeof input.worktreeRoot !== "string" || !path10.isAbsolute(input.worktreeRoot)) {
+        throw new WorktreePolicyError("WORKTREE_POLICY_INVALID", "worktreeRoot deve ser um caminho absoluto.");
+      }
+      worktreeRoot = input.worktreeRoot;
+    }
+    const file = this.fileFor(input.repoKey);
+    const record2 = {
+      repoKey: input.repoKey,
+      canonicalWorkspace: input.canonicalWorkspace,
+      enabled: true,
+      enabledAt: (/* @__PURE__ */ new Date()).toISOString(),
+      enabledBy: input.enabledBy,
+      note,
+      maxParallelRuns: boundedInteger(input.maxParallelRuns, "maxParallelRuns", 1, 10, DEFAULT_MAX_PARALLEL),
+      maxRetainedWorktrees: boundedInteger(input.maxRetainedWorktrees, "maxRetainedWorktrees", 1, 50, DEFAULT_MAX_RETAINED),
+      worktreeRoot,
+      file
+    };
+    await fs10.mkdir(path10.dirname(file), { recursive: true });
+    await writeFileAtomic(file, JSON.stringify(record2, null, 2));
+    return record2;
+  }
+  async load(repoKey) {
+    const read = await readJsonShared(this.fileFor(repoKey));
+    return read.status === "ok" && read.value.enabled ? read.value : null;
+  }
+  /** Fails closed: a repository nobody enrolled cannot be provisioned into. */
+  async require(repoKey) {
+    const record2 = await this.load(repoKey);
+    if (!record2) {
+      throw new WorktreePolicyError(
+        "WORKTREE_POLICY_REQUIRED",
+        'Este reposit\xF3rio ainda n\xE3o foi habilitado para worktrees. Criar um worktree altera o reposit\xF3rio de forma persistente, ent\xE3o exige uma a\xE7\xE3o local do usu\xE1rio: "codeorquestra worktree enable --repo <caminho> --note <motivo>".'
+      );
+    }
+    return record2;
+  }
+  async revoke(repoKey) {
+    await fs10.rm(this.fileFor(repoKey), { force: true });
+  }
+  async list() {
+    const dir = path10.join(this.root, "worktree-policy");
+    let names;
+    try {
+      names = (await fs10.readdir(dir)).filter((name) => name.endsWith(".json"));
+    } catch {
+      return [];
+    }
+    const records = [];
+    for (const name of names) {
+      const read = await readJsonShared(path10.join(dir, name));
+      if (read.status === "ok") records.push(read.value);
+    }
+    return records.sort((a, b) => a.canonicalWorkspace.localeCompare(b.canonicalWorkspace));
+  }
+};
+
+// src/trust/trust-store.ts
+import { createHash as createHash4 } from "node:crypto";
+import { promises as fs11 } from "node:fs";
+import path11 from "node:path";
+var TrustStoreError = class extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "TrustStoreError";
+    this.code = code;
+  }
+};
+var TrustStore = class {
+  root;
+  constructor(root) {
+    this.root = root;
+  }
+  fileFor(canonicalWorkspace) {
+    return path11.join(this.root, "trust", `${createHash4("sha256").update(canonicalWorkspace).digest("hex")}.json`);
+  }
+  async approve(input) {
+    if (input.inventory.incomplete) throw new TrustStoreError("INVENTORY_INCOMPLETE", "O invent\xE1rio est\xE1 incompleto; aprove somente ap\xF3s a descoberta completa.");
+    const approvedSet = input.approvedItems === "all" ? null : new Set(input.approvedItems);
+    const approvedItems = input.inventory.items.filter((item) => approvedSet === null || approvedSet.has(item.relativePath)).map((item) => ({ relativePath: item.relativePath, sha256: item.sha256, kind: item.kind, scope: item.scope }));
+    const mcpServers = {};
+    for (const item of approvedItems) {
+      if (item.kind !== "mcp") continue;
+      const name = item.relativePath.split("#").pop() ?? "";
+      if (name && name !== "parse-error") mcpServers[name] = { approved: true, externalMutations: "escalate" };
+    }
+    const file = this.fileFor(input.inventory.canonicalWorkspace);
+    const record2 = {
+      canonicalWorkspace: input.inventory.canonicalWorkspace,
+      fingerprint: input.inventory.fingerprint,
+      identity: input.identity,
+      approvalRevision: input.approvalRevision,
+      approvedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      note: input.approvedRevisionNote ?? null,
+      approvedItems,
+      mcpServers,
+      file
+    };
+    await fs11.mkdir(path11.dirname(file), { recursive: true });
+    await writeFileAtomic(file, JSON.stringify(record2, null, 2));
+    return record2;
+  }
+  async load(canonicalWorkspace) {
+    const read = await readJsonShared(this.fileFor(canonicalWorkspace));
+    return read.status === "ok" ? read.value : null;
+  }
+  /**
+   * Reuses a parent checkout's approval for a worktree of the same repository.
+   *
+   * A worktree is a new canonical path, so it has no record of its own and the
+   * first parallel run would be refused with WORKSPACE_NOT_TRUSTED — pushing
+   * the user to approve without reading anything. Derivation avoids that
+   * without weakening the invariant, stated precisely:
+   *
+   *   no resource executes whose exact content hash the user has not already
+   *   approved for this project.
+   *
+   * So every item in the child must have an identical (relativePath, sha256)
+   * among the parent's approved items. One new or changed file and this returns
+   * null, falling through to the normal refusal with pending/changed populated.
+   * It reuses an approval; it never manufactures one.
+   *
+   * The child may legitimately be a strict SUBSET — ancestor-scope items the
+   * state-root worktree does not have — which is why absence is not a mismatch.
+   *
+   * Known and deliberate limit: comparison is over bytes, so a repository whose
+   * checkout settings rewrite text on checkout (notably `core.autocrlf=true` on
+   * Windows, where the worktree gets CRLF while the parent working tree holds
+   * LF) produces different hashes for the same instruction file, and derivation
+   * refuses. That refusal is correct — the bytes the CLI would load really are
+   * different — and the cost is bounded: the worktree path is deterministic per
+   * task, so the user approves it once, not once per run. Normalizing line
+   * endings before hashing would make trust equality mean something weaker than
+   * "these exact bytes", which is not a trade worth making here.
+   */
+  async deriveFromParent(input) {
+    if (input.child.incomplete) return null;
+    const parent = await this.load(input.parentCanonicalWorkspace);
+    if (!parent) return null;
+    const approved = new Map(parent.approvedItems.map((item) => [item.relativePath, item.sha256]));
+    for (const item of input.child.items) {
+      if (approved.get(item.relativePath) !== item.sha256) return null;
+    }
+    const file = this.fileFor(input.child.canonicalWorkspace);
+    const record2 = {
+      canonicalWorkspace: input.child.canonicalWorkspace,
+      fingerprint: input.child.fingerprint,
+      identity: parent.identity,
+      approvalRevision: parent.approvalRevision,
+      approvedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      note: `Herdado de ${parent.canonicalWorkspace}: todo item bate por hash com uma aprova\xE7\xE3o existente.`,
+      approvedItems: input.child.items.map((item) => ({ relativePath: item.relativePath, sha256: item.sha256, kind: item.kind, scope: item.scope })),
+      mcpServers: parent.mcpServers,
+      file,
+      derivedFrom: { canonicalWorkspace: parent.canonicalWorkspace, approvalRevision: parent.approvalRevision, fingerprint: parent.fingerprint }
+    };
+    await fs11.mkdir(path11.dirname(file), { recursive: true });
+    await writeFileAtomic(file, JSON.stringify(record2, null, 2));
+    return record2;
+  }
+  async check(inventory) {
+    const all = inventory.items.map((item) => item.relativePath).sort();
+    if (inventory.incomplete) return { trusted: false, reason: "INVENTORY_INCOMPLETE", changed: [], pending: all };
+    const record2 = await this.load(inventory.canonicalWorkspace);
+    if (!record2) {
+      if (all.length === 0) return { trusted: true, approvalRevision: null, pending: [], changed: [], reason: "NO_CUSTOMIZATIONS" };
+      return { trusted: false, reason: "NOT_APPROVED", changed: [], pending: all };
+    }
+    if (record2.derivedFrom) {
+      const parent = await this.load(record2.derivedFrom.canonicalWorkspace);
+      if (!parent || parent.fingerprint !== record2.derivedFrom.fingerprint) {
+        return { trusted: false, reason: "NOT_APPROVED", changed: [], pending: all };
+      }
+    }
+    const approved = new Map(record2.approvedItems.map((item) => [item.relativePath, item.sha256]));
+    const current = new Map(inventory.items.map((item) => [item.relativePath, item.sha256]));
+    const changed = [...current.entries()].filter(([key, hash]) => approved.has(key) && approved.get(key) !== hash).map(([key]) => key);
+    for (const key of approved.keys()) if (!current.has(key)) changed.push(key);
+    changed.sort();
+    const pending = [...current.keys()].filter((key) => !approved.has(key)).sort();
+    if (changed.length) return { trusted: false, reason: "FINGERPRINT_CHANGED", changed, pending };
+    if (pending.length) return { trusted: false, reason: "PENDING_RESOURCES", changed: [], pending };
+    return { trusted: true, approvalRevision: record2.approvalRevision, pending: [], changed: [], reason: "TRUSTED" };
+  }
+  async revoke(canonicalWorkspace) {
+    await fs11.rm(this.fileFor(canonicalWorkspace), { force: true });
+  }
+};
+
+// src/worker/supervision.ts
+var SUPERVISION = {
+  inactivityAlertMs: 12e5,
+  elapsedAlertMs: 72e5,
+  coordinatorAbsentMs: 9e4,
+  /**
+   * Waiting for a decision is not idleness — but it is not progress either.
+   *
+   * A run blocked on a permission or a question makes no events, so it is
+   * deliberately exempt from the inactivity alert. The consequence was that it
+   * could sit for hours emitting nothing at all, which from outside is
+   * indistinguishable from work in progress. This threshold says the other true
+   * thing: nobody has answered, and the run is going nowhere until someone
+   * does. Two minutes, because the cost of the alert is a line in the feed and
+   * the cost of missing it is an afternoon.
+   */
+  decisionPendingMs: 12e4
+};
+var COORDINATOR_ABSENT_LABEL = "aguardando coordenador";
+function evaluateSupervision(input) {
+  const thresholds = input.thresholds ?? SUPERVISION;
+  const coordinatorPresence = input.coordinatorLastSeenAt !== null && input.now - input.coordinatorLastSeenAt < thresholds.coordinatorAbsentMs ? "present" : "absent";
+  const coordinatorLabel = coordinatorPresence === "absent" ? COORDINATOR_ABSENT_LABEL : null;
+  if (input.terminal || input.phase === "terminal") {
+    return { state: "terminal", alerts: [], action: "none", coordinatorPresence, coordinatorLabel, requiresReview: false };
+  }
+  if (input.brokerRestartedDuringRun) {
+    return { state: "uncertain", alerts: [], action: "none", coordinatorPresence, coordinatorLabel, requiresReview: true };
+  }
+  if (!input.processAlive) {
+    return { state: "disconnected", alerts: [], action: "none", coordinatorPresence, coordinatorLabel, requiresReview: true };
+  }
+  const waiting = input.phase === "waiting_permission" || input.phase === "waiting_question" || input.pendingRequests > 0;
+  const alerts = [];
+  if (!waiting && input.now - input.lastActivityAt >= thresholds.inactivityAlertMs) alerts.push("inactivity_20m");
+  if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push("decision_pending");
+  if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push("elapsed_2h");
+  const state = waiting && input.phase !== "waiting_permission" && input.phase !== "waiting_question" ? "waiting_permission" : input.phase;
+  return { state, alerts, action: "none", coordinatorPresence, coordinatorLabel, requiresReview: false };
+}
+
+// src/shared/env.ts
+var ENV_PREFIX = "CODEORQUESTRA_";
+function readEnv(name, env = process.env) {
+  return env[`${ENV_PREFIX}${name}`];
+}
+function envName(name) {
+  return `${ENV_PREFIX}${name}`;
+}
+function isHarness(env = process.env) {
+  return readEnv("TEST_HARNESS", env) === "1";
+}
+
+// src/usage/claude-usage.ts
+function token(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function sanitizeClaudeUsageReport(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const usage2 = value;
+  const report = {
+    input_tokens: token(usage2.input_tokens ?? usage2.inputTokens ?? usage2.input),
+    output_tokens: token(usage2.output_tokens ?? usage2.outputTokens ?? usage2.output),
+    cache_read_input_tokens: token(usage2.cache_read_input_tokens ?? usage2.cachedInputTokens ?? usage2.cacheRead),
+    cache_creation_input_tokens: token(usage2.cache_creation_input_tokens ?? usage2.cacheWriteInputTokens ?? usage2.cacheWrite)
+  };
+  return Object.values(report).some((item) => item !== null) ? report : null;
+}
+function normalizeClaudeUsage(value) {
+  const usage2 = sanitizeClaudeUsageReport(value);
+  if (!usage2) return null;
+  const inputTokens = usage2.input_tokens;
+  const outputTokens = usage2.output_tokens;
+  const cachedInputTokens = usage2.cache_read_input_tokens;
+  const cacheWriteInputTokens = usage2.cache_creation_input_tokens;
+  const totalInputTokens = (inputTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheWriteInputTokens ?? 0);
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    totalInputTokens,
+    totalObservedTokens: totalInputTokens + (outputTokens ?? 0),
+    quality: [inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens].every((item) => item !== null) ? "reported" : "partial"
+  };
+}
+function emptyTotal() {
+  return { turns: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalInputTokens: 0, totalObservedTokens: 0, partial: false };
+}
+function add(total, usage2) {
+  total.turns += 1;
+  total.inputTokens += usage2.inputTokens ?? 0;
+  total.outputTokens += usage2.outputTokens ?? 0;
+  total.cachedInputTokens += usage2.cachedInputTokens ?? 0;
+  total.cacheWriteInputTokens += usage2.cacheWriteInputTokens ?? 0;
+  total.totalInputTokens += usage2.totalInputTokens;
+  total.totalObservedTokens += usage2.totalObservedTokens;
+  total.partial ||= usage2.quality === "partial";
+}
+var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
+  seen = /* @__PURE__ */ new Set();
+  total = emptyTotal();
+  models = /* @__PURE__ */ new Map();
+  lastObservedAt = null;
+  static fromEvents(events) {
+    const accumulator = new _ClaudeUsageAccumulator();
+    for (const event of events) accumulator.addEvent(event);
+    return accumulator;
+  }
+  addEvent(event) {
+    if (!["turn_completed", "turn_interrupted", "turn_failed"].includes(event.type)) return false;
+    const turn = token(event.data.turn);
+    if (turn === null) return false;
+    const key = `${event.runId}:${turn}`;
+    if (this.seen.has(key)) return false;
+    const usage2 = normalizeClaudeUsage(event.data.usage ?? event.data.tokens);
+    if (!usage2) return false;
+    this.seen.add(key);
+    const model = typeof event.data.model === "string" && event.data.model.trim() ? event.data.model.trim() : "desconhecido";
+    add(this.total, usage2);
+    const modelTotal = this.models.get(model) ?? emptyTotal();
+    add(modelTotal, usage2);
+    this.models.set(model, modelTotal);
+    this.lastObservedAt = event.ts;
+    return true;
+  }
+  snapshot(observedAt = this.lastObservedAt) {
+    const quality = this.total.turns === 0 ? "unavailable" : this.total.partial ? "partial" : "reported";
+    return {
+      quality,
+      observedAt: this.total.turns === 0 ? null : observedAt,
+      turns: this.total.turns,
+      inputTokens: this.total.inputTokens,
+      outputTokens: this.total.outputTokens,
+      cachedInputTokens: this.total.cachedInputTokens,
+      cacheWriteInputTokens: this.total.cacheWriteInputTokens,
+      totalInputTokens: this.total.totalInputTokens,
+      totalObservedTokens: this.total.totalObservedTokens,
+      byModel: [...this.models.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([model, total]) => ({
+        model,
+        turns: total.turns,
+        inputTokens: total.inputTokens,
+        outputTokens: total.outputTokens,
+        cachedInputTokens: total.cachedInputTokens,
+        cacheWriteInputTokens: total.cacheWriteInputTokens,
+        totalInputTokens: total.totalInputTokens,
+        totalObservedTokens: total.totalObservedTokens,
+        quality: total.partial ? "partial" : "reported"
+      }))
+    };
+  }
+};
+
+// src/usage/codex-usage.ts
+import { spawn as spawn4 } from "node:child_process";
+import readline2 from "node:readline";
+function integer(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function boundedText(value, max = 80) {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, max) : null;
+}
+function record(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+function unavailableCodexUsage(code = null, queriedAt = null) {
+  return {
+    quality: "unavailable",
+    queriedAt,
+    limits: { quality: "unavailable", buckets: [] },
+    activity: { quality: "unavailable", lifetimeTokens: null, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null, daily: [] },
+    task: { quality: "unavailable", groups: [] },
+    failure: code ? { code } : null
+  };
+}
+function window(value) {
+  const item = record(value);
+  const used = integer(item?.usedPercent);
+  if (used === null) return null;
+  const usedPercent = Math.min(100, used);
+  return {
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    windowDurationMins: integer(item?.windowDurationMins),
+    resetsAt: integer(item?.resetsAt)
+  };
+}
+function limits(value) {
+  const response = record(value);
+  const multiple = record(response?.rateLimitsByLimitId);
+  const candidates = multiple && Object.keys(multiple).length ? Object.entries(multiple).slice(0, 16) : [["codex", response?.rateLimits]];
+  const buckets = candidates.flatMap(([fallbackId, raw]) => {
+    const item = record(raw);
+    if (!item) return [];
+    const primary = window(item.primary);
+    const secondary = window(item.secondary);
+    if (!primary && !secondary) return [];
+    return [{
+      id: boundedText(item.limitId) ?? fallbackId.slice(0, 80),
+      name: boundedText(item.limitName),
+      planType: boundedText(item.planType),
+      primary,
+      secondary
+    }];
+  });
+  return { quality: buckets.length ? "reported" : "unavailable", buckets };
+}
+function activity(value) {
+  const response = record(value);
+  const summary = record(response?.summary);
+  const daily = Array.isArray(response?.dailyUsageBuckets) ? response.dailyUsageBuckets.slice(0, 400).flatMap((raw) => {
+    const item = record(raw);
+    const startDate = boundedText(item?.startDate, 20);
+    const tokens = integer(item?.tokens);
+    return startDate && tokens !== null ? [{ startDate, tokens }] : [];
+  }) : [];
+  const result = {
+    quality: "unavailable",
+    lifetimeTokens: integer(summary?.lifetimeTokens),
+    peakDailyTokens: integer(summary?.peakDailyTokens),
+    longestRunningTurnSec: integer(summary?.longestRunningTurnSec),
+    currentStreakDays: integer(summary?.currentStreakDays),
+    longestStreakDays: integer(summary?.longestStreakDays),
+    daily
+  };
+  const fields = [result.lifetimeTokens, result.peakDailyTokens, result.longestRunningTurnSec, result.currentStreakDays, result.longestStreakDays];
+  if (fields.some((item) => item !== null) || daily.length) result.quality = fields.every((item) => item !== null) ? "reported" : "partial";
+  return result;
+}
+function taskUsage(value) {
+  const response = record(value);
+  const usage2 = record(response?.threadUsage);
+  if (!usage2 || !Array.isArray(usage2.groups)) return { quality: "unavailable", groups: [] };
+  const groups = usage2.groups.slice(0, 32).flatMap((raw) => {
+    const item = record(raw);
+    if (!item) return [];
+    return [{
+      model: boundedText(item.model),
+      reasoningEffort: boundedText(item.reasoningEffort),
+      inputTokens: integer(item.inputTokens),
+      cachedInputTokens: integer(item.cachedInputTokens),
+      netNewInputTokens: integer(item.netNewInputTokens),
+      outputTokens: integer(item.outputTokens),
+      totalTokens: integer(item.totalTokens)
+    }];
+  });
+  if (!groups.length) return { quality: "unavailable", groups: [] };
+  const complete = groups.every((group) => group.inputTokens !== null && group.outputTokens !== null && group.totalTokens !== null);
+  return { quality: complete ? "estimated" : "partial", groups };
+}
+var CodexUsageService = class {
+  command;
+  args;
+  minRefreshMs;
+  requestTimeoutMs;
+  child = null;
+  ready = null;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  cache = /* @__PURE__ */ new Map();
+  refreshes = /* @__PURE__ */ new Map();
+  constructor(options = {}) {
+    this.command = options.command ?? "codex";
+    this.args = options.args ?? ["app-server", "--listen", "stdio://"];
+    this.minRefreshMs = Math.max(0, options.minRefreshMs ?? 3e4);
+    this.requestTimeoutMs = Math.max(100, options.requestTimeoutMs ?? 5e3);
+  }
+  async refresh(threadId, options = {}) {
+    const key = threadId ?? "";
+    const cached = this.cache.get(key);
+    if (!options.force && cached && Date.now() - cached.at < this.minRefreshMs) return cached.value;
+    const active = this.refreshes.get(key);
+    if (active) return active;
+    const refresh = this.read(threadId).finally(() => this.refreshes.delete(key));
+    this.refreshes.set(key, refresh);
+    return refresh;
+  }
+  async read(threadId) {
+    try {
+      await this.ensureReady();
+      const [rateRead, activityRead, taskRead] = await Promise.all([
+        this.request("account/rateLimits/read", null).then((value2) => ({ ok: true, value: value2 }), () => ({ ok: false, value: null })),
+        this.request("account/usage/read", null).then((value2) => ({ ok: true, value: value2 }), () => ({ ok: false, value: null })),
+        threadId ? this.request("account/usage/read", { threadId }).then((value2) => ({ ok: true, value: value2 }), () => ({ ok: false, value: null })) : Promise.resolve({ ok: true, value: null })
+      ]);
+      const limitView = rateRead.ok ? limits(rateRead.value) : { quality: "unavailable", buckets: [] };
+      const activityView = activityRead.ok ? activity(activityRead.value) : unavailableCodexUsage().activity;
+      const taskView = threadId && taskRead.ok ? taskUsage(taskRead.value) : { quality: "unavailable", groups: [] };
+      const qualities = [limitView.quality, activityView.quality, taskView.quality];
+      const quality = qualities.every((item) => item === "reported" || item === "estimated") ? "reported" : qualities.some((item) => item !== "unavailable") ? "partial" : "unavailable";
+      const value = {
+        quality,
+        queriedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        limits: limitView,
+        activity: activityView,
+        task: taskView,
+        failure: [rateRead, activityRead, taskRead].some((item) => !item.ok) ? { code: quality === "unavailable" ? "CODEX_USAGE_UNAVAILABLE" : "CODEX_USAGE_PARTIAL" } : null
+      };
+      this.cache.set(threadId ?? "", { at: Date.now(), value });
+      return value;
+    } catch (error) {
+      const code = error instanceof Error && error.message.startsWith("CODEX_USAGE_") ? error.message.split(":", 1)[0] ?? "CODEX_USAGE_UNAVAILABLE" : "CODEX_USAGE_UNAVAILABLE";
+      const value = unavailableCodexUsage(code, (/* @__PURE__ */ new Date()).toISOString());
+      this.cache.set(threadId ?? "", { at: Date.now(), value });
+      return value;
+    }
+  }
+  ensureReady() {
+    if (this.ready) return this.ready;
+    this.ready = new Promise((resolve, reject) => {
+      const child = spawn4(this.command, this.args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+      this.child = child;
+      child.stderr.resume();
+      const reader = readline2.createInterface({ input: child.stdout, crlfDelay: Infinity });
+      reader.on("line", (line) => this.onLine(line));
+      const fail = (code) => {
+        const error = new Error(code);
+        for (const pending of this.pending.values()) {
+          clearTimeout(pending.timer);
+          pending.reject(error);
+        }
+        this.pending.clear();
+        this.child = null;
+        this.ready = null;
+        reject(error);
+      };
+      child.once("error", () => fail("CODEX_USAGE_START_FAILED"));
+      child.once("exit", () => fail("CODEX_USAGE_APP_SERVER_EXITED"));
+      this.request("initialize", { clientInfo: { name: "codeorquestra", title: "CodeOrquestra", version: "0.1.0" }, capabilities: null }, child).then(() => resolve(), () => {
+        this.breakConnection("CODEX_USAGE_INITIALIZE_FAILED");
+        reject(new Error("CODEX_USAGE_INITIALIZE_FAILED"));
+      });
+    });
+    return this.ready;
+  }
+  request(method, params, child = this.child) {
+    if (!child?.stdin.writable) return Promise.reject(new Error("CODEX_USAGE_NOT_CONNECTED"));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error("CODEX_USAGE_REQUEST_TIMEOUT"));
+      }, this.requestTimeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
+      child.stdin.write(`${JSON.stringify({ id, method, params })}
+`, (error) => {
+        if (!error) return;
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(new Error("CODEX_USAGE_WRITE_FAILED"));
+      });
+    });
+  }
+  onLine(line) {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      this.breakConnection("CODEX_USAGE_INVALID_RESPONSE");
+      return;
+    }
+    if (typeof message.id !== "number") return;
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pending.delete(message.id);
+    if (message.error) pending.reject(new Error("CODEX_USAGE_REQUEST_REJECTED"));
+    else pending.resolve(message.result);
+  }
+  breakConnection(code) {
+    const error = new Error(code);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.child?.kill();
+    this.child = null;
+    this.ready = null;
+  }
+  async stop() {
+    const child = this.child;
+    this.child = null;
+    this.ready = null;
+    this.cache.clear();
+    this.breakConnection("CODEX_USAGE_STOPPED");
+    if (!child || child.exitCode !== null) return;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, 2e3);
+      timer.unref?.();
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      child.kill();
+    });
+  }
+};
+
+// src/broker/runtime-paths.ts
+import { promises as fs12, existsSync, readFileSync } from "node:fs";
+import os3 from "node:os";
+import path12 from "node:path";
+import { fileURLToPath } from "node:url";
+var here = fileURLToPath(import.meta.url);
+var SOURCE_MODE = here.endsWith(".ts");
+var RUNTIME_BASE = SOURCE_MODE ? path12.resolve(path12.dirname(here), "..", "..") : path12.dirname(here);
+function workerEntry() {
+  return readEnv("WORKER_ENTRY") ?? (SOURCE_MODE ? path12.join(RUNTIME_BASE, "src", "worker", "main.ts") : path12.join(RUNTIME_BASE, "worker.mjs"));
+}
+function cliEntry() {
+  return SOURCE_MODE ? path12.join(RUNTIME_BASE, "src", "cli", "main.ts") : path12.join(RUNTIME_BASE, "codeorquestra.mjs");
+}
+function nodeExecArgv() {
+  return SOURCE_MODE ? ["--experimental-strip-types", "--disable-warning=ExperimentalWarning"] : [];
+}
+function dashboardDir() {
+  const candidates = [
+    readEnv("DASHBOARD_DIR"),
+    SOURCE_MODE ? path12.join(RUNTIME_BASE, "dist", "dashboard") : path12.join(RUNTIME_BASE, "dashboard")
+  ].filter((candidate) => Boolean(candidate));
+  for (const candidate of candidates) if (existsSync(path12.join(candidate, "index.html"))) return candidate;
+  return null;
+}
+function defaultStateRoot() {
+  const base = process.platform === "win32" ? process.env.LOCALAPPDATA ?? path12.join(os3.homedir(), "AppData", "Local") : path12.join(os3.homedir(), ".local", "state");
+  return path12.join(base, "CodexClaudeLive", "v2");
+}
+function engineInfo() {
+  return { runtimeVersion: RUNTIME_VERSION, productName: BRAND.name };
+}
+async function findClaudeLauncher(env = process.env) {
+  const override = readEnv("TEST_CLI", env) ?? readEnv("CLAUDE_LAUNCHER", env);
+  if (override) return override;
+  const names = process.platform === "win32" ? ["claude.ps1", "claude.cmd", "claude.exe", "claude"] : ["claude"];
+  for (const dir of (env.PATH ?? "").split(path12.delimiter).filter(Boolean)) {
+    for (const name of names) {
+      const candidate = path12.join(dir, name);
+      try {
+        await fs12.access(candidate);
+        return candidate;
+      } catch {
+      }
+    }
+  }
+  return null;
 }
 
 // src/quota/usage-parser.ts
@@ -2605,20 +3557,20 @@ var QuotaService = class {
 };
 
 // src/broker/process-tree.ts
-import { spawn as spawn4 } from "node:child_process";
+import { spawn as spawn6 } from "node:child_process";
 import { closeSync, openSync, statSync, unlinkSync, utimesSync, writeFileSync, readFileSync as readFileSync2, mkdirSync } from "node:fs";
-import { promises as fs11 } from "node:fs";
-import path10 from "node:path";
+import { promises as fs14 } from "node:fs";
+import path13 from "node:path";
 
 // src/broker/process-identity.ts
-import { spawn as spawn3 } from "node:child_process";
-import { promises as fs10 } from "node:fs";
+import { spawn as spawn5 } from "node:child_process";
+import { promises as fs13 } from "node:fs";
 var PROBE_TIMEOUT_MS = 1e4;
 function runCapture(command, args, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn3(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+      child = spawn5(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     } catch {
       resolve(null);
       return;
@@ -2669,7 +3621,7 @@ async function windowsCreationTime(pid) {
 async function linuxCreationTime(pid) {
   let raw;
   try {
-    raw = await fs10.readFile(`/proc/${pid}/stat`, "utf8");
+    raw = await fs13.readFile(`/proc/${pid}/stat`, "utf8");
   } catch (error) {
     return error.code === "ENOENT" ? "" : null;
   }
@@ -2710,7 +3662,7 @@ function parsePipeTable(text) {
 async function linuxProcessTable() {
   let names;
   try {
-    names = await fs10.readdir("/proc");
+    names = await fs13.readdir("/proc");
   } catch {
     return null;
   }
@@ -2718,7 +3670,7 @@ async function linuxProcessTable() {
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      const raw = await fs10.readFile(`/proc/${name}/stat`, "utf8");
+      const raw = await fs13.readFile(`/proc/${name}/stat`, "utf8");
       const close = raw.lastIndexOf(")");
       if (close < 0) continue;
       const fields = raw.slice(close + 2).split(" ");
@@ -2784,10 +3736,10 @@ async function verifyProcessIdentity(pid, recorded) {
 
 // src/broker/process-tree.ts
 function holdFileFor(runDir) {
-  return path10.join(runDir, "worker.hold");
+  return path13.join(runDir, "worker.hold");
 }
 function identityFileFor(runDir) {
-  return path10.join(runDir, "worker-identity.json");
+  return path13.join(runDir, "worker-identity.json");
 }
 function readWorkerIdentity(runDir) {
   try {
@@ -2823,7 +3775,7 @@ async function verifyWorkerLiveness(runDir, expected) {
 function terminateTree(pid) {
   return new Promise((resolve) => {
     if (process.platform === "win32") {
-      const killer = spawn4("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      const killer = spawn6("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       const timer = setTimeout(() => {
         killer.kill();
         resolve();
@@ -2861,7 +3813,7 @@ function waitForExit(pid, timeoutMs) {
   });
 }
 function engineFileFor(runDir) {
-  return path10.join(runDir, "engine.json");
+  return path13.join(runDir, "engine.json");
 }
 function readEngineProcess(runDir) {
   try {
@@ -2926,7 +3878,7 @@ async function settleExitedTarget(name, pid, createdAt, abnormal = false) {
 }
 async function reconcileRunProcesses(runDir, workerPid, strictRecovery = false) {
   const targets = [];
-  const holdReleased = await fs11.access(holdFileFor(runDir)).then(() => false, () => true);
+  const holdReleased = await fs14.access(holdFileFor(runDir)).then(() => false, () => true);
   const workerCreatedAt = readWorkerIdentity(runDir)?.createdAt;
   if (workerPid !== null) {
     if (holdReleased) targets.push(await settleExitedTarget("worker", workerPid, workerCreatedAt));
@@ -3005,7 +3957,9 @@ var TaskManager = class {
   stateRoot;
   tasks = /* @__PURE__ */ new Map();
   trustStore;
+  worktreePolicy;
   quota;
+  codexUsage;
   locks = /* @__PURE__ */ new Map();
   options;
   globalSeq = 0;
@@ -3025,21 +3979,26 @@ var TaskManager = class {
     this.options = options;
     this.stateRoot = options.stateRoot;
     this.trustStore = new TrustStore(options.stateRoot);
+    this.worktreePolicy = new WorktreePolicyStore(options.stateRoot);
     this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 3e4 });
+    this.codexUsage = options.codexUsage ?? (options.harness ? {
+      refresh: async () => unavailableCodexUsage("CODEX_USAGE_DISABLED_IN_HARNESS", (/* @__PURE__ */ new Date()).toISOString()),
+      stop: async () => void 0
+    } : new CodexUsageService());
   }
   get thresholds() {
     return this.options.supervision ?? SUPERVISION;
   }
   tasksDir() {
-    return path11.join(this.stateRoot, "tasks");
+    return path14.join(this.stateRoot, "tasks");
   }
   locksDir() {
-    return path11.join(this.stateRoot, "locks");
+    return path14.join(this.stateRoot, "locks");
   }
   async start() {
-    await fs12.mkdir(this.tasksDir(), { recursive: true });
+    await fs15.mkdir(this.tasksDir(), { recursive: true });
     this.assertOperational();
-    await fs12.mkdir(this.locksDir(), { recursive: true });
+    await fs15.mkdir(this.locksDir(), { recursive: true });
     this.assertOperational();
     this.launcherPath = await findClaudeLauncher();
     this.assertOperational();
@@ -3068,6 +4027,8 @@ var TaskManager = class {
     this.stopping = true;
     if (this.supervisionTimer) clearInterval(this.supervisionTimer);
     if (this.derivedTimer) clearInterval(this.derivedTimer);
+    await this.codexUsage.stop();
+    await Promise.allSettled([...this.tasks.values()].flatMap((task) => task.usageRefresh ? [task.usageRefresh] : []));
     await this.settlePreparations();
     for (const task of this.tasks.values()) {
       if (task.run && !task.run.finalized) {
@@ -3101,7 +4062,7 @@ var TaskManager = class {
     this.assertOperational();
     let entries = [];
     try {
-      entries = await fs12.readdir(this.tasksDir());
+      entries = await fs15.readdir(this.tasksDir());
       this.assertOperational();
     } catch {
       entries = [];
@@ -3109,11 +4070,11 @@ var TaskManager = class {
     const opened = [];
     for (const taskId of entries) {
       this.assertOperational();
-      const dir = path11.join(this.tasksDir(), taskId);
-      const record = await readJsonShared(path11.join(dir, "task.json"));
+      const dir = path14.join(this.tasksDir(), taskId);
+      const record2 = await readJsonShared(path14.join(dir, "task.json"));
       this.assertOperational();
-      if (record.status !== "ok") continue;
-      opened.push(await this.openTask(normalizeRecord(record.value), dir));
+      if (record2.status !== "ok") continue;
+      opened.push(await this.openTask(normalizeRecord(record2.value), dir));
       this.assertOperational();
     }
     for (const task of opened) {
@@ -3128,11 +4089,11 @@ var TaskManager = class {
     }
     for (const task of opened) {
       this.assertOperational();
-      const current = await readJsonShared(path11.join(task.dir, "current-run.json"));
+      const current = await readJsonShared(path14.join(task.dir, "current-run.json"));
       this.assertOperational();
       if (current.status !== "ok") continue;
       if (current.value.status !== "RUNNING" && current.value.status !== "STARTING") continue;
-      const runDir = current.value.runDir || path11.join(task.dir, "runs", current.value.runId);
+      const runDir = current.value.runDir || path14.join(task.dir, "runs", current.value.runId);
       const identity = readWorkerIdentity(runDir);
       const verdict = await verifyWorkerLiveness(runDir, identity);
       this.assertOperational();
@@ -3174,7 +4135,7 @@ var TaskManager = class {
           quarantineNote
         };
         this.locks.set(lock.workspaceKey, lock);
-        await writeFileAtomic(path11.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path14.join(this.locksDir(), `${lock.workspaceKey}.json`), JSON.stringify(lock, null, 2));
         this.assertOperational();
       }
       await this.writeCurrentRunBestEffort(task, { ...current.value, status: "UNCERTAIN", workerPid: null });
@@ -3184,7 +4145,7 @@ var TaskManager = class {
     }
     let lockFiles = [];
     try {
-      lockFiles = await fs12.readdir(this.locksDir());
+      lockFiles = await fs15.readdir(this.locksDir());
       this.assertOperational();
     } catch {
       lockFiles = [];
@@ -3193,10 +4154,10 @@ var TaskManager = class {
       this.assertOperational();
       const key = file.replace(/\.json$/, "");
       if (this.locks.has(key)) continue;
-      const read = await readJsonShared(path11.join(this.locksDir(), file));
+      const read = await readJsonShared(path14.join(this.locksDir(), file));
       this.assertOperational();
       if (read.status !== "ok") {
-        await fs12.rm(path11.join(this.locksDir(), file), { force: true });
+        await fs15.rm(path14.join(this.locksDir(), file), { force: true });
         this.assertOperational();
         continue;
       }
@@ -3204,18 +4165,63 @@ var TaskManager = class {
         this.locks.set(key, read.value);
         continue;
       }
-      await fs12.rm(path11.join(this.locksDir(), file), { force: true });
+      await fs15.rm(path14.join(this.locksDir(), file), { force: true });
       this.assertOperational();
     }
+    await this.sweepOrphanWorktrees();
   }
-  async openTask(record, dir) {
-    const existing = this.tasks.get(record.taskId);
+  /**
+   * Removes worktrees no live task owns, and reports the ones it will not touch.
+   *
+   * Deliberately the LAST pass: quarantined locks are re-seeded just above, and
+   * a quarantined worktree must never be swept — a process of the previous run
+   * may still be able to write there.
+   *
+   * This is not optional once provisioning exists. `git worktree add` can
+   * outlast PREPARATION_DRAIN_MS on a large repository; shutdown logs and
+   * proceeds, leaving a registered worktree with no task. Without this sweep
+   * that leaks, one directory per interrupted start.
+   *
+   * Removal is narrow by design: only a tree with no uncommitted work, and only
+   * through git, which refuses a dirty tree on its own. Anything dirty or
+   * unattributable is listed and left alone.
+   */
+  async sweepOrphanWorktrees() {
+    const owned = /* @__PURE__ */ new Set();
+    for (const task of this.tasks.values()) owned.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) owned.add(lock.holderTaskId.slice(0, 16));
+    let orphans;
+    try {
+      orphans = await listOrphans(this.stateRoot, (_repoKey, prefix) => owned.has(prefix));
+    } catch {
+      return;
+    }
+    for (const orphan of orphans) {
+      this.assertOperational();
+      if (orphan.dirtyFiles.length > 0) {
+        this.options.log(`worktree \xF3rf\xE3o preservado (${orphan.dirtyFiles.length} arquivo(s) n\xE3o commitado(s)): ${orphan.path}`);
+        continue;
+      }
+      let repository;
+      try {
+        repository = await resolveRepository(orphan.path);
+      } catch {
+        this.options.log(`worktree \xF3rf\xE3o n\xE3o atribu\xEDvel, preservado: ${orphan.path}`);
+        continue;
+      }
+      const removal = await withRepositoryMutex(repository.repoKey, () => removeWorktree(repository, orphan.path));
+      this.options.log(removal.removed ? `worktree \xF3rf\xE3o limpo removido: ${orphan.path}` : `worktree \xF3rf\xE3o preservado (git recusou a remo\xE7\xE3o): ${orphan.path} \u2014 ${removal.reason ?? "sem motivo informado"}`);
+    }
+  }
+  async openTask(record2, dir) {
+    const existing = this.tasks.get(record2.taskId);
     if (existing) return existing;
-    const log = await EventLog.open(path11.join(dir, "events.jsonl"));
+    const log = await EventLog.open(path14.join(dir, "events.jsonl"));
+    const history = await log.readFrom(0);
     const queue = await this.loadQueue(dir);
-    const pointer = await readJsonShared(path11.join(dir, "session.json"));
+    const pointer = await readJsonShared(path14.join(dir, "session.json"));
     const task = {
-      record,
+      record: record2,
       dir,
       log,
       run: null,
@@ -3230,10 +4236,14 @@ var TaskManager = class {
       pending: /* @__PURE__ */ new Map(),
       resolvedRequests: /* @__PURE__ */ new Set(),
       alertsRaised: /* @__PURE__ */ new Set(),
-      uncertain: record.requiresReview,
+      lastDecisionAlertAt: null,
+      uncertain: record2.requiresReview,
       disconnected: false,
       previousSessionId: pointer.status === "ok" && typeof pointer.value.sessionId === "string" ? pointer.value.sessionId : null,
       quota: null,
+      claudeUsage: ClaudeUsageAccumulator.fromEvents(history),
+      codexUsage: unavailableCodexUsage(),
+      usageRefresh: null,
       writer: null,
       derivedDirty: false,
       lastTelemetryEventAt: 0,
@@ -3242,28 +4252,52 @@ var TaskManager = class {
       updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
       chain: Promise.resolve()
     };
-    this.tasks.set(record.taskId, task);
+    this.tasks.set(record2.taskId, task);
     return task;
   }
   async persistRecord(task) {
-    await writeFileAtomic(path11.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
+    await writeFileAtomic(path14.join(task.dir, "task.json"), JSON.stringify(task.record, null, 2));
   }
   // ------------------------------------------------------------- registration
   async register(threadId, source) {
     if (typeof threadId !== "string" || !THREAD_ID_PATTERN.test(threadId)) throw new HttpError(400, "THREAD_ID_INVALID");
     const taskId = taskIdForThread(threadId);
-    const dir = path11.join(this.tasksDir(), taskId);
-    await fs12.mkdir(dir, { recursive: true });
+    const dir = path14.join(this.tasksDir(), taskId);
+    await fs15.mkdir(dir, { recursive: true });
     const existing = this.tasks.get(taskId) ?? null;
     const { handle, hash } = mintTaskHandle();
-    const record = existing ? { ...existing.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() } : { taskId, threadId, createdAt: (/* @__PURE__ */ new Date()).toISOString(), handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString(), workspace: null, requiresReview: false, reviewReason: null };
-    const task = await this.openTask(record, dir);
-    task.record = record;
+    const record2 = existing ? { ...existing.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() } : { taskId, threadId, createdAt: (/* @__PURE__ */ new Date()).toISOString(), handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString(), workspace: null, requiresReview: false, reviewReason: null };
+    const task = await this.openTask(record2, dir);
+    task.record = record2;
     await this.persistRecord(task);
     await this.append(task, task.run?.runId ?? "none", "task_registered", { source, rotated: Boolean(existing) });
     this.options.log(`task ${taskId} registered (${source})`);
     this.changed(task);
-    return { taskId, taskHandle: handle, created: !existing, requiresReview: record.requiresReview };
+    if (!this.options.harness) void this.refreshUsage(task);
+    return { taskId, taskHandle: handle, created: !existing, requiresReview: record2.requiresReview };
+  }
+  /**
+   * Mints a new handle for an existing task and invalidates the previous one.
+   *
+   * Rotation is a takeover, not a copy: whoever held the old handle stops being
+   * able to act on the task. That is the property that keeps a paired
+   * coordinator from silently sharing control with a stale one, and it is why
+   * this is appended to the durable log rather than done quietly.
+   */
+  async rotateHandle(task, reason, source) {
+    const { handle, hash } = mintTaskHandle();
+    const previousRotatedAt = task.record.handleRotatedAt;
+    task.record = { ...task.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    await this.persistRecord(task);
+    await this.append(task, task.run?.runId ?? "none", "task_handle_rotated", {
+      reason,
+      source,
+      previousRotatedAt,
+      note: "Um handle novo foi emitido; o anterior deixou de valer. Quem o detinha n\xE3o age mais nesta tarefa."
+    });
+    this.options.log(`task ${task.record.taskId}: handle rotacionado (${reason}, ${source})`);
+    this.changed(task);
+    return { taskId: task.record.taskId, taskHandle: handle, requiresReview: task.record.requiresReview };
   }
   resolveHandle(handle) {
     if (typeof handle !== "string" || !handle) throw new HttpError(403, "TASK_HANDLE_REQUIRED");
@@ -3311,6 +4345,64 @@ var TaskManager = class {
    * be proven gone: a writer is never restored while a survivor is possible.
    * The decision and its reason are recorded in the task log.
    */
+  /**
+   * What worktrees exist under this state root and which are unaccounted for.
+   *
+   * Ownership is decided here, not in the git module, because only the task
+   * manager knows which tasks are live and which locks are quarantined. A
+   * quarantined worktree is never reported as an orphan: a process of the
+   * previous run may still be able to write there, and the audited release
+   * path — not a sweep — is what ends that.
+   */
+  async worktreeInventory() {
+    const ownedPrefixes = /* @__PURE__ */ new Set();
+    for (const task of this.tasks.values()) ownedPrefixes.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) ownedPrefixes.add(lock.holderTaskId.slice(0, 16));
+    const orphans = await listOrphans(this.stateRoot, (_repoKey, taskPrefix) => ownedPrefixes.has(taskPrefix));
+    return { policies: await this.worktreePolicy.list(), orphans };
+  }
+  /**
+   * Removes a retained worktree, on the operator's explicit instruction.
+   *
+   * Retention exists because uncommitted work is the normal end state of a run,
+   * so discarding it has to be stated, not defaulted: a dirty tree is only
+   * removed with confirmDiscardUncommitted, and the files being discarded are
+   * named back in the answer. A tree whose lock is still quarantined is never
+   * removed here — releasing ownership is the other, survivor-checking action.
+   */
+  async releaseWorktree(target, request, source) {
+    const note = (request.note ?? "").trim();
+    if (!note) throw new HttpError(400, "NOTE_REQUIRED", { message: "Remover um worktree exige uma nota; a remo\xE7\xE3o fica registrada." });
+    const canonical = canonicalize(target);
+    for (const lock of this.locks.values()) {
+      if (canonicalize(lock.workspace) !== canonical) continue;
+      if (lock.quarantined) {
+        throw new HttpError(409, "WORKSPACE_LOCK_QUARANTINED", {
+          holderTaskId: lock.holderTaskId,
+          note: lock.quarantineNote,
+          remediation: "Um processo da execu\xE7\xE3o anterior pode continuar escrevendo aqui. Libere a posse pela rota de travas, que reverifica sobreviventes, antes de remover o diret\xF3rio."
+        });
+      }
+      throw new HttpError(409, "WORKSPACE_WRITER_LOCKED", { holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, message: "Este worktree ainda pertence a uma execu\xE7\xE3o ativa." });
+    }
+    let repository;
+    try {
+      repository = await resolveRepository(target);
+    } catch (error) {
+      throw new HttpError(400, error.code ?? "NOT_A_GIT_REPOSITORY", { message: error.message });
+    }
+    const dirty = await gitStatus(target);
+    if (dirty.length > 0 && !request.confirmDiscardUncommitted) {
+      throw new HttpError(409, "WORKTREE_HAS_UNCOMMITTED_WORK", {
+        files: dirty.slice(0, 50),
+        message: `Este worktree tem ${dirty.length} arquivo(s) com altera\xE7\xF5es n\xE3o commitadas. Commite a partir dele, ou repita com confirmDiscardUncommitted para descartar.`
+      });
+    }
+    const removal = await withRepositoryMutex(repository.repoKey, () => removeWorktree(repository, target, { force: dirty.length > 0 }));
+    if (!removal.removed) throw new HttpError(409, "WORKTREE_REMOVE_REFUSED", { message: removal.reason ?? "git recusou a remo\xE7\xE3o." });
+    this.options.log(`worktree removido por a\xE7\xE3o administrativa (${source}): ${target} \u2014 ${note}`);
+    return { removed: true, path: target, discarded: dirty.slice(0, 50), note };
+  }
   async releaseQuarantinedLock(workspaceKey, request, source) {
     const lock = this.locks.get(workspaceKey);
     if (!lock) throw new HttpError(404, "LOCK_NOT_FOUND");
@@ -3329,7 +4421,7 @@ var TaskManager = class {
     const historicalAncestryConclusive = false;
     try {
       if (this.options.harness) await new Promise((resolve) => setTimeout(resolve, 50));
-      const runDir = task ? path11.join(task.dir, "runs", lock.holderRunId) : null;
+      const runDir = task ? path14.join(task.dir, "runs", lock.holderRunId) : null;
       check = runDir ? await survivorCheck(runDir, lock.holderPid) : { releasable: false, livePids: [], note: "A execu\xE7\xE3o que det\xE9m a trava n\xE3o p\xF4de ser localizada no estado; a posse n\xE3o \xE9 liberada \xE0s cegas." };
       if (!check.releasable) {
         if (task) await this.append(task, lock.holderRunId, "lock_release_refused", { workspaceKey, source, livePids: check.livePids, note: check.note });
@@ -3347,12 +4439,12 @@ var TaskManager = class {
           ownership: { taskId: lock.holderTaskId, runId: lock.holderRunId }
         });
       }
-      const persisted = await readJsonShared(path11.join(this.locksDir(), `${workspaceKey}.json`));
+      const persisted = await readJsonShared(path14.join(this.locksDir(), `${workspaceKey}.json`));
       const current = this.locks.get(workspaceKey);
       if (current !== lock || persisted.status !== "ok" || persisted.value.holderTaskId !== lock.holderTaskId || persisted.value.holderRunId !== lock.holderRunId || !persisted.value.quarantined) {
         throw new HttpError(409, "LOCK_OWNERSHIP_CHANGED", { note: "A posse mudou durante a auditoria; nada foi liberado." });
       }
-      await fs12.rm(path11.join(this.locksDir(), `${workspaceKey}.json`));
+      await fs15.rm(path14.join(this.locksDir(), `${workspaceKey}.json`));
       this.locks.delete(workspaceKey);
       if (task) await this.append(task, lock.holderRunId, "lock_released", {
         workspaceKey,
@@ -3376,12 +4468,12 @@ var TaskManager = class {
     const run2 = async () => {
       this.globalSeq += 1;
       const gseq = this.globalSeq;
-      const record = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...toolUseId ? { toolUseId } : {}, data, gseq });
+      const record2 = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...toolUseId ? { toolUseId } : {}, data, gseq });
       task.lastActivityAt = Date.now();
       task.derivedDirty = true;
-      task.updatedAt = record.ts;
-      this.options.onEvent(record);
-      return record;
+      task.updatedAt = record2.ts;
+      this.options.onEvent(record2);
+      return record2;
     };
     const next = this.appendChain.then(run2, run2);
     this.appendChain = next.catch(() => void 0);
@@ -3393,10 +4485,10 @@ var TaskManager = class {
   }
   // ---------------------------------------------------------------- queue
   async loadQueue(dir) {
-    const file = path11.join(dir, "queue.jsonl");
+    const file = path14.join(dir, "queue.jsonl");
     let text;
     try {
-      text = await fs12.readFile(file, "utf8");
+      text = await fs15.readFile(file, "utf8");
     } catch {
       return [];
     }
@@ -3413,7 +4505,7 @@ var TaskManager = class {
   }
   async persistQueue(task) {
     const lines = task.queue.map((entry) => JSON.stringify(entry)).join("\n");
-    await writeFileAtomic(path11.join(task.dir, "queue.jsonl"), lines ? `${lines}
+    await writeFileAtomic(path14.join(task.dir, "queue.jsonl"), lines ? `${lines}
 ` : "");
   }
   queueView(entry) {
@@ -3435,6 +4527,74 @@ var TaskManager = class {
     await this.deliverNext(task);
     this.changed(task);
     return this.queueView(entry);
+  }
+  /**
+   * A review note on a changed file becomes guidance for the next turn.
+   *
+   * Three steps, in order: validate the target, record the annotation in the
+   * durable log, and hand the rendered text to the EXISTING enqueueMessage.
+   * There is no new delivery path, no second queue and no new worker message,
+   * so every guarantee comes along unchanged — refused with NO_ACTIVE_RUN,
+   * refused while the run REQUIRES_REVIEW, delivered only between turns, never
+   * mid-turn, persisted in queue.jsonl, redacted on the way in.
+   *
+   * The target must be a file the broker already observed as changed. An
+   * annotation can therefore never name an arbitrary path, which is what keeps
+   * this from becoming a way to make Claude read somewhere it was not sent.
+   */
+  async annotate(task, input, source) {
+    const file = typeof input.file === "string" ? input.file.trim() : "";
+    const comment = typeof input.comment === "string" ? input.comment.trim() : "";
+    if (!file) throw new HttpError(400, "FILE_REQUIRED", { message: 'Informe o arquivo anotado em "file".' });
+    if (!comment) throw new HttpError(400, "COMMENT_REQUIRED", { message: "Uma anota\xE7\xE3o sem texto n\xE3o orienta nada." });
+    const workspace = task.record.workspace;
+    if (!workspace) throw new HttpError(409, "NO_ACTIVE_RUN");
+    const observed = await this.observedFiles(task);
+    if (!observed.includes(file)) {
+      throw new HttpError(400, "FILE_NOT_OBSERVED", {
+        message: "S\xF3 \xE9 poss\xEDvel anotar um arquivo que o broker observou como alterado nesta execu\xE7\xE3o.",
+        observed: observed.slice(0, 50)
+      });
+    }
+    if (isSensitivePath(file)) throw new HttpError(403, "SENSITIVE_FILE", { message: "Arquivos sens\xEDveis n\xE3o s\xE3o anotados nem exibidos." });
+    const resolved = resolveWorkspacePath(workspace, file);
+    if (!resolved.inside) throw new HttpError(403, "OUTSIDE_WORKSPACE", { message: "O caminho anotado sai da \xE1rvore de trabalho." });
+    const hunk = typeof input.hunk === "string" && input.hunk.trim() ? input.hunk.trim().slice(0, 120) : null;
+    const rendered = `Anota\xE7\xE3o de revis\xE3o em ${file}${hunk ? ` (${hunk})` : ""}: ${comment}`;
+    await this.append(task, task.run?.runId ?? "none", "diff_annotated", {
+      file,
+      hunk,
+      commentPreview: boundedPreview(redactSensitiveText(comment), 300).preview,
+      source,
+      note: "A anota\xE7\xE3o entra na fila como orienta\xE7\xE3o e \xE9 entregue entre turnos, como qualquer outra."
+    });
+    return this.enqueueMessage(task, rendered, source);
+  }
+  /** The changed-file list the annotation and diff routes validate against. */
+  async observedFiles(task) {
+    const fresh = await this.changedFiles(task);
+    return fresh.observed;
+  }
+  /**
+   * The diff of one observed file, for review.
+   *
+   * Diff output is file content the panel has never previewed, so it goes
+   * through the same redaction as everything else public, and through the same
+   * target validation as an annotation.
+   */
+  async fileDiff(task, file) {
+    const workspace = task.record.workspace;
+    if (!workspace) throw new HttpError(409, "NO_ACTIVE_RUN");
+    const observed = await this.observedFiles(task);
+    if (!observed.includes(file)) throw new HttpError(400, "FILE_NOT_OBSERVED", { observed: observed.slice(0, 50) });
+    if (isSensitivePath(file)) throw new HttpError(403, "SENSITIVE_FILE");
+    const resolved = resolveWorkspacePath(workspace, file);
+    if (!resolved.inside) throw new HttpError(403, "OUTSIDE_WORKSPACE");
+    const result = await git(["diff", "--unified=3", "--", file], workspace);
+    const raw = result.code === 0 ? result.stdout : "";
+    const redacted = redactSensitiveText(raw);
+    const limit = 64e3;
+    return { file, diff: redacted.slice(0, limit), truncated: redacted.length > limit };
   }
   async deliverNext(task) {
     const run2 = task.run;
@@ -3564,7 +4724,7 @@ var TaskManager = class {
    * Reserves the task slot and the checkout writer lock synchronously, before
    * any awaited preparation, so two concurrent starts can never both proceed.
    */
-  async startRun(task, job, harness, source, acknowledgeReview) {
+  async startRun(task, job, harness, source, acknowledgeReview, observation) {
     let contract;
     try {
       contract = resolveJobContract(job);
@@ -3573,6 +4733,7 @@ var TaskManager = class {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, "LEGACY_CONTRACT_USE_LEGACY_RUNNER", { message: "Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2." });
+    this.assertObserved(task, observation);
     if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker est\xE1 encerrando; nenhuma execu\xE7\xE3o nova \xE9 aceita." });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
       throw new HttpError(409, "REQUIRES_REVIEW", { message: "A \xFAltima execu\xE7\xE3o ficou incerta ou desconectada; confirme a revis\xE3o (acknowledgeReview: true) antes de iniciar outra.", reason: task.record.reviewReason });
@@ -3580,13 +4741,18 @@ var TaskManager = class {
     let workspace;
     let canonicalWorkspace;
     try {
-      workspace = realpathSync2.native(contract.workspace);
+      workspace = realpathSync3.native(contract.workspace);
       canonicalWorkspace = workspace.replace(/\\/g, "/").replace(/\/+$/, "");
       if (process.platform === "win32") canonicalWorkspace = canonicalWorkspace.toLowerCase();
     } catch {
       throw new HttpError(400, "WORKSPACE_NOT_FOUND");
     }
-    const workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    let worktreePlan = null;
+    let workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    if (contract.execution.mode === "worktree") {
+      worktreePlan = await this.planWorktree(task, contract, workspace);
+      workspaceKey = sha256(canonicalizePlanned(worktreePlan.path)).slice(0, 24);
+    }
     if (task.run && !task.run.finalized) throw new HttpError(409, "RUN_IN_PROGRESS", { runId: task.run.runId });
     const holder = this.locks.get(workspaceKey);
     if (contract.capabilities.edit && holder && holder.holderTaskId !== task.record.taskId) {
@@ -3601,7 +4767,7 @@ var TaskManager = class {
     }
     const runId = `run-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     const runToken = randomUUID();
-    const runDir = path11.join(task.dir, "runs", runId);
+    const runDir = path14.join(task.dir, "runs", runId);
     const run2 = {
       runId,
       runToken,
@@ -3624,6 +4790,8 @@ var TaskManager = class {
       turns: 0,
       resumeMode: task.previousSessionId ? "automatic" : "new",
       simulated: false,
+      declaredWorkspace: worktreePlan ? workspace : null,
+      worktree: worktreePlan,
       writerLockKey: contract.capabilities.edit ? workspaceKey : null,
       finalized: false,
       finalizing: false,
@@ -3634,27 +4802,47 @@ var TaskManager = class {
     };
     task.run = run2;
     if (contract.capabilities.edit) {
-      this.locks.set(workspaceKey, { workspaceKey, workspace: canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run2.startedAt, quarantined: false });
+      this.locks.set(workspaceKey, { workspaceKey, workspace: worktreePlan ? canonicalizePlanned(worktreePlan.path) : canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run2.startedAt, quarantined: false });
     }
     task.uncertain = false;
     task.disconnected = false;
     task.phase = "starting";
     task.currentTool = null;
     task.alertsRaised.clear();
+    task.lastDecisionAlertAt = null;
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
     try {
-      await fs12.mkdir(runDir, { recursive: true });
-      run2.prompt = contract.prompt ?? (contract.promptFile ? await fs12.readFile(contract.promptFile, "utf8") : "");
+      await fs15.mkdir(runDir, { recursive: true });
+      run2.prompt = contract.prompt ?? (contract.promptFile ? await fs15.readFile(contract.promptFile, "utf8") : "");
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
-      const { inventory, trust } = await this.inventoryFor(workspace);
+      let effectiveWorkspace = workspace;
+      if (worktreePlan) {
+        effectiveWorkspace = await this.provisionWorktree(task, run2, worktreePlan);
+        if (this.stopping || task.run !== run2) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante o provisionamento; nenhum worker ser\xE1 criado." });
+      }
+      const { inventory, trust: initialTrust } = await this.inventoryFor(effectiveWorkspace);
+      let trust = initialTrust;
       if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker come\xE7ou a encerrar durante a prepara\xE7\xE3o; nenhum worker ser\xE1 criado." });
+      if (!trust.trusted && worktreePlan) {
+        const derived = await this.trustStore.deriveFromParent({ child: inventory, parentCanonicalWorkspace: canonicalizeWorkspace(workspace) });
+        if (derived) {
+          trust = await this.trustStore.check(inventory);
+          await this.append(task, runId, "trust_derived", {
+            workspace: inventory.canonicalWorkspace,
+            from: canonicalWorkspace,
+            approvalRevision: derived.approvalRevision,
+            items: derived.approvedItems.length,
+            note: "Aprova\xE7\xE3o herdada do checkout de origem: todo item bate por hash. Nenhum recurso novo foi autorizado."
+          });
+        }
+      }
       if (!trust.trusted) {
         throw new HttpError(409, "WORKSPACE_NOT_TRUSTED", { reason: trust.reason, pending: trust.pending, changed: trust.changed, fingerprint: inventory.fingerprint, incomplete: inventory.incomplete });
       }
-      const record = await this.trustStore.load(inventory.canonicalWorkspace);
-      const launch = resolveLaunchCustomizations({ inventory, trust, record });
+      const record2 = await this.trustStore.load(inventory.canonicalWorkspace);
+      const launch = resolveLaunchCustomizations({ inventory, trust, record: record2 });
       task.writer = new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15e3, onTelemetryFailure: (failure) => {
         run2.telemetryFailures += 1;
         void this.reportTelemetryFailure(task, run2, failure.file, failure.code);
@@ -3662,10 +4850,10 @@ var TaskManager = class {
       await this.persistRecord(task);
       if (run2.writerLockKey) {
         const lock = this.locks.get(run2.writerLockKey);
-        await writeFileAtomic(path11.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path14.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       try {
-        await this.writeCurrentRun(task, { runId, runToken, status: "STARTING", workerPid: null, workerStartedAt: null, startedAt: run2.startedAt, workspace, writerLockKey: run2.writerLockKey, runDir });
+        await this.writeCurrentRun(task, { runId, runToken, status: "STARTING", workerPid: null, workerStartedAt: null, startedAt: run2.startedAt, workspace: effectiveWorkspace, writerLockKey: run2.writerLockKey, runDir });
       } catch (error) {
         throw new HttpError(503, "OWNERSHIP_RECORD_FAILED", {
           code: error.code ?? "WRITE_FAILED",
@@ -3677,7 +4865,11 @@ var TaskManager = class {
         requestedModel: run2.requestedModel,
         modelReason: run2.modelReason,
         effort: contract.effort,
-        workspace,
+        workspace: effectiveWorkspace,
+        // Recorded so an audit of status.json can see a run that started with
+        // no panel attached, and which channel was declared instead.
+        observation: { mode: isRecord(observation) && observation.mode === "voz" ? "voz" : "painel", observers: this.options.observers?.(task.record.taskId) ?? 0 },
+        ...worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: "broker", policyEnabledAt: worktreePlan.policy.enabledAt } } : {},
         profile: contract.profile,
         contractVersion: contract.version,
         coordination: contract.coordination,
@@ -3690,8 +4882,8 @@ var TaskManager = class {
       });
       if (source !== "browser") this.touchCoordinator(task);
       this.changed(task);
-      const approvedAgents = inventory.items.filter((item) => item.kind === "agent").map((item) => path11.basename(item.relativePath, ".md"));
-      const approvedSkills = inventory.items.filter((item) => item.kind === "skill").map((item) => path11.basename(path11.dirname(item.relativePath)));
+      const approvedAgents = inventory.items.filter((item) => item.kind === "agent").map((item) => path14.basename(item.relativePath, ".md"));
+      const approvedSkills = inventory.items.filter((item) => item.kind === "skill").map((item) => path14.basename(path14.dirname(item.relativePath)));
       const preparation = this.prepareAndSpawn(task, run2, launch, approvedAgents, approvedSkills, harness).catch((error) => {
         this.options.log(`task ${task.record.taskId}: prepara\xE7\xE3o falhou inesperadamente (${error.name})`);
         void this.finalize(task, run2, "FAIL", "PREPARATION_CRASH", redactSensitiveText(String(error.message ?? error)).slice(0, 300), 1, "preparation");
@@ -3703,12 +4895,126 @@ var TaskManager = class {
       throw error;
     }
   }
+  /**
+   * A run never starts without a declared channel for watching it.
+   *
+   * Commit 0988ebb added this requirement, but only to the v1 runner, where
+   * `Wait-ClaudeLivePanelReady` really blocks. In v2 it existed solely as prose
+   * in SKILL.md and two READMEs telling the coordinator to confirm the panel —
+   * an instruction to a model, not an invariant, and therefore the only place
+   * in this codebase where the documentation promised more than the code did.
+   *
+   * The property worth keeping is not "a tab is on screen", which no broker can
+   * verify. It is that the mode of observation is DECIDED before work starts
+   * and recorded durably. `painel` is now actually checked against live SSE
+   * subscribers; `voz` is an explicit, attributable choice for a coordinator
+   * with no screen. What can no longer happen is a run starting with neither.
+   *
+   * Deliberately understated: a subscriber count proves a channel is attached,
+   * not that a human is watching.
+   */
+  assertObserved(task, observation) {
+    const mode = isRecord(observation) && observation.mode === "voz" ? "voz" : "painel";
+    if (mode === "voz") return;
+    const observers = this.options.observers?.(task.record.taskId) ?? 0;
+    if (observers > 0) return;
+    throw new HttpError(409, "OBSERVATION_REQUIRED", {
+      message: 'Nenhum painel est\xE1 acompanhando esta tarefa. Abra o link do painel e aguarde ele carregar, ou declare observa\xE7\xE3o por voz (observation.mode: "voz") para assumir o acompanhamento narrado.',
+      note: "A contagem prova que um canal est\xE1 anexado, n\xE3o que algu\xE9m est\xE1 olhando."
+    });
+  }
+  /**
+   * Decides where a worktree run will live, and whether it may start at all.
+   *
+   * Everything here is a lookup or a policy check: no directory is created, so
+   * a refusal leaves nothing behind. Runs before the critical section, because
+   * the section cannot await.
+   */
+  async planWorktree(task, contract, declaredWorkspace) {
+    let repository;
+    let policy;
+    try {
+      repository = await resolveRepository(declaredWorkspace);
+      policy = await this.worktreePolicy.require(repository.repoKey);
+    } catch (error) {
+      const code = error.code ?? "WORKTREE_UNAVAILABLE";
+      throw new HttpError(code === "WORKTREE_POLICY_REQUIRED" ? 403 : 400, code, { message: error.message });
+    }
+    const active = [...this.tasks.values()].filter((other) => other.record.taskId !== task.record.taskId && other.run && !other.run.finalized && other.run.worktree?.repository.repoKey === repository.repoKey);
+    if (active.length >= policy.maxParallelRuns) {
+      throw new HttpError(429, "FLEET_CAPACITY_REACHED", {
+        limit: policy.maxParallelRuns,
+        holders: active.map((other) => ({ taskId: other.record.taskId, threadId: other.record.threadId, runId: other.run?.runId ?? null })),
+        message: `J\xE1 existem ${active.length} execu\xE7\xE3o(\xF5es) em worktree neste reposit\xF3rio, o limite aprovado. Aguarde uma terminar ou ajuste maxParallelRuns na pol\xEDtica.`
+      });
+    }
+    const root = policy.worktreeRoot ?? this.stateRoot;
+    const location = worktreePathFor(root, repository.repoKey, task.record.taskId);
+    try {
+      assertUsablePathLength(location.path);
+    } catch (error) {
+      throw new HttpError(400, error.code ?? "WORKTREE_PATH_TOO_LONG", { message: error.message });
+    }
+    const retained = await listOrphans(root, () => false);
+    const mine = retained.filter((entry) => entry.repoKey === repository.repoKey && canonicalize(entry.path) !== canonicalizePlanned(location.path));
+    if (mine.length >= policy.maxRetainedWorktrees) {
+      throw new HttpError(409, "WORKTREE_RETENTION_LIMIT", {
+        limit: policy.maxRetainedWorktrees,
+        retained: mine.map((entry) => ({ path: entry.path, dirtyFiles: entry.dirtyFiles.length })),
+        message: `H\xE1 ${mine.length} worktree(s) retido(s) deste reposit\xF3rio, o limite aprovado. Revise e remova os conclu\xEDdos com "codeorquestra worktree list".`
+      });
+    }
+    return {
+      repository,
+      policy,
+      path: location.path,
+      branch: contract.execution.worktree?.branch ?? `codeorquestra/${task.record.taskId.slice(0, 16)}`,
+      baseRef: contract.execution.worktree?.baseRef ?? null
+    };
+  }
+  /**
+   * Creates the run's worktree and makes it the effective workspace.
+   *
+   * The single substitution of `contract.workspace` is what carries the change
+   * everywhere else: the spawn cwd, the worker descriptor, the action context's
+   * containment checks, the inventory and the changed-file list all read it.
+   */
+  async provisionWorktree(task, run2, plan) {
+    let outcome;
+    try {
+      outcome = await withRepositoryMutex(plan.repository.repoKey, () => ensureWorktree({
+        repository: plan.repository,
+        target: plan.path,
+        branch: plan.branch,
+        baseRef: plan.baseRef
+      }));
+    } catch (error) {
+      const code = error.code ?? "WORKTREE_ADD_FAILED";
+      throw new HttpError(code === "WORKTREE_DIRTY_FROM_PREVIOUS_RUN" ? 409 : 500, code, {
+        message: error.message,
+        ...error.detail ? { detail: error.detail } : {}
+      });
+    }
+    run2.contract = { ...run2.contract, workspace: outcome.path };
+    task.record.workspace = outcome.path;
+    await this.append(task, run2.runId, "worktree_provisioned", {
+      path: outcome.path,
+      branch: outcome.branch,
+      baseRef: outcome.baseRef,
+      created: outcome.created,
+      repoKey: plan.repository.repoKey,
+      declaredWorkspace: run2.declaredWorkspace,
+      provisionedBy: "broker",
+      note: "O Claude nunca cria worktrees; a pol\xEDtica do reposit\xF3rio foi aprovada pelo usu\xE1rio e o broker executou."
+    });
+    return outcome.path;
+  }
   async releaseReservation(task, run2) {
     if (run2.writerLockKey) {
       const lock = this.locks.get(run2.writerLockKey);
       if (lock && lock.holderRunId === run2.runId && !lock.quarantined) {
         this.locks.delete(run2.writerLockKey);
-        await fs12.rm(path11.join(this.locksDir(), `${run2.writerLockKey}.json`), { force: true });
+        await fs15.rm(path14.join(this.locksDir(), `${run2.writerLockKey}.json`), { force: true });
       }
       run2.writerLockKey = null;
     }
@@ -3784,7 +5090,7 @@ var TaskManager = class {
         threadId: task.record.threadId,
         stateRoot: this.stateRoot,
         taskDir: task.dir,
-        runDir: path11.join(task.dir, "runs", run2.runId),
+        runDir: path14.join(task.dir, "runs", run2.runId),
         contract: run2.contract,
         prompt: run2.prompt,
         resumeSessionId: run2.sessionId,
@@ -3803,10 +5109,10 @@ var TaskManager = class {
           ...typeof harness.setModelDelayMs === "number" ? { setModelDelayMs: harness.setModelDelayMs } : {}
         } : null
       };
-      const descriptorFile = path11.join(descriptor.runDir, "worker-descriptor.json");
+      const descriptorFile = path14.join(descriptor.runDir, "worker-descriptor.json");
       await writeFileAtomic(descriptorFile, JSON.stringify(descriptor, null, 2));
       if (this.stopping || task.run !== run2 || run2.finalized) return;
-      const child = spawn5(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
+      const child = spawn7(process.execPath, [...nodeExecArgv(), workerEntry(), "--descriptor", descriptorFile], {
         cwd: run2.contract.workspace,
         env: { ...process.env, [envName("TASK_ID")]: task.record.taskId, [envName("RUN_ID")]: run2.runId, [envName("RUN_TOKEN")]: run2.runToken },
         stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -3820,7 +5126,7 @@ var TaskManager = class {
       const lock = run2.writerLockKey ? this.locks.get(run2.writerLockKey) : null;
       if (lock) {
         lock.holderPid = run2.workerPid;
-        await writeFileAtomic(path11.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
+        await writeFileAtomic(path14.join(this.locksDir(), `${run2.writerLockKey}.json`), JSON.stringify(lock, null, 2));
       }
       child.stderr?.setEncoding("utf8");
       child.stderr?.on("data", (chunk) => this.options.log(`worker ${run2.workerPid} stderr: ${redactSensitiveText(chunk).trim().slice(0, 500)}`));
@@ -3868,7 +5174,8 @@ var TaskManager = class {
         break;
       }
       case "event": {
-        await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
+        const event = await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
+        task.claudeUsage.addEvent(event);
         this.applyEvent(task, run2, message.type, message.data, message.toolUseId);
         if (message.type === "permission_requested" || message.type === "question_asked") this.changed(task);
         break;
@@ -3889,8 +5196,8 @@ var TaskManager = class {
         this.changed(task);
         break;
       case "blob":
-        await fs12.mkdir(path11.join(task.dir, "blobs"), { recursive: true });
-        await writeFileAtomic(path11.join(task.dir, "blobs", `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
+        await fs15.mkdir(path14.join(task.dir, "blobs"), { recursive: true });
+        await writeFileAtomic(path14.join(task.dir, "blobs", `${message.blobId}.json`), JSON.stringify({ blobId: message.blobId, truncated: message.truncated, totalChars: message.totalChars, text: message.text }));
         break;
       case "model_result": {
         task.modelTransition?.settle({ ok: message.ok, activeModel: message.activeModel, code: message.code });
@@ -3911,6 +5218,7 @@ var TaskManager = class {
         await this.observeBetweenTurns(task, run2);
         await this.deliverNext(task);
         this.changed(task);
+        void this.refreshUsage(task);
         break;
       }
       case "preparation_failed": {
@@ -3996,7 +5304,7 @@ var TaskManager = class {
     for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
     task.pending.clear();
     this.changed(task);
-    const runDir = path11.join(task.dir, "runs", run2.runId);
+    const runDir = path14.join(task.dir, "runs", run2.runId);
     const reconciliation = await reconcileRunProcesses(runDir, run2.workerPid, true);
     await this.append(task, run2.runId, "worker_disconnected", {
       workerPid: run2.workerPid,
@@ -4030,7 +5338,7 @@ var TaskManager = class {
     task.currentTool = null;
     for (const [requestId] of task.pending) task.resolvedRequests.add(requestId);
     task.pending.clear();
-    const runDir = path11.join(task.dir, "runs", run2.runId);
+    const runDir = path14.join(task.dir, "runs", run2.runId);
     try {
       if (task.worker?.pid) {
         const pid = task.worker.pid;
@@ -4052,7 +5360,7 @@ var TaskManager = class {
       }
       if (run2.sessionId && run2.sessionConfirmed) {
         task.previousSessionId = run2.sessionId;
-        await writeFileAtomic(path11.join(task.dir, "session.json"), JSON.stringify({ sessionId: run2.sessionId, runId: run2.runId, updatedAt: endedAt, resultFile: path11.join(runDir, "resultado.json") }, null, 2));
+        await writeFileAtomic(path14.join(task.dir, "session.json"), JSON.stringify({ sessionId: run2.sessionId, runId: run2.runId, updatedAt: endedAt, resultFile: path14.join(runDir, "resultado.json") }, null, 2));
       }
       await this.writeCurrentRunBestEffort(task, { runId: run2.runId, runToken: run2.runToken, status, workerPid: null, workerStartedAt: run2.workerStartedAt, startedAt: run2.startedAt, workspace: run2.contract.workspace, writerLockKey: null, runDir });
       await this.writeDerivedNow(task, run2.runId, true, { status, code, message, exitCode, endedAt, failureStage });
@@ -4107,13 +5415,49 @@ var TaskManager = class {
     }
     if (clean) {
       this.locks.delete(key);
-      await fs12.rm(path11.join(this.locksDir(), `${key}.json`), { force: true });
+      await fs15.rm(path14.join(this.locksDir(), `${key}.json`), { force: true });
+      if (run2.worktree) await this.settleWorktree(task, run2, run2.worktree);
     } else {
       holder.quarantined = true;
       holder.quarantineNote = note;
-      await writeFileAtomic(path11.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      await writeFileAtomic(path14.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      if (run2.worktree) {
+        await this.append(task, run2.runId, "worktree_retained", {
+          path: run2.worktree.path,
+          reason: "quarantine",
+          note: "A trava do worktree ficou em quarentena; o diret\xF3rio \xE9 preservado e n\xE3o ser\xE1 reutilizado at\xE9 a libera\xE7\xE3o expl\xEDcita."
+        });
+      }
     }
     run2.writerLockKey = null;
+  }
+  /**
+   * Decides what happens to a worktree once its run released the lock cleanly.
+   *
+   * Uncommitted work is NEVER deleted. `commit` can never belong to Claude, so
+   * the normal end state of a successful run is exactly that: work sitting in
+   * the tree, waiting for the coordinator. Deleting it would destroy the
+   * deliverable, so a dirty tree is retained and reported, and only a tree git
+   * itself agrees is clean is removed.
+   */
+  async settleWorktree(task, run2, plan) {
+    const dirty = await gitStatus(plan.path);
+    if (dirty.length > 0) {
+      await this.append(task, run2.runId, "worktree_retained", {
+        path: plan.path,
+        branch: plan.branch,
+        reason: "uncommitted_work",
+        files: dirty.slice(0, 50),
+        note: "Trabalho n\xE3o commitado preservado: commit nunca pertence ao Claude, ent\xE3o este \xE9 o estado normal de uma execu\xE7\xE3o bem-sucedida. Commite a partir deste caminho ou remova o worktree explicitamente."
+      });
+      return;
+    }
+    const removal = await withRepositoryMutex(plan.repository.repoKey, () => removeWorktree(plan.repository, plan.path));
+    await this.append(task, run2.runId, removal.removed ? "worktree_removed" : "worktree_retained", {
+      path: plan.path,
+      branch: plan.branch,
+      ...removal.removed ? {} : { reason: "git_refused", detail: removal.reason ?? null }
+    });
   }
   /**
    * Writes the authoritative ownership record of the task.
@@ -4125,7 +5469,7 @@ var TaskManager = class {
    * than release work against an unrecorded state.
    */
   async writeCurrentRun(task, value) {
-    await writeFileAtomic(path11.join(task.dir, "current-run.json"), JSON.stringify(value, null, 2), { maxWaitMs: 3e3 });
+    await writeFileAtomic(path14.join(task.dir, "current-run.json"), JSON.stringify(value, null, 2), { maxWaitMs: 3e3 });
   }
   /** Same record, on paths that are already finishing and cannot abort. */
   async writeCurrentRunBestEffort(task, value) {
@@ -4159,7 +5503,7 @@ var TaskManager = class {
     }
   }
   async writeDerivedNow(task, runId, final, terminal) {
-    const runDir = path11.join(task.dir, "runs", runId);
+    const runDir = path14.join(task.dir, "runs", runId);
     const writer = task.writer && task.writer.directory === runDir ? task.writer : new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15e3, onTelemetryFailure: (failure) => {
       if (task.run) {
         task.run.telemetryFailures += 1;
@@ -4169,15 +5513,16 @@ var TaskManager = class {
     const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
     if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: "run_ended", taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
     const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
-    const status = { ...derived.status, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
+    const llmUsage = this.usageView(task);
+    const status = { ...derived.status, llmUsage, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
     await writer.writeStatus(status);
     try {
-      await writeFileAtomic(path11.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
+      await writeFileAtomic(path14.join(runDir, "acompanhamento.txt"), derived.acompanhamento, { maxWaitMs: 1500 });
     } catch {
     }
     if (final) {
       try {
-        const outcome = await writer.writeFinalResult({ ...derived.result, telemetryFailures: status.telemetryFailures });
+        const outcome = await writer.writeFinalResult({ ...derived.result, llmUsage, telemetryFailures: status.telemetryFailures });
         if (outcome.fallback) await this.append(task, runId, "final_result_fallback", { path: outcome.path });
       } catch (error) {
         await this.append(task, runId, "final_result_not_persisted", { code: error.code ?? "FINAL_RESULT_NOT_PERSISTED", message: redactSensitiveText(error.message).slice(0, 300) }).catch(() => void 0);
@@ -4189,12 +5534,22 @@ var TaskManager = class {
   // ------------------------------------------------------------ supervision
   superviseAll() {
     for (const task of this.tasks.values()) {
+      try {
+        this.superviseTask(task);
+      } catch (error) {
+        this.options.log(`supervis\xE3o falhou para ${task.record.taskId}: ${error.name}`);
+      }
+    }
+  }
+  superviseTask(task) {
+    {
       const run2 = task.run;
-      if (!run2 || run2.finalized) continue;
+      if (!run2 || run2.finalized) return;
       const evaluation = evaluateSupervision({
         now: Date.now(),
         runStartedAt: Date.parse(run2.startedAt),
         lastActivityAt: task.lastActivityAt,
+        oldestPendingRequestAt: oldestPendingAt(task),
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -4204,13 +5559,56 @@ var TaskManager = class {
         thresholds: this.thresholds
       });
       for (const alert of evaluation.alerts) {
+        if (alert === "decision_pending") {
+          const now = Date.now();
+          const period = (this.options.supervision ?? SUPERVISION).decisionPendingMs;
+          if (task.lastDecisionAlertAt !== null && now - task.lastDecisionAlertAt < period) continue;
+          task.lastDecisionAlertAt = now;
+          task.alertsRaised.add(alert);
+          const oldest = oldestPendingAt(task);
+          void this.append(task, run2.runId, "alert", {
+            alert,
+            action: "none",
+            pendingRequests: task.pending.size,
+            waitingForSeconds: oldest === null ? null : Math.round((now - oldest) / 1e3),
+            note: "Uma decis\xE3o pendente bloqueia o turno. Esperar n\xE3o \xE9 ociosidade, mas tamb\xE9m n\xE3o \xE9 progresso: nada avan\xE7a at\xE9 algu\xE9m responder."
+          }).then(() => this.changed(task));
+          continue;
+        }
         if (task.alertsRaised.has(alert)) continue;
         task.alertsRaised.add(alert);
         void this.append(task, run2.runId, "alert", { alert, action: "none", note: "Alerta de supervis\xE3o; nenhum encerramento autom\xE1tico." }).then(() => this.changed(task));
       }
+      if (task.pending.size === 0 && task.lastDecisionAlertAt !== null) {
+        task.lastDecisionAlertAt = null;
+        task.alertsRaised.delete("decision_pending");
+      }
     }
   }
   // ------------------------------------------------------------------ views
+  usageView(task) {
+    return { claude: task.claudeUsage.snapshot(), codex: task.codexUsage };
+  }
+  async refreshUsage(task, force = false) {
+    if (task.usageRefresh) return task.usageRefresh;
+    if (this.stopping) return task.codexUsage;
+    const pending = (async () => {
+      const snapshot = await this.codexUsage.refresh(task.record.threadId, { force });
+      if (this.stopping) return snapshot;
+      task.codexUsage = snapshot;
+      await this.append(task, task.run?.runId ?? "none", "codex_usage_observed", { snapshot });
+      this.changed(task);
+      if (task.run) await this.writeDerivedNow(task, task.run.runId, task.run.finalized);
+      return snapshot;
+    })().finally(() => {
+      task.usageRefresh = null;
+    });
+    task.usageRefresh = pending;
+    return pending;
+  }
+  refreshAllUsage() {
+    for (const task of this.tasks.values()) void this.refreshUsage(task);
+  }
   async changedFiles(task) {
     const workspace = task.record.workspace;
     if (!workspace) return { observed: [], claudeAuthored: [], observedAt: null };
@@ -4220,7 +5618,7 @@ var TaskManager = class {
       observed = await gitStatus(workspace);
       task.changedFilesCache = { at: Date.now(), observed };
     }
-    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path11.relative(workspace, file).replace(/\\/g, "/")) : [];
+    const authored = task.run ? [...task.run.claudeAuthored].map((file) => path14.relative(workspace, file).replace(/\\/g, "/")) : [];
     return { observed, claudeAuthored: authored, observedAt: new Date(task.changedFilesCache?.at ?? Date.now()).toISOString() };
   }
   view(task) {
@@ -4230,6 +5628,7 @@ var TaskManager = class {
       now,
       runStartedAt: run2 ? Date.parse(run2.startedAt) : now,
       lastActivityAt: task.lastActivityAt,
+      oldestPendingRequestAt: oldestPendingAt(task),
       phase: run2 && run2.finalizing && !run2.finalized ? "busy_model" : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)) || Boolean(run2 && run2.finalizing && !run2.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -4282,7 +5681,17 @@ var TaskManager = class {
       pendingRequests: [...task.pending.values()],
       queue: task.queue.map((entry) => this.queueView(entry)),
       quota: task.quota ?? this.quota.view(run2?.requestedModel ?? "claude-fable-5-1"),
-      changedFiles: { observed: task.changedFilesCache?.observed ?? [], claudeAuthored: run2 ? [...run2.claudeAuthored] : [], observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null },
+      usage: this.usageView(task),
+      // Relative, like changedFiles() already returns. They disagreed before —
+      // view() emitted absolute paths and only the single-task GET overwrote
+      // them — which a fleet of worktrees would have made unreadable: two
+      // absolute paths from two checkouts look nearly identical.
+      changedFiles: {
+        observed: task.changedFilesCache?.observed ?? [],
+        claudeAuthored: run2 && task.record.workspace ? [...run2.claudeAuthored].map((file) => path14.relative(task.record.workspace, file).replace(/\\/g, "/")).filter((file) => file && !file.startsWith("..")) : [],
+        observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null
+      },
+      worktree: run2?.worktree ? { path: run2.worktree.path, branch: run2.worktree.branch, baseRef: run2.worktree.baseRef, repoKey: run2.worktree.repository.repoKey, declaredWorkspace: run2.declaredWorkspace } : null,
       reviewPending: true,
       createdAt: task.record.createdAt,
       updatedAt: task.updatedAt,
@@ -4293,23 +5702,23 @@ var TaskManager = class {
     return [...this.tasks.values()].filter((task) => !scope || task.record.taskId === scope).map((task) => this.view(task));
   }
   async runsOf(task) {
-    const dir = path11.join(task.dir, "runs");
+    const dir = path14.join(task.dir, "runs");
     let entries = [];
     try {
-      entries = await fs12.readdir(dir);
+      entries = await fs15.readdir(dir);
     } catch {
       return [];
     }
     const runs = [];
     for (const runId of entries.sort()) {
-      const status = await readJsonShared(path11.join(dir, runId, "status.json"));
+      const status = await readJsonShared(path14.join(dir, runId, "status.json"));
       runs.push({ runId, status: status.status === "ok" ? status.value.status ?? "UNKNOWN" : "UNKNOWN", startedAt: status.status === "ok" ? status.value.startedAt ?? null : null, endedAt: status.status === "ok" ? status.value.endedAt ?? null : null });
     }
     return runs;
   }
   async blobPage(task, blobId, page) {
     if (!/^blob-[a-f0-9-]{36}$/.test(blobId)) return null;
-    const read = await readJsonShared(path11.join(task.dir, "blobs", `${blobId}.json`));
+    const read = await readJsonShared(path14.join(task.dir, "blobs", `${blobId}.json`));
     if (read.status !== "ok") return null;
     const paged = previewPage(read.value.text, page);
     return { ...paged, truncated: read.value.truncated, totalChars: read.value.totalChars };
@@ -4338,46 +5747,31 @@ var TaskManager = class {
     return { events: collected, gapped };
   }
 };
-function normalizeRecord(record) {
-  return {
-    ...record,
-    requiresReview: record.requiresReview === true,
-    reviewReason: typeof record.reviewReason === "string" ? record.reviewReason : null
-  };
-}
-async function gitStatus(workspace) {
-  try {
-    await fs12.access(path11.join(workspace, ".git"));
-  } catch {
-    return [];
+function oldestPendingAt(task) {
+  let oldest = null;
+  for (const request of task.pending.values()) {
+    const at = Date.parse(request.createdAt);
+    if (Number.isNaN(at)) continue;
+    if (oldest === null || at < oldest) oldest = at;
   }
-  return new Promise((resolve) => {
-    const child = spawn5("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: workspace, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-    let stdout = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve([]);
-    }, 5e3);
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve([]);
-    });
-    child.on("exit", () => {
-      clearTimeout(timer);
-      resolve(stdout.split("\n").map((line) => line.slice(3).trim()).filter(Boolean).slice(0, 500));
-    });
-  });
+  return oldest;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizeRecord(record2) {
+  return {
+    ...record2,
+    requiresReview: record2.requiresReview === true,
+    reviewReason: typeof record2.reviewReason === "string" ? record2.reviewReason : null
+  };
 }
 
 // src/broker/singleton.ts
 import { closeSync as closeSync2, openSync as openSync2, readFileSync as readFileSync3, renameSync, statSync as statSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2, mkdirSync as mkdirSync2 } from "node:fs";
-import { spawn as spawn6 } from "node:child_process";
-import { createHash as createHash4 } from "node:crypto";
-import path12 from "node:path";
+import { spawn as spawn8 } from "node:child_process";
+import { createHash as createHash5 } from "node:crypto";
+import path15 from "node:path";
 function readOwner(file) {
   try {
     const parsed = JSON.parse(readFileSync3(file, "utf8"));
@@ -4449,9 +5843,9 @@ var SingletonBusyError = class extends Error {
   }
 };
 function acquireFileSingleton(stateRoot) {
-  const dir = path12.join(stateRoot, "broker");
+  const dir = path15.join(stateRoot, "broker");
   mkdirSync2(dir, { recursive: true });
-  const file = path12.join(dir, "broker.lock");
+  const file = path15.join(dir, "broker.lock");
   if (heldByLiveProcess(file)) throw new SingletonBusyError(readOwner(file));
   let descriptor;
   try {
@@ -4480,10 +5874,10 @@ function acquireFileSingleton(stateRoot) {
   };
 }
 async function acquireWindowsMutex(stateRoot) {
-  const dir = path12.join(stateRoot, "broker");
+  const dir = path15.join(stateRoot, "broker");
   mkdirSync2(dir, { recursive: true });
-  const file = path12.join(dir, "broker.lock");
-  const key = createHash4("sha256").update(path12.resolve(stateRoot).toLowerCase()).digest("hex").slice(0, 32);
+  const file = path15.join(dir, "broker.lock");
+  const key = createHash5("sha256").update(path15.resolve(stateRoot).toLowerCase()).digest("hex").slice(0, 32);
   const mutexName = `Local\\CodeOrquestra-${key}`;
   const script = [
     `$m=[Threading.Mutex]::new($false,'${mutexName}')`,
@@ -4493,7 +5887,7 @@ async function acquireWindowsMutex(stateRoot) {
     "try{$m.ReleaseMutex()}catch{}",
     "$m.Dispose()"
   ].join(";");
-  const child = spawn6("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+  const child = spawn8("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
     stdio: ["pipe", "pipe", "ignore"],
     windowsHide: true
   });
@@ -4585,7 +5979,19 @@ async function acquireWindowsMutex(stateRoot) {
   };
 }
 async function acquireBrokerSingleton(stateRoot) {
-  return process.platform === "win32" ? acquireWindowsMutex(stateRoot) : acquireFileSingleton(stateRoot);
+  if (process.platform !== "win32") return acquireFileSingleton(stateRoot);
+  try {
+    return await acquireWindowsMutex(stateRoot);
+  } catch (error) {
+    if (!isMissingInterpreter2(error)) throw error;
+    process.stderr.write(
+      "CodeOrquestra: PowerShell 7 (pwsh) n\xE3o est\xE1 instalado; o singleton do broker passa a usar arquivo de trava exclusivo, o mesmo mecanismo j\xE1 usado fora do Windows. Continua valendo um broker por state root.\n"
+    );
+    return acquireFileSingleton(stateRoot);
+  }
+}
+function isMissingInterpreter2(error) {
+  return /ENOENT/.test(error instanceof Error ? error.message : String(error));
 }
 
 // src/broker/broker.ts
@@ -4607,14 +6013,15 @@ var Broker = class {
   singleton = null;
   constructor(options) {
     this.options = options;
-    this.brokerDir = path13.join(options.stateRoot, "broker");
-    this.logFile = path13.join(this.brokerDir, "broker.log");
+    this.brokerDir = path16.join(options.stateRoot, "broker");
+    this.logFile = path16.join(this.brokerDir, "broker.log");
     this.identity = new IdentityRegistry(this.brokerDir);
     this.assets = new StaticAssets(dashboardDir());
     this.tasks = new TaskManager({
       stateRoot: options.stateRoot,
       log: (line) => this.log(line),
       onEvent: (event) => this.hub.broadcastEvent(event),
+      observers: (taskId) => this.hub.observerCount(taskId),
       onTaskChanged: (view) => this.hub.broadcastTask(view),
       onTransient: (frame) => this.hub.broadcastTransient(frame),
       harness: options.harness,
@@ -4628,7 +6035,7 @@ var Broker = class {
     void appendTextSafe(this.logFile, text).catch(() => void 0);
   }
   async start() {
-    await fs13.mkdir(this.brokerDir, { recursive: true });
+    await fs16.mkdir(this.brokerDir, { recursive: true });
     this.singleton = await acquireBrokerSingleton(this.options.stateRoot);
     void this.singleton.lost.then(async () => {
       this.log("broker singleton ownership was lost; shutting down to prevent a second owner");
@@ -4657,7 +6064,7 @@ var Broker = class {
     this.baseUrl = `http://127.0.0.1:${this.port}`;
     const bootstrapUrl = `${this.baseUrl}/bootstrap?token=${this.identity.mintBootstrapToken(null)}`;
     const announcement = { event: "broker_listening", address: "127.0.0.1", port: this.port, baseUrl: this.baseUrl, bootstrapUrl, secretFile: this.identity.secretPath, stateRoot: this.options.stateRoot, pid: process.pid, cursorEpoch: this.cursorEpoch };
-    await writeFileAtomic(path13.join(this.brokerDir, "broker.json"), JSON.stringify({ pid: process.pid, port: this.port, baseUrl: this.baseUrl, startedAt: this.startedAt, secretFile: this.identity.secretPath, version: RUNTIME_VERSION, product: BRAND.name }, null, 2));
+    await writeFileAtomic(path16.join(this.brokerDir, "broker.json"), JSON.stringify({ pid: process.pid, port: this.port, baseUrl: this.baseUrl, startedAt: this.startedAt, secretFile: this.identity.secretPath, version: RUNTIME_VERSION, product: BRAND.name }, null, 2));
     this.log(`broker listening on ${this.baseUrl} (pid ${process.pid}, painel ${this.assets.dir ? "compilado" : "n\xE3o compilado"})`);
     return announcement;
   }
@@ -4669,7 +6076,7 @@ var Broker = class {
     await this.tasks.stop();
     if (this.server) await new Promise((resolve) => this.server.close(() => resolve()));
     try {
-      await fs13.rm(path13.join(this.brokerDir, "broker.json"), { force: true });
+      await fs16.rm(path16.join(this.brokerDir, "broker.json"), { force: true });
     } catch {
     }
     await this.singleton?.release();
@@ -4705,8 +6112,8 @@ var Broker = class {
     }
   }
   bootstrap(url, res) {
-    const token = url.searchParams.get("token") ?? "";
-    const outcome = this.identity.redeemBootstrapToken(token);
+    const token2 = url.searchParams.get("token") ?? "";
+    const outcome = this.identity.redeemBootstrapToken(token2);
     if (!outcome.ok) throw new HttpError(403, outcome.code);
     res.statusCode = 303;
     res.setHeader("set-cookie", `${SESSION_COOKIE}=${outcome.session.cookie}; HttpOnly; SameSite=Strict; Path=/`);
@@ -4750,6 +6157,7 @@ var Broker = class {
     const body = method === "POST" ? await readJsonBody(req) : {};
     if (parts[1] === "health" && method === "GET") return sendJson(res, 200, { pid: process.pid, product: BRAND.name, version: RUNTIME_VERSION, startedAt: this.startedAt, tasks: this.tasks.tasks.size, cursorEpoch: this.cursorEpoch });
     if (parts[1] === "status" && method === "GET") {
+      if (identity.source === "browser") this.tasks.refreshAllUsage();
       return sendJson(res, 200, {
         broker: { version: RUNTIME_VERSION, tagline: BRAND.tagline, startedAt: this.startedAt, pid: process.pid, simulatedAdapter: this.options.harness },
         identity: { source: identity.source, taskScope: identity.taskScope },
@@ -4769,8 +6177,8 @@ var Broker = class {
       if (typeof body.taskHandle === "string") scope = this.tasks.resolveHandle(body.taskHandle).record.taskId;
       else if (identity.source === "mcp") throw new HttpError(403, "TASK_HANDLE_REQUIRED");
       else this.requireAdministrative(identity);
-      const token = this.identity.mintBootstrapToken(scope);
-      return sendJson(res, 200, { url: `${this.baseUrl}/bootstrap?token=${token}`, scope, note: "Link de uso \xFAnico; abra no navegador desta m\xE1quina." });
+      const token2 = this.identity.mintBootstrapToken(scope);
+      return sendJson(res, 200, { url: `${this.baseUrl}/bootstrap?token=${token2}`, scope, note: "Link de uso \xFAnico; abra no navegador desta m\xE1quina." });
     }
     if (parts[1] === "locks" && parts[2] && parts[3] === "release" && method === "POST") {
       this.requireAdministrative(identity);
@@ -4785,6 +6193,36 @@ var Broker = class {
       this.requireAdministrative(identity);
       return sendJson(res, 200, [...this.tasks.locks.values()].map((lock) => ({ workspaceKey: lock.workspaceKey, workspace: lock.workspace, holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, holderPid: lock.holderPid, acquiredAt: lock.acquiredAt, quarantined: lock.quarantined, ...lock.quarantineNote ? { note: lock.quarantineNote } : {} })));
     }
+    if (parts[1] === "repos" && parts[2] === "worktree-policy" && method === "POST") {
+      this.requireAdministrative(identity);
+      const workspace = typeof body.repo === "string" ? body.repo : typeof body.workspace === "string" ? body.workspace : "";
+      if (!workspace) throw new HttpError(400, "WORKSPACE_REQUIRED", { message: 'Informe o caminho do reposit\xF3rio em "repo".' });
+      const repository = await resolveRepository(workspace);
+      const record2 = await this.tasks.worktreePolicy.enrol({
+        repoKey: repository.repoKey,
+        canonicalWorkspace: repository.topLevel,
+        enabledBy: "local-secret",
+        note: typeof body.note === "string" ? body.note : "",
+        maxParallelRuns: body.maxParallelRuns,
+        maxRetainedWorktrees: body.maxRetainedWorktrees,
+        worktreeRoot: body.worktreeRoot
+      });
+      this.log(`worktrees habilitados para ${repository.topLevel} (repoKey ${repository.repoKey})`);
+      return sendJson(res, 200, record2);
+    }
+    if (parts[1] === "worktrees" && method === "GET") {
+      this.requireAdministrative(identity);
+      return sendJson(res, 200, await this.tasks.worktreeInventory());
+    }
+    if (parts[1] === "worktrees" && parts[2] === "release" && method === "POST") {
+      this.requireAdministrative(identity);
+      const target = typeof body.path === "string" ? body.path : "";
+      if (!target) throw new HttpError(400, "PATH_REQUIRED", { message: 'Informe o caminho do worktree em "path".' });
+      return sendJson(res, 200, await this.tasks.releaseWorktree(target, {
+        note: typeof body.note === "string" ? body.note : null,
+        confirmDiscardUncommitted: body.confirmDiscardUncommitted === true
+      }, identity.source));
+    }
     if (parts[1] === "quota" && method === "GET") {
       return sendJson(res, 200, this.tasks.quota.view("claude-fable-5-1"));
     }
@@ -4793,6 +6231,17 @@ var Broker = class {
       if (parts.length === 2 && method === "GET") {
         if (identity.source === "mcp") throw new HttpError(403, "TASK_HANDLE_REQUIRED");
         return sendJson(res, 200, this.tasks.views(identity.taskScope));
+      }
+      if (parts[2] === "pair" && method === "POST") {
+        if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
+        const outcome = this.identity.redeemPairingCode(typeof body.code === "string" ? body.code : "");
+        if (!outcome.ok) {
+          throw new HttpError(403, outcome.code, {
+            message: outcome.code === "PAIRING_CODE_USED" ? "Esse c\xF3digo j\xE1 foi usado. Gere outro no painel." : outcome.code === "PAIRING_CODE_EXPIRED" ? "Esse c\xF3digo expirou. Gere outro no painel." : "C\xF3digo de pareamento desconhecido. Confira o que est\xE1 na tela do painel."
+          });
+        }
+        const paired = this.tasks.getTask(outcome.taskId);
+        return sendJson(res, 200, await this.tasks.rotateHandle(paired, "voice-pairing", identity.source));
       }
       if (parts[2] === "register" && method === "POST") {
         this.requireAdministrative(identity);
@@ -4809,6 +6258,7 @@ var Broker = class {
       const task = this.scopedTask(identity, taskId);
       if (!action && method === "GET") {
         if (identity.source === "mcp") this.bindHandle(identity, task, body, url);
+        if (identity.source === "browser") void this.tasks.refreshUsage(task);
         const view = this.tasks.view(task);
         view.changedFiles = await this.tasks.changedFiles(task);
         return sendJson(res, 200, view);
@@ -4822,7 +6272,7 @@ var Broker = class {
         const resolved = this.tasks.resolveHandle(body.taskHandle);
         if (resolved !== task) throw new HttpError(403, "TASK_HANDLE_MISMATCH");
         const harness = this.options.harness && body.harness && typeof body.harness === "object" ? body.harness : null;
-        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true);
+        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true, body.observation);
         return sendJson(res, 202, result);
       }
       if (action === "events" && method === "GET") {
@@ -4873,6 +6323,11 @@ var Broker = class {
         const { inventory, trust } = await this.tasks.inventoryFor(workspace);
         return sendJson(res, 200, { inventory: inventory.toJSON(), trust });
       }
+      if (action === "diff" && method === "GET") {
+        const file = url.searchParams.get("file");
+        if (!file) throw new HttpError(400, "FILE_REQUIRED");
+        return sendJson(res, 200, await this.tasks.fileDiff(task, file));
+      }
       if (method !== "POST") throw new HttpError(405, "METHOD_NOT_ALLOWED");
       this.bindHandle(identity, task, body, url);
       const source = identity.source;
@@ -4880,6 +6335,15 @@ var Broker = class {
         case "message": {
           if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "TEXT_REQUIRED");
           const entry = await this.tasks.enqueueMessage(task, body.text, source);
+          return sendJson(res, 202, entry);
+        }
+        case "pairing": {
+          if (identity.source !== "browser") throw new HttpError(403, "BROWSER_PAIRING_ONLY", { message: "O c\xF3digo de pareamento \xE9 gerado na tela do painel, por uma pessoa nesta m\xE1quina." });
+          const minted = this.identity.mintPairingCode(task.record.taskId);
+          return sendJson(res, 200, { ...minted, note: "Leia este c\xF3digo para o coordenador. Vale uma vez s\xF3 e por cinco minutos; ao ser usado, o handle da tarefa \xE9 rotacionado." });
+        }
+        case "annotations": {
+          const entry = await this.tasks.annotate(task, { file: body.file, comment: body.comment, hunk: body.hunk }, source);
           return sendJson(res, 202, entry);
         }
         case "answer":
@@ -4897,6 +6361,8 @@ var Broker = class {
           if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
           this.tasks.touchCoordinator(task);
           return sendJson(res, 200, { present: true });
+        case "usage-refresh":
+          return sendJson(res, 200, { usage: await this.tasks.refreshUsage(task, true) });
         case "acknowledge-review":
           if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
           await this.tasks.acknowledgeReview(task, typeof body.note === "string" ? body.note : null, source);
@@ -4937,14 +6403,14 @@ var Broker = class {
 };
 
 // src/broker/client.ts
-import { spawn as spawn7 } from "node:child_process";
-import { promises as fs14 } from "node:fs";
-import path14 from "node:path";
+import { spawn as spawn9 } from "node:child_process";
+import { promises as fs17 } from "node:fs";
+import path17 from "node:path";
 async function readBrokerInfo(stateRoot) {
-  const read = await readJsonShared(path14.join(stateRoot, "broker", "broker.json"));
+  const read = await readJsonShared(path17.join(stateRoot, "broker", "broker.json"));
   if (read.status !== "ok") return null;
   try {
-    const secret = (await fs14.readFile(read.value.secretFile, "utf8")).trim();
+    const secret = (await fs17.readFile(read.value.secretFile, "utf8")).trim();
     const response = await fetch(`${read.value.baseUrl}/api/health`, { headers: { authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(3e3) });
     if (!response.ok) return null;
     const health = await response.json();
@@ -4956,8 +6422,8 @@ async function readBrokerInfo(stateRoot) {
 }
 async function ensureBroker(stateRoot) {
   const existing = await readBrokerInfo(stateRoot);
-  if (existing) return { baseUrl: existing.baseUrl, secret: (await fs14.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
-  const child = spawn7(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
+  if (existing) return { baseUrl: existing.baseUrl, secret: (await fs17.readFile(existing.secretFile, "utf8")).trim(), pid: existing.pid, started: false };
+  const child = spawn9(process.execPath, [...nodeExecArgv(), cliEntry(), "broker", "start", "--state-root", stateRoot, "--port", "0"], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -4967,7 +6433,7 @@ async function ensureBroker(stateRoot) {
   const deadline = Date.now() + 2e4;
   while (Date.now() < deadline) {
     const info = await readBrokerInfo(stateRoot);
-    if (info) return { baseUrl: info.baseUrl, secret: (await fs14.readFile(info.secretFile, "utf8")).trim(), pid: info.pid, started: true };
+    if (info) return { baseUrl: info.baseUrl, secret: (await fs17.readFile(info.secretFile, "utf8")).trim(), pid: info.pid, started: true };
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error("O broker n\xE3o iniciou a tempo.");
@@ -5019,6 +6485,8 @@ function usage() {
     "  task register [--state-root <dir>] [--thread-id <id>]               registra a tarefa Codex atual e imprime o handle",
     "  task review [--task-handle <h>] [--note <texto>]                    confirma a revis\xE3o de uma execu\xE7\xE3o incerta",
     "  dashboard [--state-root <dir>] [--task-handle <h>]                  imprime um link de uso \xFAnico para o painel",
+    "  worktree enable --repo <dir> --note <motivo>                        habilita worktrees paralelos neste reposit\xF3rio",
+    "  worktree list                                                       lista reposit\xF3rios habilitados e worktrees \xF3rf\xE3os",
     "  start --job <job.json> --task-handle <h> [--state-root <dir>]       inicia uma execu\xE7\xE3o v2 na tarefa",
     "  doctor [--json]                                                     verifica o Claude Code instalado sem autenticar",
     "  --version"
@@ -5030,7 +6498,7 @@ function parseSupervision() {
   if (!raw || !isHarness()) return void 0;
   try {
     const parsed = JSON.parse(raw);
-    return { inactivityAlertMs: parsed.inactivityAlertMs ?? 12e5, elapsedAlertMs: parsed.elapsedAlertMs ?? 72e5, coordinatorAbsentMs: parsed.coordinatorAbsentMs ?? 9e4 };
+    return { inactivityAlertMs: parsed.inactivityAlertMs ?? 12e5, elapsedAlertMs: parsed.elapsedAlertMs ?? 72e5, coordinatorAbsentMs: parsed.coordinatorAbsentMs ?? 9e4, decisionPendingMs: parsed.decisionPendingMs ?? 12e4 };
   } catch {
     return void 0;
   }
@@ -5081,7 +6549,7 @@ async function main(argv = process.argv.slice(2)) {
 `);
     return 0;
   }
-  const stateRoot = typeof flags["state-root"] === "string" ? path15.resolve(flags["state-root"]) : defaultStateRoot();
+  const stateRoot = typeof flags["state-root"] === "string" ? path18.resolve(flags["state-root"]) : defaultStateRoot();
   const [command, sub] = positional;
   if (command === "broker" && sub === "start") {
     const supervision = parseSupervision();
@@ -5159,6 +6627,27 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
 `);
     return result.status === 200 ? 0 : 1;
   }
+  if (command === "worktree" && sub === "enable") {
+    const repo = typeof flags.repo === "string" ? flags.repo : process.cwd();
+    if (typeof flags.note !== "string" || !flags.note.trim()) {
+      process.stderr.write("Use: worktree enable --repo <caminho> --note <motivo>\nA nota fica registrada junto com a permiss\xE3o; permiss\xE3o sem motivo vale menos que nenhum registro.\n");
+      return 2;
+    }
+    const payload = { repo, note: flags.note };
+    if (typeof flags["max-parallel"] === "string") payload.maxParallelRuns = Number(flags["max-parallel"]);
+    if (typeof flags["max-retained"] === "string") payload.maxRetainedWorktrees = Number(flags["max-retained"]);
+    if (typeof flags["worktree-root"] === "string") payload.worktreeRoot = flags["worktree-root"];
+    const result = await api(stateRoot, "POST", "/api/repos/worktree-policy", payload);
+    process.stdout.write(`${JSON.stringify(result.body, null, 2)}
+`);
+    return result.status === 200 ? 0 : 1;
+  }
+  if (command === "worktree" && sub === "list") {
+    const result = await api(stateRoot, "GET", "/api/worktrees");
+    process.stdout.write(`${JSON.stringify(result.body, null, 2)}
+`);
+    return result.status === 200 ? 0 : 1;
+  }
   if (command === "dashboard") {
     const result = await api(stateRoot, "POST", "/api/dashboard-url", typeof flags["task-handle"] === "string" ? { taskHandle: flags["task-handle"] } : {});
     process.stdout.write(`${JSON.stringify(result.body, null, 2)}
@@ -5170,7 +6659,7 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
       process.stderr.write("Use: start --job <job.json> --task-handle <handle>\n");
       return 2;
     }
-    const job = JSON.parse(await fs15.readFile(flags.job, "utf8"));
+    const job = JSON.parse(await fs18.readFile(flags.job, "utf8"));
     const bound = await api(stateRoot, "POST", "/api/tasks/by-handle", { taskHandle: flags["task-handle"] });
     if (bound.status !== 200) {
       process.stdout.write(`${JSON.stringify(bound.body)}
@@ -5188,7 +6677,7 @@ Painel (link de uso \xFAnico): ${announcement.bootstrapUrl}
 `);
   return command ? 2 : 0;
 }
-var isEntry = process.argv[1] ? pathToFileURL(path15.resolve(process.argv[1])).href === import.meta.url : false;
+var isEntry = process.argv[1] ? pathToFileURL(path18.resolve(process.argv[1])).href === import.meta.url : false;
 if (isEntry) {
   main().then((code) => {
     if (code !== 0) process.exitCode = code;

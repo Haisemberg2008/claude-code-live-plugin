@@ -60,7 +60,7 @@ async function register(threadId: string): Promise<{ taskId: string; taskHandle:
 }
 
 async function startRun(taskId: string, taskHandle: string, prompt: string): Promise<string> {
-  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: jobV2(workspace, { prompt, scope: { summary: 's', paths: ['src/'] } }) }) });
+  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: jobV2(workspace, { prompt, scope: { summary: 's', paths: ['src/'] } }), observation: { mode: 'voz' } }) });
   assert.equal(response.status, 202, response.text);
   return (response.body as { runId: string }).runId;
 }
@@ -201,6 +201,23 @@ describe('dashboard', () => {
     await inspector.getByRole('heading', { name: 'Capacidade' }).waitFor();
     // Anchored and case-sensitive: the effort line also ends in "indisponível".
     await inspector.getByText(/^Indisponível/).waitFor();
+    await inspector.getByRole('heading', { name: 'Consumo por fonte' }).waitFor();
+    const claudeUsage = inspector.locator('[data-testid="usage-claude"]');
+    await claudeUsage.getByText('Claude nesta tarefa').waitFor();
+    await claudeUsage.getByText('reportado').waitFor();
+    await claudeUsage.getByText('Entrada').waitFor();
+    await claudeUsage.getByText('Saída').waitFor();
+    await claudeUsage.getByText('Cache lido').waitFor();
+    const codexUsage = inspector.locator('[data-testid="usage-codex-task"]');
+    await codexUsage.getByText('Codex nesta tarefa').waitFor();
+    await codexUsage.getByText('indisponível').waitFor();
+    const refreshUsage = inspector.getByRole('button', { name: 'Atualizar consumo' });
+    await refreshUsage.waitFor();
+    const [refreshResponse] = await Promise.all([
+      page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/usage-refresh`) && response.request().method() === 'POST'),
+      refreshUsage.click(),
+    ]);
+    assert.equal(refreshResponse.status(), 200);
     await inspector.getByText('Revisão independente pendente').waitFor();
     await inspector.getByRole('heading', { name: 'Arquivos alterados observados' }).waitFor();
     assert.equal(await page.locator('[data-testid="progress-percent"]').count(), 0, 'no fake progress percentage');
@@ -302,6 +319,34 @@ describe('dashboard', () => {
     await main.getByText('anotado', { exact: true }).waitFor({ timeout: 20000 });
     await question.getByText(/Decisão: respondida por Navegador/).waitFor({ timeout: 15000 });
     await waitFor(async () => ((await taskState(taskId)) === 'idle' ? true : undefined), { timeoutMs: 20000, description: 'question task idle' });
+    await endTask(taskId);
+  });
+
+  test('a blocked turn stays visible and reachable even after the feed scrolls past it', async (t) => {
+    if (unavailable) { t.skip(unavailable); return; }
+    const { taskId, taskHandle } = await register('thread-ui-bloqueio');
+    await startRun(taskId, taskHandle, script(['ask: Qual banco usar?', 'say: anotado']));
+    const item = page.locator('[data-testid="task-item"]').filter({ hasText: 'thread-ui-bloqueio' });
+    await item.waitFor({ timeout: 15000 });
+    await item.click();
+    const main = page.getByRole('main');
+
+    // A blocked turn is the one thing on screen that stops work, so it is
+    // announced outside the feed and does not depend on scroll position.
+    const notice = main.locator('[data-testid="blocking-notice"]');
+    await notice.waitFor({ timeout: 15000 });
+    await notice.getByText(/Claude fez uma pergunta e está parado/).waitFor();
+
+    const question = main.locator('[data-testid="question-request"]');
+    await question.waitFor({ timeout: 15000 });
+    await main.locator('[data-testid="blocking-go"]').click();
+    await question.waitFor({ state: 'visible' });
+
+    // Answered, it stops competing: the notice goes away with the block.
+    await question.getByRole('radio', { name: 'Sim' }).check();
+    await question.getByRole('button', { name: 'Enviar resposta' }).click();
+    await notice.waitFor({ state: 'detached', timeout: 20000 });
+    await waitFor(async () => ((await taskState(taskId)) === 'idle' ? true : undefined), { timeoutMs: 20000, description: 'blocked task idle' });
     await endTask(taskId);
   });
 

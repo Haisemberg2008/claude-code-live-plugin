@@ -14,6 +14,7 @@ import { SseHub } from './sse-hub.ts';
 import { TaskManager, type TaskState } from './task-manager.ts';
 import { dashboardDir } from './runtime-paths.ts';
 import { acquireBrokerSingleton, type SingletonLock } from './singleton.ts';
+import { resolveRepository } from './worktree.ts';
 import type { SupervisionThresholds } from '../worker/supervision.ts';
 
 export interface BrokerOptions {
@@ -63,6 +64,7 @@ export class Broker {
       stateRoot: options.stateRoot,
       log: (line) => this.log(line),
       onEvent: (event) => this.hub.broadcastEvent(event),
+      observers: (taskId) => this.hub.observerCount(taskId),
       onTaskChanged: (view) => this.hub.broadcastTask(view),
       onTransient: (frame) => this.hub.broadcastTransient(frame),
       harness: options.harness,
@@ -215,6 +217,7 @@ export class Broker {
 
     if (parts[1] === 'health' && method === 'GET') return sendJson(res, 200, { pid: process.pid, product: BRAND.name, version: RUNTIME_VERSION, startedAt: this.startedAt, tasks: this.tasks.tasks.size, cursorEpoch: this.cursorEpoch });
     if (parts[1] === 'status' && method === 'GET') {
+      if (identity.source === 'browser') this.tasks.refreshAllUsage();
       return sendJson(res, 200, {
         broker: { version: RUNTIME_VERSION, tagline: BRAND.tagline, startedAt: this.startedAt, pid: process.pid, simulatedAdapter: this.options.harness },
         identity: { source: identity.source, taskScope: identity.taskScope },
@@ -254,6 +257,42 @@ export class Broker {
       this.requireAdministrative(identity);
       return sendJson(res, 200, [...this.tasks.locks.values()].map((lock) => ({ workspaceKey: lock.workspaceKey, workspace: lock.workspace, holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, holderPid: lock.holderPid, acquiredAt: lock.acquiredAt, quarantined: lock.quarantined, ...(lock.quarantineNote ? { note: lock.quarantineNote } : {}) })));
     }
+    if (parts[1] === 'repos' && parts[2] === 'worktree-policy' && method === 'POST') {
+      // Enrolling a repository writes .git/worktrees/<n>, creates a lasting
+      // branch ref and materializes a second checkout. That is a persistent
+      // mutation of the user's repository, so it is a local administrative act
+      // — never something a task can grant itself, and never the browser.
+      this.requireAdministrative(identity);
+      const workspace = typeof body.repo === 'string' ? body.repo : typeof body.workspace === 'string' ? body.workspace : '';
+      if (!workspace) throw new HttpError(400, 'WORKSPACE_REQUIRED', { message: 'Informe o caminho do repositório em "repo".' });
+      const repository = await resolveRepository(workspace);
+      const record = await this.tasks.worktreePolicy.enrol({
+        repoKey: repository.repoKey,
+        canonicalWorkspace: repository.topLevel,
+        enabledBy: 'local-secret',
+        note: typeof body.note === 'string' ? body.note : '',
+        maxParallelRuns: body.maxParallelRuns,
+        maxRetainedWorktrees: body.maxRetainedWorktrees,
+        worktreeRoot: body.worktreeRoot,
+      });
+      this.log(`worktrees habilitados para ${repository.topLevel} (repoKey ${repository.repoKey})`);
+      return sendJson(res, 200, record);
+    }
+    if (parts[1] === 'worktrees' && method === 'GET') {
+      this.requireAdministrative(identity);
+      return sendJson(res, 200, await this.tasks.worktreeInventory());
+    }
+    if (parts[1] === 'worktrees' && parts[2] === 'release' && method === 'POST') {
+      // Discarding uncommitted work is never a default, and never a side effect
+      // of anything else: it is its own administrative action, with a note.
+      this.requireAdministrative(identity);
+      const target = typeof body.path === 'string' ? body.path : '';
+      if (!target) throw new HttpError(400, 'PATH_REQUIRED', { message: 'Informe o caminho do worktree em "path".' });
+      return sendJson(res, 200, await this.tasks.releaseWorktree(target, {
+        note: typeof body.note === 'string' ? body.note : null,
+        confirmDiscardUncommitted: body.confirmDiscardUncommitted === true,
+      }, identity.source));
+    }
     if (parts[1] === 'quota' && method === 'GET') {
       return sendJson(res, 200, this.tasks.quota.view('claude-fable-5-1'));
     }
@@ -262,6 +301,23 @@ export class Broker {
       if (parts.length === 2 && method === 'GET') {
         if (identity.source === 'mcp') throw new HttpError(403, 'TASK_HANDLE_REQUIRED');
         return sendJson(res, 200, this.tasks.views(identity.taskScope));
+      }
+      if (parts[2] === 'pair' && method === 'POST') {
+        // Redeeming rotates the task handle, so it is a coordinator action, not
+        // a panel one: the browser shows the code and never consumes it.
+        if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
+        const outcome = this.identity.redeemPairingCode(typeof body.code === 'string' ? body.code : '');
+        if (!outcome.ok) {
+          throw new HttpError(403, outcome.code, {
+            message: outcome.code === 'PAIRING_CODE_USED'
+              ? 'Esse código já foi usado. Gere outro no painel.'
+              : outcome.code === 'PAIRING_CODE_EXPIRED'
+                ? 'Esse código expirou. Gere outro no painel.'
+                : 'Código de pareamento desconhecido. Confira o que está na tela do painel.',
+          });
+        }
+        const paired = this.tasks.getTask(outcome.taskId);
+        return sendJson(res, 200, await this.tasks.rotateHandle(paired, 'voice-pairing', identity.source));
       }
       if (parts[2] === 'register' && method === 'POST') {
         this.requireAdministrative(identity);
@@ -278,6 +334,7 @@ export class Broker {
       const task = this.scopedTask(identity, taskId);
       if (!action && method === 'GET') {
         if (identity.source === 'mcp') this.bindHandle(identity, task, body, url);
+        if (identity.source === 'browser') void this.tasks.refreshUsage(task);
         const view = this.tasks.view(task);
         view.changedFiles = await this.tasks.changedFiles(task);
         return sendJson(res, 200, view);
@@ -291,7 +348,7 @@ export class Broker {
         const resolved = this.tasks.resolveHandle(body.taskHandle);
         if (resolved !== task) throw new HttpError(403, 'TASK_HANDLE_MISMATCH');
         const harness = this.options.harness && body.harness && typeof body.harness === 'object' ? (body.harness as Record<string, unknown>) : null;
-        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true);
+        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true, body.observation);
         return sendJson(res, 202, result);
       }
       if (action === 'events' && method === 'GET') {
@@ -333,6 +390,11 @@ export class Broker {
         const { inventory, trust } = await this.tasks.inventoryFor(workspace);
         return sendJson(res, 200, { inventory: inventory.toJSON(), trust });
       }
+      if (action === 'diff' && method === 'GET') {
+        const file = url.searchParams.get('file');
+        if (!file) throw new HttpError(400, 'FILE_REQUIRED');
+        return sendJson(res, 200, await this.tasks.fileDiff(task, file));
+      }
       if (method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
       this.bindHandle(identity, task, body, url);
       const source: ActionSource = identity.source;
@@ -340,6 +402,18 @@ export class Broker {
         case 'message': {
           if (typeof body.text !== 'string' || !body.text.trim()) throw new HttpError(400, 'TEXT_REQUIRED');
           const entry = await this.tasks.enqueueMessage(task, body.text, source);
+          return sendJson(res, 202, entry);
+        }
+        case 'pairing': {
+          // Minted only by a panel session, which exists only after a person
+          // redeemed a single-use link on this machine. A session scoped to
+          // another task never reaches here: scopedTask refused it above.
+          if (identity.source !== 'browser') throw new HttpError(403, 'BROWSER_PAIRING_ONLY', { message: 'O código de pareamento é gerado na tela do painel, por uma pessoa nesta máquina.' });
+          const minted = this.identity.mintPairingCode(task.record.taskId);
+          return sendJson(res, 200, { ...minted, note: 'Leia este código para o coordenador. Vale uma vez só e por cinco minutos; ao ser usado, o handle da tarefa é rotacionado.' });
+        }
+        case 'annotations': {
+          const entry = await this.tasks.annotate(task, { file: body.file, comment: body.comment, hunk: body.hunk }, source);
           return sendJson(res, 202, entry);
         }
         case 'answer':
@@ -357,6 +431,8 @@ export class Broker {
           if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
           this.tasks.touchCoordinator(task);
           return sendJson(res, 200, { present: true });
+        case 'usage-refresh':
+          return sendJson(res, 200, { usage: await this.tasks.refreshUsage(task, true) });
         case 'acknowledge-review':
           if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
           await this.tasks.acknowledgeReview(task, typeof body.note === 'string' ? body.note : null, source);

@@ -121,8 +121,24 @@ async function readIf(file: string): Promise<string | null> {
   }
 }
 
+/** The filesystem's own spelling of a path, or the resolved one if it is absent. */
+function realpathOrResolve(target: string): string {
+  try {
+    return realpathNative(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
 function rel(root: string, file: string): string {
-  return path.relative(root, file).replace(/\\/g, '/');
+  const relative = path.relative(root, file).replace(/\\/g, '/');
+  // A relative path that climbs out of the root means the two were spelled
+  // differently (short vs long name, a symlinked ancestor). Retry through the
+  // filesystem's own spelling rather than emitting a path that escapes the
+  // workspace — it would become the key of a trust approval.
+  if (!relative.startsWith('../')) return relative;
+  const retried = path.relative(realpathOrResolve(root), realpathOrResolve(file)).replace(/\\/g, '/');
+  return retried.startsWith('../') ? relative : retried;
 }
 
 function mcpDetails(config: Record<string, unknown>): Record<string, unknown> {
@@ -394,7 +410,15 @@ async function collectChildren(collector: Collector, workspace: string, workspac
 }
 
 export async function inventoryCustomizations(workspace: string, options: InventoryOptions = {}): Promise<Inventory> {
-  const resolved = path.resolve(workspace);
+  // Through realpath, not just path.resolve. Some paths reach this function
+  // already realpathed — a hook entrypoint is resolved that way before its
+  // containment is checked — so a root spelled differently from them makes
+  // path.relative() climb out of the workspace instead of producing a relative
+  // name. On Windows that is not hypothetical: a workspace reached through an
+  // 8.3 short name (C:\Users\RUNNER~1\…) against a long-name file produced
+  // `../../../../../../../runneradmin/…` as an item's relativePath — which is
+  // also the key a trust approval is stored under.
+  const resolved = realpathOrResolve(workspace);
   const canonicalWorkspace = canonicalizeWorkspace(resolved);
   const collector: Collector = { items: [], skipped: [], incomplete: false, configs: {} };
   const toRel = (file: string) => rel(resolved, file);

@@ -43,6 +43,18 @@ function formatElapsed(seconds: number): string {
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+function formatCount(value: number | null): string {
+  return value === null ? '—' : new Intl.NumberFormat('pt-BR').format(value);
+}
+
+function qualityLabel(value: string): string {
+  return value === 'reported' ? 'reportado' : value === 'estimated' ? 'estimado' : value === 'partial' ? 'parcial' : 'indisponível';
+}
+
+function formatReset(value: number | null): string {
+  return value === null ? '—' : new Date(value * 1000).toLocaleString('pt-BR');
+}
+
 function isActive(task: TaskView): boolean {
   return Boolean(task.currentRun && !TERMINAL_STATUSES.has(task.currentRun.status));
 }
@@ -231,7 +243,11 @@ export function App() {
           {ordered.length === 0 ? <p className="empty">Nenhuma tarefa ativa. Registre uma tarefa no terminal do Codex e inicie uma execução.</p> : null}
         </nav>
         <main className="room">
-          {task ? (
+          {/* A task-scoped panel never sees the fleet: the toggle itself is
+              hidden, not just the data, so the surface matches the scope. */}
+          {!identity?.taskScope && active.length > 1 && !task ? (
+            <FleetBoard tasks={active} now={now} onSelect={select} />
+          ) : task ? (
             <Room
               key={task.taskId}
               task={task}
@@ -256,6 +272,21 @@ export function App() {
   );
 }
 
+/** The badges a task carries, in one place so the list and the board agree. */
+function TaskBadges({ task }: { task: TaskView }) {
+  return (
+    <span className="task-meta">
+      <span className={`state state-${task.state}`}>{STATE_LABELS[task.state] ?? task.state}</span>
+      {task.simulated ? <span className="badge">Simulado</span> : null}
+      {task.currentRun && TERMINAL_STATUSES.has(task.currentRun.status)
+        ? <span className={`badge ${task.currentRun.status === 'COMPLETED' ? 'ok' : task.currentRun.status === 'CANCELLED' ? '' : 'error'}`} data-testid="run-outcome">{OUTCOME_LABELS[task.currentRun.status] ?? task.currentRun.status}</span>
+        : null}
+      {task.pendingRequests.length ? <span className="badge warn">{task.pendingRequests.length} decisão(ões)</span> : null}
+      {task.requiresReview ? <span className="badge error">revisão</span> : null}
+    </span>
+  );
+}
+
 function TaskList({ title, tasks, selected, onSelect }: { title: string; tasks: TaskView[]; selected: string | null; onSelect: (id: string) => void }) {
   return (
     <section className="task-section">
@@ -265,20 +296,49 @@ function TaskList({ title, tasks, selected, onSelect }: { title: string; tasks: 
           <li key={task.taskId}>
             <button type="button" data-testid="task-item" className={`task-item ${task.taskId === selected ? 'selected' : ''}`} onClick={() => onSelect(task.taskId)} aria-pressed={task.taskId === selected}>
               <span className="task-thread" title={task.threadId}>{task.threadId}</span>
-              <span className="task-meta">
-                <span className={`state state-${task.state}`}>{STATE_LABELS[task.state] ?? task.state}</span>
-                {task.simulated ? <span className="badge">Simulado</span> : null}
-                {task.currentRun && TERMINAL_STATUSES.has(task.currentRun.status)
-                  ? <span className={`badge ${task.currentRun.status === 'COMPLETED' ? 'ok' : task.currentRun.status === 'CANCELLED' ? '' : 'error'}`} data-testid="run-outcome">{OUTCOME_LABELS[task.currentRun.status] ?? task.currentRun.status}</span>
-                  : null}
-                {task.pendingRequests.length ? <span className="badge warn">{task.pendingRequests.length} decisão(ões)</span> : null}
-                {task.requiresReview ? <span className="badge error">revisão</span> : null}
-              </span>
+              <TaskBadges task={task} />
             </button>
           </li>
         ))}
       </ul>
     </section>
+  );
+}
+
+/**
+ * Every active task at once, for when several are running in parallel.
+ *
+ * Shows what a coordinator has to decide between: who is blocked on a decision,
+ * who is writing where, and which branch each one is on.
+ */
+function FleetBoard({ tasks, now, onSelect }: { tasks: TaskView[]; now: number; onSelect: (id: string) => void }) {
+  return (
+    <div className="fleet" data-testid="fleet-board">
+      <h1 className="fleet-title">Frota <span className="count">{tasks.length}</span></h1>
+      <p className="muted">Cada tarefa Codex trabalha na própria árvore. Clique para abrir a conversa completa.</p>
+      <div className="fleet-grid">
+        {tasks.map((task) => {
+          const run = task.currentRun;
+          const elapsed = run ? Math.max(0, Math.round(((run.endedAt ? Date.parse(run.endedAt) : now) - Date.parse(run.startedAt)) / 1000)) : 0;
+          return (
+            <button key={task.taskId} type="button" className={`fleet-card ${task.pendingRequests.length ? 'needs-decision' : ''}`} data-testid="fleet-card" onClick={() => onSelect(task.taskId)}>
+              <span className="fleet-thread" title={task.threadId}>{task.threadId}</span>
+              <TaskBadges task={task} />
+              <dl className="fleet-facts">
+                <dt>Árvore</dt>
+                <dd className="mono wrap">{task.worktree ? task.worktree.branch : 'checkout declarado'}</dd>
+                <dt>Ferramenta</dt>
+                <dd>{run?.currentTool ?? 'nenhuma'}</dd>
+                <dt>Arquivos</dt>
+                <dd>{task.changedFiles.claudeAuthored.length} do Claude · {task.changedFiles.observed.length} observados</dd>
+                <dt>Tempo</dt>
+                <dd>{run ? formatElapsed(elapsed) : '—'}</dd>
+              </dl>
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -289,6 +349,7 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
   const [busy, setBusy] = useState<string | null>(null);
   // Confirmation is bound to the exact task and run it was opened for.
   const [confirmEnd, setConfirmEnd] = useState<{ taskId: string; runId: string | null } | null>(null);
+  const [pairing, setPairing] = useState<{ code: string; expiresAt: string } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const feedRef = useRef<HTMLDivElement>(null);
 
@@ -328,8 +389,36 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
           {task.coordinatorPresence === 'absent' ? <span className="badge warn">{task.coordinatorLabel ?? 'aguardando coordenador'}</span> : <span className="badge ok">coordenador presente</span>}
           {task.alerts.map((alert) => <span key={alert} className="badge warn">alerta: {alert}</span>)}
           {run?.currentTool ? <span className="badge">ferramenta: {run.currentTool}</span> : null}
+          <button type="button" className="ghost small" data-testid="pairing-button" onClick={async () => {
+            setActionError(null);
+            try {
+              setPairing(await postAction(task.taskId, 'pairing', {}) as { code: string; expiresAt: string });
+            } catch (error) {
+              setActionError(error instanceof ApiError ? `pairing: ${error.code}` : String(error));
+            }
+          }}>Código de pareamento</button>
         </div>
+        {pairing ? (
+          <p className="pairing" data-testid="pairing-code">
+            {/* Spaced so it can be read aloud a character at a time. */}
+            <span className="pairing-code">{pairing.code.split('').join(' ')}</span>
+            <span className="muted"> — vale uma vez, até {formatTime(pairing.expiresAt)}. Ao ser usado, o handle desta tarefa é rotacionado e o anterior deixa de valer.</span>
+          </p>
+        ) : null}
       </div>
+      {task.pendingRequests.length ? (
+        <div className="blocking" role="status" data-testid="blocking-notice">
+          <span className="blocking-what">
+            {task.pendingRequests.length === 1
+              ? (task.pendingRequests[0]!.kind === 'question' ? 'Claude fez uma pergunta e está parado.' : `Claude pediu permissão para ${task.pendingRequests[0]!.tool} e está parado.`)
+              : `${task.pendingRequests.length} decisões pendentes. Nada avança até serem respondidas.`}
+          </span>
+          <button type="button" className="blocking-go" data-testid="blocking-go" onClick={() => {
+            const target = document.getElementById(`decision-${task.pendingRequests[0]!.requestId}`);
+            target?.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+          }}>Ir para a decisão</button>
+        </div>
+      ) : null}
       <div className="feed" ref={feedRef}>
         <div className="feed-top">
           <button type="button" className="ghost small" onClick={onLoadHistory}>Carregar histórico</button>
@@ -480,7 +569,7 @@ function DecisionRow({ row, task, onAnswer }: { row: Extract<Row, { kind: 'decis
   const runId = pending?.runId ?? task.currentRun?.runId ?? '';
   const resolved = row.resolution;
   return (
-    <article className={`row decision ${resolved ? 'resolved' : 'pending'}`} data-testid={row.requestKind === 'question' ? 'question-request' : 'permission-request'}>
+    <article id={`decision-${row.requestId}`} className={`row decision ${resolved ? 'resolved' : 'pending'}`} data-testid={row.requestKind === 'question' ? 'question-request' : 'permission-request'}>
       <div className="row-head">
         <span className="author">{row.requestKind === 'question' ? 'Pergunta do Claude' : `Permissão: ${row.tool}`}</span>
         <span className="badge warn">{row.reason}</span>
@@ -519,6 +608,8 @@ function DecisionRow({ row, task, onAnswer }: { row: Extract<Row, { kind: 'decis
 function Inspector({ task, now }: { task: TaskView; now: number }) {
   const run = task.currentRun;
   const quota = task.quota;
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const liveElapsed = run ? Math.max(0, Math.round(((run.endedAt ? Date.parse(run.endedAt) : now) - Date.parse(run.startedAt)) / 1000)) : 0;
   const presenceAge = task.coordinatorLastSeenAt ? Math.round((now - Date.parse(task.coordinatorLastSeenAt)) / 1000) : null;
   return (
@@ -528,6 +619,12 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
         <dt>Identificador</dt><dd className="mono" title={task.taskId}>{abbreviate(task.taskId)}</dd>
         <dt>Thread Codex</dt><dd className="mono" title={task.threadId}>{abbreviate(task.threadId, 12)}</dd>
         <dt>Workspace</dt><dd className="mono wrap" title={task.workspace ?? ''}>{task.workspace ?? '—'}</dd>
+        {task.worktree ? (
+          <>
+            <dt>Worktree</dt><dd className="mono wrap">{task.worktree.branch}</dd>
+            <dt>Declarado</dt><dd className="mono wrap" title={task.worktree.declaredWorkspace ?? ''}>{task.worktree.declaredWorkspace ?? '—'}</dd>
+          </>
+        ) : null}
         <dt>Estado</dt><dd>{STATE_LABELS[task.state] ?? task.state}</dd>
         <dt>Coordenador</dt><dd>{task.coordinatorPresence === 'present' ? `presente (há ${presenceAge ?? 0}s)` : 'aguardando coordenador'}</dd>
         {task.requiresReview ? <><dt>Revisão</dt><dd className="warn-text">Execução incerta ou desconectada: revise antes de retomar.</dd></> : null}
@@ -564,6 +661,58 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
           <dt>Uso</dt><dd className="wrap">Indisponível{quota.attemptedAt ? ` (tentativa ${formatTime(quota.attemptedAt)}${quota.failure ? `, ${quota.failure.code}` : ''})` : ''}</dd>
         </dl>
       )}
+      <div className="section-heading-row">
+        <h2 className="section-title">Consumo por fonte</h2>
+        <button type="button" className="ghost small" disabled={refreshing} onClick={async () => {
+          setRefreshing(true);
+          setRefreshError(null);
+          try {
+            await postAction(task.taskId, 'usage-refresh', {});
+          } catch (error) {
+            setRefreshError(error instanceof ApiError ? error.code : 'Falha ao atualizar');
+          } finally {
+            setRefreshing(false);
+          }
+        }}>{refreshing ? 'Atualizando…' : 'Atualizar consumo'}</button>
+      </div>
+      <p className="muted small">Fontes independentes. Os valores não são somados como custo e estimativas nunca são tratadas como medição exata.</p>
+      <div className="usage-grid">
+        <section className="usage-card usage-card-claude" data-testid="usage-claude">
+          <div className="usage-card-head"><h3>Claude nesta tarefa</h3><span className={`badge usage-${task.usage.claude.quality}`}>{qualityLabel(task.usage.claude.quality)}</span></div>
+          <dl>
+            <dt>Entrada</dt><dd>{formatCount(task.usage.claude.inputTokens)}</dd>
+            <dt>Saída</dt><dd>{formatCount(task.usage.claude.outputTokens)}</dd>
+            <dt>Cache lido</dt><dd>{formatCount(task.usage.claude.cachedInputTokens)}</dd>
+            <dt>Cache criado</dt><dd>{formatCount(task.usage.claude.cacheWriteInputTokens)}</dd>
+            <dt>Total observado</dt><dd>{formatCount(task.usage.claude.totalObservedTokens)}</dd>
+            <dt>Turnos</dt><dd>{task.usage.claude.turns}</dd>
+            <dt>Último registro</dt><dd>{formatTime(task.usage.claude.observedAt)}</dd>
+          </dl>
+          {task.usage.claude.byModel.length ? <ul className="usage-models">{task.usage.claude.byModel.map((item) => <li key={item.model}><span className="mono wrap">{item.model}</span><span>{formatCount(item.totalObservedTokens)} · {item.turns} turno(s)</span></li>)}</ul> : null}
+        </section>
+        <section className="usage-card usage-card-codex" data-testid="usage-codex-task">
+          <div className="usage-card-head"><h3>Codex nesta tarefa</h3><span className={`badge usage-${task.usage.codex.task.quality}`}>{qualityLabel(task.usage.codex.task.quality)}</span></div>
+          {task.usage.codex.task.groups.length ? <ul className="usage-models">{task.usage.codex.task.groups.map((item, index) => <li key={`${item.model ?? 'modelo'}-${index}`}><span className="mono wrap">{item.model ?? 'modelo não informado'} · {item.reasoningEffort ?? 'esforço não informado'}</span><span>{formatCount(item.totalTokens)} tokens estimados</span></li>)}</ul> : <p className="muted small">Estimativa por tarefa não disponibilizada por esta versão ou conta.</p>}
+          <p className="muted small">Consulta: {formatTime(task.usage.codex.queriedAt)}</p>
+        </section>
+        <section className="usage-card" data-testid="usage-codex-limits">
+          <div className="usage-card-head"><h3>Limites Codex</h3><span className={`badge usage-${task.usage.codex.limits.quality}`}>{qualityLabel(task.usage.codex.limits.quality)}</span></div>
+          {task.usage.codex.limits.buckets.length ? task.usage.codex.limits.buckets.map((bucket) => <dl key={bucket.id}>
+            <dt>Limite</dt><dd>{bucket.name ?? bucket.id}</dd>
+            {bucket.primary ? <><dt>Janela principal</dt><dd>{bucket.primary.usedPercent}% usado · {bucket.primary.remainingPercent}% restante</dd><dt>Renovação</dt><dd>{formatReset(bucket.primary.resetsAt)}</dd></> : null}
+            {bucket.secondary ? <><dt>Janela secundária</dt><dd>{bucket.secondary.usedPercent}% usado · {bucket.secondary.remainingPercent}% restante</dd><dt>Renovação</dt><dd>{formatReset(bucket.secondary.resetsAt)}</dd></> : null}
+          </dl>) : <p className="muted small">Limites da conta indisponíveis.</p>}
+        </section>
+        <section className="usage-card" data-testid="usage-codex-activity">
+          <div className="usage-card-head"><h3>Atividade Codex</h3><span className={`badge usage-${task.usage.codex.activity.quality}`}>{qualityLabel(task.usage.codex.activity.quality)}</span></div>
+          <dl>
+            <dt>Acumulado</dt><dd>{formatCount(task.usage.codex.activity.lifetimeTokens)}</dd>
+            <dt>Pico diário</dt><dd>{formatCount(task.usage.codex.activity.peakDailyTokens)}</dd>
+            <dt>Hoje</dt><dd>{formatCount(task.usage.codex.activity.daily.at(-1)?.tokens ?? null)}</dd>
+          </dl>
+        </section>
+      </div>
+      {refreshError ? <p className="warn-text small">Atualização indisponível: {refreshError}</p> : null}
       <h2 className="section-title">Arquivos alterados observados</h2>
       <p className="muted small">Observado pelo git do workspace; não é prova de autoria do Claude.</p>
       <ul className="files">{task.changedFiles.observed.length ? task.changedFiles.observed.slice(0, 50).map((file) => <li key={file} className="mono wrap">{file}</li>) : <li className="muted">nenhum observado</li>}</ul>

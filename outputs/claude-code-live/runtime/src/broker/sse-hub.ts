@@ -91,6 +91,21 @@ export class SseHub {
     return client;
   }
 
+  /**
+   * How many live subscribers would receive this task's events.
+   *
+   * Attachment is not attention: a background tab, a reconnect still pending, a
+   * curl that never closed its connection all count. This proves a channel
+   * exists and nothing more, which is the most any broker can actually verify —
+   * so the text built on it must say "um canal está anexado", never "alguém
+   * está olhando".
+   */
+  observerCount(taskId: string): number {
+    let total = 0;
+    for (const client of this.clients) if (this.visible(client, taskId)) total += 1;
+    return total;
+  }
+
   private visible(client: SseClient, taskId: string): boolean {
     if (client.taskScope && client.taskScope !== taskId) return false;
     if (client.taskId && client.taskId !== taskId) return false;

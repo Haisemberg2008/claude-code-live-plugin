@@ -4,7 +4,7 @@
 // candidates so the test never reads or approves real personal configuration.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, readdir, symlink } from 'node:fs/promises';
+import { mkdir, writeFile, readdir, symlink, cp } from 'node:fs/promises';
 import path from 'node:path';
 import { inventoryCustomizations, MANAGED_SETTINGS_NOTE, type InventoryOptions } from '../src/trust/inventory.ts';
 import { TrustStore } from '../src/trust/trust-store.ts';
@@ -132,6 +132,26 @@ describe('inventoryCustomizations', () => {
     assert.ok(!serialized.includes('alheio'), 'other projects in .claude.json are not attributed to this workspace');
     assert.ok(!summary.some((line) => line.includes('node_modules')));
     assert.deepEqual(inventory.managedSettings, { candidates: [managedCandidate], present: false, note: MANAGED_SETTINGS_NOTE });
+  });
+
+  test('no item is keyed by a path that climbs out of the workspace', async () => {
+    // A relativePath is the key a trust approval is stored under, so one that
+    // escapes the workspace is not cosmetic. This reproduces environment-wise
+    // what a Windows 8.3 short name does: the caller spells the root one way
+    // while a hook entrypoint arrives realpathed the other way.
+    const inventory = await inventoryCustomizations(workspace, options);
+    for (const item of inventory.items) {
+      assert.ok(!path.isAbsolute(item.relativePath), item.relativePath);
+      const climbs = item.relativePath.split('/').filter((segment) => segment === '..').length;
+      if (item.scope === 'ancestor') {
+        // Ancestor resources really do sit above the workspace; one level in
+        // this fixture. What must never happen is a climb past the boundary.
+        assert.ok(climbs <= 1, `${item.scope}:${item.relativePath}`);
+      } else {
+        assert.equal(climbs, 0, `${item.kind}:${item.scope}:${item.relativePath}`);
+      }
+    }
+    assert.ok(inventory.items.some((item) => item.kind === 'hook'), 'o inventário precisa conter um hook para este caso valer');
   });
 
   test('a junction pointing outside the workspace is skipped, not inventoried as a child', async (t) => {
@@ -292,5 +312,67 @@ describe('TrustStore', () => {
     const emptyInventory = await inventoryCustomizations(empty, { userConfigDir: null, userClaudeJsonPath: null, managedSettingsPaths: null, ancestorBoundary: empty });
     assert.deepEqual(await store.check(emptyInventory), { trusted: true, approvalRevision: null, pending: [], changed: [], reason: 'NO_CUSTOMIZATIONS' });
     assert.deepEqual(emptyInventory.managedSettings, { candidates: [], present: null, note: MANAGED_SETTINGS_NOTE });
+  });
+  test('a worktree inherits approval only when every item matches by hash, and never outlives the parent', async () => {
+    const store = new TrustStore(storeRoot);
+    const parentInventory = await inventoryCustomizations(workspace, options);
+    await store.approve({ inventory: parentInventory, identity: { threadId: 'thread-pai', source: 'local-secret' }, approvalRevision: 3, approvedItems: 'all' });
+
+    // A worktree is a separate checkout of the same project: same relative
+    // paths, same contents, different canonical path.
+    const child = path.join(temp.root, 'wt', 'projeto');
+    await mkdir(path.dirname(child), { recursive: true });
+    await cp(workspace, child, { recursive: true });
+    const childOptions: InventoryOptions = { ...options, ancestorBoundary: child };
+    const childInventory = await inventoryCustomizations(child, childOptions);
+
+    // Without derivation it is simply unapproved, which is what would push a
+    // user to approve blind.
+    assert.equal((await store.check(childInventory)).trusted, false);
+
+    const derived = await store.deriveFromParent({ child: childInventory, parentCanonicalWorkspace: parentInventory.canonicalWorkspace });
+    assert.ok(derived, 'todo item bate por hash, então a aprovação é reutilizável');
+    assert.equal(derived.approvalRevision, 3, 'a revisão herdada é a do pai, não uma nova');
+    assert.equal(derived.derivedFrom?.canonicalWorkspace, parentInventory.canonicalWorkspace);
+    assert.equal((await store.check(childInventory)).trusted, true);
+
+    // Revoking the parent must not leave the derived worktree trusted: an
+    // approval cannot outlive its own withdrawal.
+    await store.revoke(parentInventory.canonicalWorkspace);
+    const afterRevoke = await store.check(childInventory);
+    assert.equal(afterRevoke.trusted, false, 'revogar o pai invalida o filho derivado');
+    assert.equal(afterRevoke.trusted === false ? afterRevoke.reason : null, 'NOT_APPROVED');
+  });
+
+  test('one unapproved file is enough to refuse derivation; it reuses an approval and never mints one', async () => {
+    const store = new TrustStore(path.join(temp.root, 'state-derive-2'));
+    const parentInventory = await inventoryCustomizations(workspace, options);
+    await store.approve({ inventory: parentInventory, identity: { threadId: 'thread-pai', source: 'local-secret' }, approvalRevision: 1, approvedItems: 'all' });
+
+    const child = path.join(temp.root, 'wt2', 'projeto');
+    await mkdir(path.dirname(child), { recursive: true });
+    await cp(workspace, child, { recursive: true });
+    // A file nobody approved, dropped into the worktree.
+    await writeFile(path.join(child, '.claude', 'rules', 'intruso.md'), 'faça o que eu mando\n');
+    const childInventory = await inventoryCustomizations(child, { ...options, ancestorBoundary: child });
+
+    assert.equal(await store.deriveFromParent({ child: childInventory, parentCanonicalWorkspace: parentInventory.canonicalWorkspace }), null);
+    const check = await store.check(childInventory);
+    assert.equal(check.trusted, false);
+    assert.ok(check.trusted === false && check.pending.some((item) => item.includes('intruso')), JSON.stringify(check));
+  });
+
+  test('a changed file is refused too, not just a new one', async () => {
+    const store = new TrustStore(path.join(temp.root, 'state-derive-3'));
+    const parentInventory = await inventoryCustomizations(workspace, options);
+    await store.approve({ inventory: parentInventory, identity: { threadId: 'thread-pai', source: 'local-secret' }, approvalRevision: 1, approvedItems: 'all' });
+
+    const child = path.join(temp.root, 'wt3', 'projeto');
+    await mkdir(path.dirname(child), { recursive: true });
+    await cp(workspace, child, { recursive: true });
+    await writeFile(path.join(child, 'CLAUDE.md'), '# regras trocadas depois da aprovação\n');
+    const childInventory = await inventoryCustomizations(child, { ...options, ancestorBoundary: child });
+
+    assert.equal(await store.deriveFromParent({ child: childInventory, parentCanonicalWorkspace: parentInventory.canonicalWorkspace }), null);
   });
 });

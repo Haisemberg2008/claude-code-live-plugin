@@ -19,6 +19,15 @@ import { ENV } from './helpers/scenario.ts';
 import { IdentityRegistry, BOOTSTRAP_TOKEN_TTL_MS } from '../src/broker/identity.ts';
 import { acquireBrokerSingleton, SingletonBusyError } from '../src/broker/singleton.ts';
 
+import { isPwshAvailable } from './helpers/pwsh.ts';
+
+const isWindows = process.platform === 'win32';
+const pwsh = isWindows && (await isPwshAvailable());
+// The kernel-mutex singleton needs PowerShell 7, which a stock Windows install
+// does not have; without it the runtime falls back to the file singleton and
+// these regressions are about a path that is not in use.
+const needsKernelMutex = !pwsh && (isWindows ? 'pwsh nao instalado: o singleton usa arquivo de trava' : 'Windows kernel mutex');
+
 const EXPECTED_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
 let temp: TempRoot;
@@ -107,7 +116,7 @@ describe('broker singleton', () => {
     await second.release();
   });
 
-  test('a lock left behind by a dead process is reclaimed instead of wedging the state root', async () => {
+  test('a lock left behind by a dead process is reclaimed instead of wedging the state root', { skip: needsKernelMutex }, async () => {
     const root = path.join(temp.root, 'singleton-stale');
     await mkdir(path.join(root, 'broker'), { recursive: true });
     const lockFile = path.join(root, 'broker', 'broker.lock');
@@ -134,7 +143,7 @@ describe('broker singleton', () => {
     }
   });
 
-  test('two contenders reclaiming the same abandoned lock cannot both end up owning it', { skip: process.platform !== 'win32' && 'safe automatic reclamation relies on Windows file sharing' }, async () => {
+  test('two contenders reclaiming the same abandoned lock cannot both end up owning it', { skip: needsKernelMutex || (process.platform !== 'win32' && 'safe automatic reclamation relies on Windows file sharing') }, async () => {
     const root = path.join(temp.root, 'singleton-reclaim-race');
     await mkdir(path.join(root, 'broker'), { recursive: true });
     const lockFile = path.join(root, 'broker', 'broker.lock');
@@ -184,7 +193,7 @@ describe('broker singleton', () => {
     }
   });
 
-  test('losing the Windows mutex helper is observable and releases kernel ownership', { skip: process.platform !== 'win32' && 'Windows kernel mutex' }, async () => {
+  test('losing the Windows mutex helper is observable and releases kernel ownership', { skip: needsKernelMutex }, async () => {
     const root = path.join(temp.root, 'singleton-helper-loss');
     const lock = await acquireBrokerSingleton(root);
     assert.ok(lock.monitorPid);
@@ -279,6 +288,10 @@ describe('action protection', () => {
       ['/api/broker/shutdown', '{}'],
       ['/api/tasks/register', JSON.stringify({ codexThreadId: 'thread-x', source: 'browser' })],
       ['/api/dashboard-url', '{}'],
+      // Enrolling a repository for worktrees writes into its shared admin
+      // directory and leaves a lasting branch ref: a local decision, never
+      // something a panel session can grant.
+      ['/api/repos/worktree-policy', JSON.stringify({ repo: 'C:/qualquer', note: 'tentativa pelo navegador' })],
     ];
     for (const [route, payload] of administrative) {
       const response = await broker.api(route, { method: 'POST', headers: broker.browserActionHeaders(), body: payload });
@@ -293,6 +306,12 @@ describe('action protection', () => {
     const adminLocks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
     assert.equal(adminLocks.status, 200, adminLocks.text);
     assert.deepEqual(adminLocks.body, []);
+    const browserWorktrees = await broker.api('/api/worktrees', { headers: broker.browserHeaders() });
+    assert.equal(browserWorktrees.status, 403);
+    assert.deepEqual(browserWorktrees.body, { error: 'LOCAL_ADMIN_REQUIRED' });
+    const adminWorktrees = await broker.api('/api/worktrees', { headers: broker.bearerHeaders() });
+    assert.equal(adminWorktrees.status, 200, adminWorktrees.text);
+    assert.deepEqual(adminWorktrees.body, { policies: [], orphans: [] }, 'sem repositorio habilitado, o inventario e vazio e nao um erro');
   });
 
   test('the MCP label is refused for administrative routes as defence in depth', async () => {
@@ -386,5 +405,81 @@ describe('secrets in logs', () => {
       assert.ok(!content.includes(broker.secret), `${file} leaks the secret`);
       assert.ok(!content.includes(broker.bootstrapToken), `${file} leaks the bootstrap token`);
     }
+  });
+});
+
+/** A panel session, scoped to one task, through the same one-time link a person uses. */
+async function panelSession(taskHandle: string): Promise<(extra?: Record<string, string>) => Record<string, string>> {
+  const link = await broker.api('/api/dashboard-url', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle }) });
+  assert.equal(link.status, 200, link.text);
+  const redeemed = await redeemBootstrap((link.body as { url: string }).url);
+  assert.equal(redeemed.status, 303, redeemed.setCookie);
+  return (extra = {}) => ({ cookie: redeemed.cookie, [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE, origin: broker.baseUrl, 'content-type': 'application/json', ...extra });
+}
+
+describe('pairing a coordinator to a task', () => {
+  test('the panel mints, the coordinator redeems, and the old handle stops working', async () => {
+    const registered = await broker.api('/api/tasks/register', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ codexThreadId: 'thread-pareamento', source: 'codex-thread' }) });
+    assert.equal(registered.status, 201, registered.text);
+    const { taskId, taskHandle: original } = registered.body as { taskId: string; taskHandle: string };
+
+    // Minting is a panel action. The coordinator identities are refused: the
+    // point of the code is that a person at the local panel chose this task.
+    for (const headers of [broker.bearerHeaders(), broker.bearerHeaders({ [CLIENT_HEADER_NAME]: 'mcp' })]) {
+      const refused = await broker.api(`/api/tasks/${taskId}/pairing`, { method: 'POST', headers, body: JSON.stringify({ taskHandle: original }) });
+      assert.equal(refused.status, 403, refused.text);
+      assert.equal((refused.body as { error?: string }).error, 'BROWSER_PAIRING_ONLY');
+    }
+
+    const session = await panelSession(original);
+    const minted = await broker.api(`/api/tasks/${taskId}/pairing`, { method: 'POST', headers: session() });
+    assert.equal(minted.status, 200, minted.text);
+    const { code } = minted.body as { code: string; expiresAt: string };
+    // Short enough to read aloud, and free of characters that can be misheard.
+    assert.match(code, /^[234679ACDEFGHJKMNPQRTUVWXYZ]{6}$/);
+
+    // Redeeming is a coordinator action; the browser that showed the code
+    // cannot consume it.
+    const byBrowser = await broker.api('/api/tasks/pair', { method: 'POST', headers: session(), body: JSON.stringify({ code }) });
+    assert.equal(byBrowser.status, 403, byBrowser.text);
+    assert.equal((byBrowser.body as { error?: string }).error, 'LOCAL_ADMIN_REQUIRED');
+
+    // Spacing and case are presentation, not identity.
+    const paired = await broker.api('/api/tasks/pair', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ code: ` ${code.toLowerCase().split('').join('-')} ` }) });
+    assert.equal(paired.status, 200, paired.text);
+    const { taskHandle: rotated } = paired.body as { taskId: string; taskHandle: string };
+    assert.notEqual(rotated, original);
+    assert.equal((paired.body as { taskId: string }).taskId, taskId);
+
+    // Rotation is a takeover: the previous holder stops being able to act.
+    const stale = await broker.api(`/api/tasks/${taskId}/message`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: original, text: 'ainda mando aqui?' }) });
+    assert.equal(stale.status, 403, stale.text);
+    assert.equal((stale.body as { error?: string }).error, 'TASK_HANDLE_INVALID');
+
+    // Single use.
+    const again = await broker.api('/api/tasks/pair', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ code }) });
+    assert.equal(again.status, 403, again.text);
+    assert.equal((again.body as { error?: string }).error, 'PAIRING_CODE_USED');
+
+    const unknown = await broker.api('/api/tasks/pair', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ code: 'ZZZZZZ' }) });
+    assert.equal(unknown.status, 403, unknown.text);
+    assert.equal((unknown.body as { error?: string }).error, 'PAIRING_CODE_INVALID');
+
+    // The rotation is in the durable log, not done quietly.
+    const events = (await broker.api(`/api/tasks/${taskId}/events?cursor=0`, { headers: broker.bearerHeaders() })).body as { events: Array<{ type: string; data: Record<string, unknown> }> };
+    const rotation = events.events.find((event) => event.type === 'task_handle_rotated');
+    assert.ok(rotation, 'a rotação precisa estar registrada');
+    assert.equal(rotation.data.reason, 'voice-pairing');
+  });
+
+  test('a panel scoped to one task cannot mint a code for another', async () => {
+    const a = await broker.api('/api/tasks/register', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ codexThreadId: 'thread-escopo-a', source: 'codex-thread' }) });
+    const b = await broker.api('/api/tasks/register', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ codexThreadId: 'thread-escopo-b', source: 'codex-thread' }) });
+    const taskB = (b.body as { taskId: string }).taskId;
+    const scoped = await panelSession((a.body as { taskHandle: string }).taskHandle);
+    // Task isolation is the property pairing must not weaken: a session limited
+    // to A must not be able to hand anyone control of B.
+    const crossed = await broker.api(`/api/tasks/${taskB}/pairing`, { method: 'POST', headers: scoped() });
+    assert.equal(crossed.status, 404, crossed.text);
   });
 });

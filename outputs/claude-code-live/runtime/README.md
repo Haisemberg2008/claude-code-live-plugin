@@ -33,7 +33,7 @@ Set-Location outputs/claude-code-live/runtime
 npm install --ignore-scripts --no-audit --no-fund
 ```
 
-Um `.npmrc` local com `ignore-scripts=true`, `save-exact=true`, `save-prefix=` e `package-lock=true` tornaria essa política independente da linha de comando; ele ainda não existe porque o runner legado bloqueia a criação desse nome de arquivo.
+Essa política agora vive em `runtime/.npmrc` (`ignore-scripts=true`, `save-exact=true`, `save-prefix=`, `package-lock=true`, `global=false`), e não depende mais de quem digita o comando lembrar das flags. O arquivo precisa ser criado pelo Codex ou pelo usuário: `.npmrc` está em `SENSITIVE_PATH_PATTERNS` porque pode conter `_authToken`, então uma sessão Claude sob este contrato é impedida de escrevê-lo — o que é o comportamento correto, não uma limitação a contornar.
 
 O plugin registra `dist/mcp-stdio.mjs` por meio do `.mcp.json` da raiz. Ao ser carregado numa tarefa nova do Codex, o adaptador inicia ou reutiliza o broker local. O registro inicial da tarefa continua explícito porque o `taskHandle` é a capacidade que impede uma tarefa de consultar, orientar ou cancelar outra:
 
@@ -43,6 +43,26 @@ node runtime/dist/codeorquestra.mjs dashboard --task-handle '<handle-retornado>'
 ```
 
 O primeiro comando não inicia o Claude. Uma execução só começa depois que o job v2 aprovado é enviado por `codeorquestra_start` ou pelo comando `start`. Se o inventário encontrar instruções, configurações, hooks, agentes, skills ou MCPs, o início falha fechado até o conjunto ser aprovado para aquele projeto.
+
+## Execucao paralela em worktrees
+
+Um job v2 pode pedir uma arvore isolada com `execution.mode: "worktree"`; sem o
+campo, tudo roda no checkout declarado exatamente como antes. Habilitar o
+repositorio e uma acao local do usuario, porque criar um worktree altera o
+repositorio de forma persistente:
+
+```powershell
+node runtime/dist/codeorquestra.mjs worktree enable --repo '<caminho>' --note '<motivo>'
+node runtime/dist/codeorquestra.mjs worktree list
+```
+
+A trava de escrita nao some: ela passa a ser sobre a **arvore de trabalho**, e
+as mutacoes do `.git` compartilhado serializam sob um mutex por repositorio. Os
+worktrees vivem sob o state root, fora do repositorio, em caminho deterministico
+por `(repositorio, tarefa)` — dentro dele, o inventario de confianca veria a
+copia do `CLAUDE.md` de cada worktree e recusaria toda execucao no checkout
+principal. Trabalho nao commitado nunca e apagado; `commit` nunca pertence ao
+Claude, entao esse e o estado normal de uma execucao bem-sucedida.
 
 ## Layout
 
@@ -59,6 +79,7 @@ runtime/
   src/trust/              inventário de personalizações, armazenamento de confiança e opções de lançamento
   src/preflight/          resolução do executável instalado, sondagem read-only e política de autenticação
   src/quota/              leitura sanitizada de /usage sob o mutex global
+  src/usage/              acumulador Claude e adaptador somente leitura do Codex App Server
   src/events/             log append-only sequenciado, redação e arquivos derivados de compatibilidade
   src/worker/             um processo por execução: sessão, supervisão e adaptador de processo
   src/broker/             estado autoritativo, HTTP em loopback, SSE, travas e identidade de processo
@@ -74,6 +95,8 @@ runtime/
 A única fronteira substituída é o **processo do Claude Code**. O harness aponta `CODEORQUESTRA_TEST_ADAPTER` para `test/helpers/fake-claude-process.ts`, um módulo confiável do harness que fala o mesmo protocolo `stream-json` em pipes de memória; ele nunca é um campo do job. Broker, worker, HTTP, MCP e persistência são exercitados de verdade.
 
 O adaptador falha fechado: sob o harness um adaptador simulado é **obrigatório** (`ADAPTER_REQUIRED_IN_HARNESS`), um adaptador ausente ou quebrado resulta em `ADAPTER_LOAD_FAILED` e um adaptador fora do harness é recusado com `ADAPTER_NOT_ALLOWED` — em nenhum desses casos o Claude Code instalado é iniciado. Um segundo executável falso (`test/helpers/fake-claude.mjs`) atende apenas `--version`, `--help`, `auth status --json` e `-p /usage`, registra cada invocação e sai com código 99 em qualquer chamada que iniciaria um turno de modelo.
+
+O medidor Codex tem uma fronteira falsa própria no harness: um processo `stdio` responde apenas a `initialize`, `account/rateLimits/read` e `account/usage/read`. Os testes provam que nenhuma operação de turno, autenticação, reset ou consumo de crédito é emitida.
 
 O comportamento de cada turno é roteirizado por diretivas no texto da mensagem (`say:`, `thinking:`, `tool:`, `ask:`, `sleep:`, `spawn:`, `big:`, `stderr:`, `fail:`; ver `test/helpers/scenario.ts`). Strings como `curl https://…` ou `git push` nessas diretivas são **dados** para o simulador: nada é executado. O adaptador grava um rastro por processo em `CODEORQUESTRA_FAKE_TRACE_DIR` para que os testes verifiquem os argumentos reais de lançamento (modelo exato, `xhigh`, executável instalado, `--permission-prompts host`, sem `dontAsk`).
 
@@ -99,3 +122,12 @@ Redação de segredos é melhor esforço, não garantia. Filtros de texto não s
 * liberar uma quarentena é uma exceção exclusiva do administrador local: requer nota, reconhecimento explícito do risco e a identidade exata da posse, relida antes da remoção. A auditoria não retoma a sessão, não reenvia fila e não aprova artefatos;
 * modelo e esforço não são rebaixados em silêncio; o esforço é reportado como “configurado”, com confirmação de servidor indisponível;
 * pensamento interno e assinaturas nunca são persistidos nem exibidos.
+* uso Claude é acumulado uma vez por `runId + turno`, com subtotais por modelo e ausência de campos marcada como parcial; reconexão ou retomada não duplica tokens;
+* uso Codex vem de uma única conexão local `stdio` com o App Server, somente leitura. Limites e atividade são reportados; o recorte por tarefa é sempre estimado e pode estar indisponível. Respostas brutas, credenciais e valores financeiros não são persistidos;
+* o painel nunca soma Claude e Codex como custo nem inventa economia; mostra duração, turnos, cache e cada fonte separadamente.
+
+## Medidor híbrido de uso
+
+O broker consulta o Codex App Server ao carregar o painel, depois de um turno Claude e pelo botão **Atualizar consumo** ou pela ferramenta MCP `codeorquestra_usage_refresh`. Leituras automáticas respeitam um intervalo mínimo. A falha ou incompatibilidade da telemetria produz `indisponível` e nunca bloqueia o worker, reduz o esforço ou troca o modelo.
+
+O `status.json` e o `resultado.json` recebem apenas a projeção sanitizada `llmUsage`: números de tokens, modelo/esforço quando informados, qualidade e horário da consulta. O runtime não acessa arquivos de autenticação do Codex. Nesta versão não exibe saldo, créditos estimados, dólares nem qualquer total financeiro combinado.

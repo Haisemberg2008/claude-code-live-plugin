@@ -17,6 +17,7 @@ function evaluate(overrides: Partial<Parameters<typeof evaluateSupervision>[0]> 
     processAlive: true,
     coordinatorLastSeenAt: t0 + minutes(1),
     pendingRequests: 0,
+    oldestPendingRequestAt: null,
     brokerRestartedDuringRun: false,
     terminal: false,
     ...overrides,
@@ -25,7 +26,7 @@ function evaluate(overrides: Partial<Parameters<typeof evaluateSupervision>[0]> 
 
 describe('supervision thresholds', () => {
   test('literal thresholds', () => {
-    assert.deepEqual(SUPERVISION, { inactivityAlertMs: 1_200_000, elapsedAlertMs: 7_200_000, coordinatorAbsentMs: 90_000 });
+    assert.deepEqual(SUPERVISION, { inactivityAlertMs: 1_200_000, elapsedAlertMs: 7_200_000, coordinatorAbsentMs: 90_000, decisionPendingMs: 120_000 });
     assert.equal(COORDINATOR_ABSENT_LABEL, 'aguardando coordenador');
   });
 
@@ -78,5 +79,32 @@ describe('state distinction', () => {
 
   test('waiting for a question answer is distinct from permission and idle', () => {
     assert.equal(evaluate({ phase: 'waiting_question', pendingRequests: 1 }).state, 'waiting_question');
+  });
+});
+
+describe('a decision nobody answered', () => {
+  test('is not inactivity, but is reported once it stops being progress', () => {
+    const waiting = { phase: 'waiting_permission' as const, pendingRequests: 1 };
+
+    // The pre-existing rule is unchanged and still correct: waiting is not
+    // idling, so the inactivity alert stays silent no matter how long it takes.
+    const long = evaluate({ ...waiting, oldestPendingRequestAt: t0, now: t0 + minutes(90), lastActivityAt: t0 });
+    assert.ok(!long.alerts.includes('inactivity_20m'), 'esperar nunca é ociosidade');
+
+    // Below the threshold it is simply a decision that just arrived.
+    assert.deepEqual(evaluate({ ...waiting, oldestPendingRequestAt: t0, now: t0 + minutes(1) }).alerts, []);
+
+    // Above it, the other true thing gets said.
+    assert.ok(evaluate({ ...waiting, oldestPendingRequestAt: t0, now: t0 + minutes(3) }).alerts.includes('decision_pending'));
+    assert.ok(long.alerts.includes('decision_pending'), 'noventa minutos parado precisa aparecer');
+
+    // Nothing is ever terminated by supervision.
+    assert.equal(long.action, 'none');
+    assert.equal(long.requiresReview, false);
+  });
+
+  test('never fires without a pending request, whatever the phase says', () => {
+    assert.deepEqual(evaluate({ phase: 'waiting_permission', pendingRequests: 1, oldestPendingRequestAt: null, now: t0 + minutes(90) }).alerts, []);
+    assert.deepEqual(evaluate({ phase: 'busy_tool', pendingRequests: 0, oldestPendingRequestAt: t0, now: t0 + minutes(90), lastActivityAt: t0 + minutes(89) }).alerts, []);
   });
 });

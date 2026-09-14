@@ -42,6 +42,30 @@ export type LegacyTimeoutPolicy =
   | { mode: 'fixed'; timeoutSeconds: number }
   | { mode: 'adaptive'; renewEverySeconds: number; idleAfterSeconds: number; hardStopAfterSeconds: number };
 
+export interface WorktreeRequest {
+  /** null lets the broker derive a name from the task; it never comes from git output. */
+  branch: string | null;
+  /** null means the repository's current HEAD. */
+  baseRef: string | null;
+  /**
+   * Only 'refuse' today. Adopting a worktree that still holds uncommitted work
+   * must be an explicit contract change rather than a silent behaviour shift,
+   * because the normal end state of a successful run *is* uncommitted work:
+   * commit can never belong to Claude.
+   */
+  onExistingWork: 'refuse';
+}
+
+/**
+ * Where a run's files live. `checkout` is the historical behaviour — the
+ * declared workspace itself — and is what every contract written before this
+ * field resolves to.
+ */
+export interface ExecutionTarget {
+  mode: 'checkout' | 'worktree';
+  worktree: WorktreeRequest | null;
+}
+
 export interface JobContract {
   version: 1 | 2;
   profile: 'development' | 'read' | 'restricted' | 'diagnostic';
@@ -53,6 +77,7 @@ export interface JobContract {
   effort: EffortLevel;
   coordination: Coordination;
   scope: { summary: string; paths: string[]; wholeWorkspace: boolean };
+  execution: ExecutionTarget;
   launch: {
     permissionMode: 'default' | 'dontAsk';
     safeMode: boolean;
@@ -238,6 +263,78 @@ function resolveAuth(job: Dict): { allowApiBilling: boolean } {
   return { allowApiBilling: allow === true };
 }
 
+const REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/;
+
+/**
+ * Validates a git ref name here, where every other adversarial input is already
+ * validated, because it becomes an argument to `git worktree add`. The allowlist
+ * is deliberately narrower than git's own rules: a name git would accept but
+ * that we did not anticipate is refused rather than passed through.
+ */
+function resolveRefName(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') throw new ContractError('EXECUTION_BRANCH_INVALID', `execution.worktree.${field} deve ser texto ou null.`);
+  const invalid = (why: string): never => {
+    throw new ContractError('EXECUTION_BRANCH_INVALID', `execution.worktree.${field} ${why}`);
+  };
+  // A leading '-' would be read as an option by git; the first character of the
+  // pattern being alphanumeric already excludes it, along with leading '.' .
+  if (!REF_NAME.test(value)) invalid('aceita apenas letras, dígitos, ponto, hífen, barra e sublinhado, começando por letra ou dígito, com no máximo 101 caracteres.');
+  if (value.includes('..')) invalid('não pode conter "..".');
+  if (value.endsWith('/') || value.endsWith('.')) invalid('não pode terminar em "/" nem ".".');
+  for (const part of value.split('/')) {
+    if (part === '') invalid('não pode conter componentes vazios ("//").');
+    if (part.startsWith('.')) invalid('não pode ter componente começando com ".".');
+    if (part.endsWith('.lock')) invalid('não pode ter componente terminando em ".lock".');
+  }
+  return value;
+}
+
+/**
+ * Resolves where the run's files live.
+ *
+ * An absent or null `execution` resolving to `checkout` is the entire
+ * backward-compatibility story for this field: every v2 job written before it
+ * existed keeps the same workspace and the same writer lock as today, so no
+ * contractVersion bump is needed.
+ */
+function resolveExecution(job: Dict, coordination: Coordination, profile: 'development' | 'read'): ExecutionTarget {
+  const raw = own(job, 'execution');
+  if (raw === undefined || raw === null) return { mode: 'checkout', worktree: null };
+  if (!isDict(raw)) throw new ContractError('EXECUTION_INVALID', 'execution deve ser um objeto.');
+  for (const key of Object.keys(raw)) {
+    if (key !== 'mode' && key !== 'worktree') throw new ContractError('EXECUTION_INVALID', `execution contém o campo inesperado ${key}.`);
+  }
+  const mode = own(raw, 'mode');
+  if (mode !== 'checkout' && mode !== 'worktree') throw new ContractError('EXECUTION_INVALID', 'execution.mode deve ser checkout ou worktree.');
+  const worktreeRaw = own(raw, 'worktree');
+  if (mode === 'checkout') {
+    if (worktreeRaw !== undefined && worktreeRaw !== null) throw new ContractError('EXECUTION_INVALID', 'execution.worktree só é aceito quando execution.mode é worktree.');
+    return { mode: 'checkout', worktree: null };
+  }
+  // A worktree exists to let an assigned implementation run in parallel with
+  // another task on the same repository. Every other shape would provision a
+  // checkout that nothing is going to write to.
+  if (profile === 'read') throw new ContractError('WORKTREE_NOT_APPLICABLE', 'O perfil read não toma trava de escrita e deve inspecionar a mesma árvore que o usuário vê.');
+  if (coordination.phase !== 'execution') throw new ContractError('WORKTREE_NOT_APPLICABLE', 'Um worktree só é provisionado na fase de execução.');
+  if (coordination.responsibilities.implementation !== 'claude') throw new ContractError('WORKTREE_NOT_APPLICABLE', 'Um worktree só é provisionado quando implementation pertence ao Claude.');
+  if (worktreeRaw === undefined || worktreeRaw === null) return { mode: 'worktree', worktree: { branch: null, baseRef: null, onExistingWork: 'refuse' } };
+  if (!isDict(worktreeRaw)) throw new ContractError('EXECUTION_INVALID', 'execution.worktree deve ser um objeto ou null.');
+  for (const key of Object.keys(worktreeRaw)) {
+    if (key !== 'branch' && key !== 'baseRef' && key !== 'onExistingWork') throw new ContractError('EXECUTION_INVALID', `execution.worktree contém o campo inesperado ${key}.`);
+  }
+  const onExistingWork = own(worktreeRaw, 'onExistingWork');
+  if (onExistingWork !== undefined && onExistingWork !== 'refuse') throw new ContractError('EXECUTION_INVALID', 'execution.worktree.onExistingWork aceita apenas "refuse".');
+  return {
+    mode: 'worktree',
+    worktree: {
+      branch: resolveRefName(own(worktreeRaw, 'branch'), 'branch'),
+      baseRef: resolveRefName(own(worktreeRaw, 'baseRef'), 'baseRef'),
+      onExistingWork: 'refuse',
+    },
+  };
+}
+
 function resolveV2(job: Dict): JobContract {
   for (const legacyField of ['mode', 'allowedCommands', 'modelPolicy', 'timeoutPolicy', 'timeoutSeconds']) {
     if (Object.prototype.hasOwnProperty.call(job, legacyField)) throw new ContractError('LEGACY_FIELD_IN_V2', `O campo legado ${legacyField} não existe no contrato v2.`);
@@ -251,6 +348,7 @@ function resolveV2(job: Dict): JobContract {
   const model = resolveModelV2(own(job, 'model'));
   const effort = resolveEffortV2(own(job, 'effort'));
   const scope = resolveScope(own(job, 'scope'), coordination.phase);
+  const execution = resolveExecution(job, coordination, profileRaw);
   const codexThreadId = resolveThreadId(own(job, 'codexThreadId'));
   const auth = resolveAuth(job);
   const resumeFrom = stringField(own(job, 'resumeFrom'));
@@ -272,6 +370,7 @@ function resolveV2(job: Dict): JobContract {
     effort,
     coordination,
     scope,
+    execution,
     launch: { permissionMode: 'default', safeMode: false, permissionPromptsDisabled: false, restricted: false, strictMcpConfig: true },
     capabilities,
     limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
@@ -325,6 +424,12 @@ export function resolveLegacyTimeoutPolicy(policy: unknown, timeoutSeconds: unkn
 }
 
 function resolveLegacy(job: Dict): JobContract {
+  // Mirror of LEGACY_FIELD_IN_V2: a v2-only field in a legacy job is refused
+  // rather than ignored, so a worktree request can never look accepted while
+  // the run happens in the declared checkout.
+  if (Object.prototype.hasOwnProperty.call(job, 'execution')) {
+    throw new ContractError('V2_FIELD_IN_LEGACY', 'O campo execution pertence ao contrato v2 (contractVersion: 2); o runner legado executa sempre no checkout declarado.');
+  }
   const workspace = resolveWorkspace(own(job, 'workspace'));
   const { prompt, promptFile } = resolvePrompt(job);
   const coordination = resolveCoordination(own(job, 'coordination'));
@@ -376,6 +481,10 @@ function resolveLegacy(job: Dict): JobContract {
     effort,
     coordination,
     scope: { summary: coordination.planSummary, paths: [], wholeWorkspace: false },
+    // The legacy runner has no worktree provisioning; a v1 job always runs in
+    // the declared checkout. An `execution` field here is refused above rather
+    // than ignored, so it can never look accepted.
+    execution: { mode: 'checkout', worktree: null },
     launch: { permissionMode: 'dontAsk', safeMode: true, permissionPromptsDisabled: true, restricted: profileRaw === 'restricted', strictMcpConfig: true },
     capabilities,
     limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },

@@ -36669,11 +36669,18 @@ server.registerTool("codeorquestra_status", { description: "Sa\xFAde do broker l
   const health = await call("GET", "/api/health");
   return { status: health.status, body: { broker: { ...health.body, tagline: BRAND.tagline, version: RUNTIME_VERSION }, tasks: [] } };
 }));
-server.registerTool("codeorquestra_start", { description: "Inicia uma execu\xE7\xE3o v2 na tarefa identificada pelo handle. O job segue o contrato v2 (contractVersion: 2).", inputSchema: { taskHandle: handle.optional(), job: external_exports.record(external_exports.string(), external_exports.unknown()), acknowledgeReview: external_exports.boolean().optional(), codexThreadId: external_exports.string().optional().describe("Ignorado: nunca autoriza; use taskHandle.") } }, async ({ taskHandle, job, acknowledgeReview }) => guarded(async () => {
+server.registerTool("codeorquestra_start", { description: "Inicia uma execu\xE7\xE3o v2 na tarefa identificada pelo handle. O job segue o contrato v2 (contractVersion: 2).", inputSchema: { taskHandle: handle.optional(), job: external_exports.record(external_exports.string(), external_exports.unknown()), acknowledgeReview: external_exports.boolean().optional(), observation: external_exports.object({ mode: external_exports.enum(["painel", "voz"]) }).optional().describe('Canal de acompanhamento. "painel" (padrao) exige uma aba do painel assinando os eventos desta tarefa; "voz" assume o acompanhamento narrado pelo coordenador.'), codexThreadId: external_exports.string().optional().describe("Ignorado: nunca autoriza; use taskHandle.") } }, async ({ taskHandle, job, acknowledgeReview, observation }) => guarded(async () => {
   if (!taskHandle) return { status: 403, body: { error: "TASK_HANDLE_REQUIRED", note: 'codexThreadId n\xE3o \xE9 aceito como autoriza\xE7\xE3o; registre a tarefa no terminal com "codeorquestra task register".' } };
   const taskId = await taskIdFor(taskHandle);
-  const result = await call("POST", `/api/tasks/${taskId}/runs`, { taskHandle, job, ...acknowledgeReview ? { acknowledgeReview: true } : {} });
+  const result = await call("POST", `/api/tasks/${taskId}/runs`, { taskHandle, job, ...acknowledgeReview ? { acknowledgeReview: true } : {}, ...observation ? { observation } : {} });
   return { status: result.status, body: { taskId, ...result.body } };
+}));
+server.registerTool("codeorquestra_pair", {
+  description: "Pareia esta sess\xE3o com a tarefa do painel usando o c\xF3digo curto exibido na tela. Devolve o taskHandle desta tarefa; o handle anterior deixa de valer.",
+  inputSchema: { code: external_exports.string().min(4).max(24).describe("C\xF3digo curto lido no painel. Espa\xE7os e h\xEDfens s\xE3o ignorados.") }
+}, async ({ code }) => guarded(async () => {
+  const result = await call("POST", "/api/tasks/pair", { code });
+  return { status: result.status, body: result.body };
 }));
 server.registerTool("codeorquestra_wait", { description: "Aguarda novos eventos da tarefa a partir de um cursor (long-poll). Atualiza a presen\xE7a do coordenador.", inputSchema: { taskHandle: handle, cursor: external_exports.number().int().min(0).default(0), waitMs: external_exports.number().int().min(0).max(3e4).default(1e4) } }, async ({ taskHandle, cursor, waitMs }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
@@ -36695,6 +36702,10 @@ server.registerTool("codeorquestra_answer", { description: "Responde a um pedido
   const taskId = await taskIdFor(taskHandle);
   return call("POST", `/api/tasks/${taskId}/answer`, { taskHandle, ...rest });
 }));
+server.registerTool("codeorquestra_annotate", { description: "Anota um arquivo alterado nesta execu\xE7\xE3o; a anota\xE7\xE3o vira orienta\xE7\xE3o na fila e \xE9 entregue no pr\xF3ximo turno. S\xF3 aceita arquivos que o broker observou como alterados.", inputSchema: { taskHandle: handle, file: external_exports.string().min(1).describe("Caminho relativo ao workspace, exatamente como aparece em changedFiles.observed."), comment: external_exports.string().min(1), hunk: external_exports.string().optional().describe('Cabe\xE7alho do trecho, quando houver (ex.: "@@ -10,7 +10,9 @@").') } }, async ({ taskHandle, ...rest }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call("POST", `/api/tasks/${taskId}/annotations`, { taskHandle, ...rest });
+}));
 server.registerTool("codeorquestra_interrupt", { description: "Interrompe o turno atual (a sess\xE3o continua aberta).", inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call("POST", `/api/tasks/${taskId}/interrupt`, { taskHandle });
@@ -36714,6 +36725,10 @@ server.registerTool("codeorquestra_inventory", { description: "Inventaria person
 server.registerTool("codeorquestra_trust", { description: "Registra a aprova\xE7\xE3o (feita pelo usu\xE1rio) das personaliza\xE7\xF5es inventariadas para este projeto.", inputSchema: { taskHandle: handle, workspace: external_exports.string(), approvalRevision: external_exports.number().int().min(1), approvedItems: external_exports.union([external_exports.literal("all"), external_exports.array(external_exports.string())]), note: external_exports.string().optional() } }, async ({ taskHandle, ...rest }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call("POST", `/api/tasks/${taskId}/trust`, { taskHandle, ...rest });
+}));
+server.registerTool("codeorquestra_usage_refresh", { description: "Atualiza, sem iniciar infer\xEAncia nem consumir cr\xE9ditos, os limites e a atividade que o Codex App Server disponibiliza para esta tarefa.", inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call("POST", `/api/tasks/${taskId}/usage-refresh`, { taskHandle });
 }));
 server.registerTool("codeorquestra_dashboard_url", { description: 'Gera um link de uso \xFAnico do painel limitado a esta tarefa (o painel com todas as tarefas \xE9 uma a\xE7\xE3o local do usu\xE1rio: "codeorquestra dashboard").', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => call("POST", "/api/dashboard-url", { taskHandle })));
 var transport = new StdioServerTransport();

@@ -114,11 +114,19 @@ server.registerTool('codeorquestra_status', { description: 'Saúde do broker loc
   return { status: health.status, body: { broker: { ...(health.body as object), tagline: BRAND.tagline, version: RUNTIME_VERSION }, tasks: [] } };
 }));
 
-server.registerTool('codeorquestra_start', { description: 'Inicia uma execução v2 na tarefa identificada pelo handle. O job segue o contrato v2 (contractVersion: 2).', inputSchema: { taskHandle: handle.optional(), job: z.record(z.string(), z.unknown()), acknowledgeReview: z.boolean().optional(), codexThreadId: z.string().optional().describe('Ignorado: nunca autoriza; use taskHandle.') } }, async ({ taskHandle, job, acknowledgeReview }) => guarded(async () => {
+server.registerTool('codeorquestra_start', { description: 'Inicia uma execução v2 na tarefa identificada pelo handle. O job segue o contrato v2 (contractVersion: 2).', inputSchema: { taskHandle: handle.optional(), job: z.record(z.string(), z.unknown()), acknowledgeReview: z.boolean().optional(), observation: z.object({ mode: z.enum(['painel', 'voz']) }).optional().describe('Canal de acompanhamento. "painel" (padrao) exige uma aba do painel assinando os eventos desta tarefa; "voz" assume o acompanhamento narrado pelo coordenador.'), codexThreadId: z.string().optional().describe('Ignorado: nunca autoriza; use taskHandle.') } }, async ({ taskHandle, job, acknowledgeReview, observation }) => guarded(async () => {
   if (!taskHandle) return { status: 403, body: { error: 'TASK_HANDLE_REQUIRED', note: 'codexThreadId não é aceito como autorização; registre a tarefa no terminal com "codeorquestra task register".' } };
   const taskId = await taskIdFor(taskHandle);
-  const result = await call('POST', `/api/tasks/${taskId}/runs`, { taskHandle, job, ...(acknowledgeReview ? { acknowledgeReview: true } : {}) });
+  const result = await call('POST', `/api/tasks/${taskId}/runs`, { taskHandle, job, ...(acknowledgeReview ? { acknowledgeReview: true } : {}), ...(observation ? { observation } : {}) });
   return { status: result.status, body: { taskId, ...(result.body as object) } };
+}));
+
+server.registerTool('codeorquestra_pair', {
+  description: 'Pareia esta sessão com a tarefa do painel usando o código curto exibido na tela. Devolve o taskHandle desta tarefa; o handle anterior deixa de valer.',
+  inputSchema: { code: z.string().min(4).max(24).describe('Código curto lido no painel. Espaços e hífens são ignorados.') },
+}, async ({ code }) => guarded(async () => {
+  const result = await call('POST', '/api/tasks/pair', { code });
+  return { status: result.status, body: result.body };
 }));
 
 server.registerTool('codeorquestra_wait', { description: 'Aguarda novos eventos da tarefa a partir de um cursor (long-poll). Atualiza a presença do coordenador.', inputSchema: { taskHandle: handle, cursor: z.number().int().min(0).default(0), waitMs: z.number().int().min(0).max(30000).default(10000) } }, async ({ taskHandle, cursor, waitMs }) => guarded(async () => {
@@ -147,6 +155,11 @@ server.registerTool('codeorquestra_answer', { description: 'Responde a um pedido
   return call('POST', `/api/tasks/${taskId}/answer`, { taskHandle, ...rest });
 }));
 
+server.registerTool('codeorquestra_annotate', { description: 'Anota um arquivo alterado nesta execução; a anotação vira orientação na fila e é entregue no próximo turno. Só aceita arquivos que o broker observou como alterados.', inputSchema: { taskHandle: handle, file: z.string().min(1).describe('Caminho relativo ao workspace, exatamente como aparece em changedFiles.observed.'), comment: z.string().min(1), hunk: z.string().optional().describe('Cabeçalho do trecho, quando houver (ex.: "@@ -10,7 +10,9 @@").') } }, async ({ taskHandle, ...rest }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call('POST', `/api/tasks/${taskId}/annotations`, { taskHandle, ...rest });
+}));
+
 server.registerTool('codeorquestra_interrupt', { description: 'Interrompe o turno atual (a sessão continua aberta).', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call('POST', `/api/tasks/${taskId}/interrupt`, { taskHandle });
@@ -170,6 +183,11 @@ server.registerTool('codeorquestra_inventory', { description: 'Inventaria person
 server.registerTool('codeorquestra_trust', { description: 'Registra a aprovação (feita pelo usuário) das personalizações inventariadas para este projeto.', inputSchema: { taskHandle: handle, workspace: z.string(), approvalRevision: z.number().int().min(1), approvedItems: z.union([z.literal('all'), z.array(z.string())]), note: z.string().optional() } }, async ({ taskHandle, ...rest }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call('POST', `/api/tasks/${taskId}/trust`, { taskHandle, ...rest });
+}));
+
+server.registerTool('codeorquestra_usage_refresh', { description: 'Atualiza, sem iniciar inferência nem consumir créditos, os limites e a atividade que o Codex App Server disponibiliza para esta tarefa.', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call('POST', `/api/tasks/${taskId}/usage-refresh`, { taskHandle });
 }));
 
 server.registerTool('codeorquestra_dashboard_url', { description: 'Gera um link de uso único do painel limitado a esta tarefa (o painel com todas as tarefas é uma ação local do usuário: "codeorquestra dashboard").', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => call('POST', '/api/dashboard-url', { taskHandle })));

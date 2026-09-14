@@ -21,13 +21,18 @@ import { redactSensitiveText } from '../events/redaction.ts';
 import { probeCli } from '../preflight/cli-probe.ts';
 import { resolvePreflight, type PreflightResult, type ProbeResult, type ResolvedExecutable } from '../preflight/cli-resolver.ts';
 import { StateWriter, readJsonShared, writeFileAtomic } from '../state/atomic-file.ts';
-import { inventoryCustomizations, type Inventory } from '../trust/inventory.ts';
+import { inventoryCustomizations, canonicalizeWorkspace, type Inventory } from '../trust/inventory.ts';
 import { resolveLaunchCustomizations } from '../trust/launch-customizations.ts';
+import { isSensitivePath, resolveWorkspacePath } from '../policy/action-classifier.ts';
+import { git, gitStatus, listOrphans, resolveRepository, worktreePathFor, ensureWorktree, removeWorktree, withRepositoryMutex, assertUsablePathLength, canonicalize, canonicalizePlanned, type Repository } from './worktree.ts';
+import { WorktreePolicyStore, type WorktreePolicyRecord } from './worktree-policy.ts';
 import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
 import { isHarness, envName } from '../shared/env.ts';
-import type { ActionSource, AuthorizedModel, EventRecord, PendingRequestView, QueueEntryView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import type { ActionSource, AuthorizedModel, CodexUsageView, EventRecord, PendingRequestView, QueueEntryView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import { ClaudeUsageAccumulator } from '../usage/claude-usage.ts';
+import { CodexUsageService, type CodexUsageReader, unavailableCodexUsage } from '../usage/codex-usage.ts';
 import { sha256, mintTaskHandle, verifyTaskHandle, taskIdForThread, THREAD_ID_PATTERN } from './identity.ts';
 import { HttpError } from './http.ts';
 import { findClaudeLauncher, nodeExecArgv, engineInfo, workerEntry } from './runtime-paths.ts';
@@ -50,6 +55,15 @@ interface QueueEntry extends QueueEntryView {
   text: string;
 }
 
+/** What a run needed to provision before it could start. */
+interface WorktreePlan {
+  repository: Repository;
+  policy: WorktreePolicyRecord;
+  path: string;
+  branch: string;
+  baseRef: string | null;
+}
+
 interface RunState {
   runId: string;
   runToken: string;
@@ -57,6 +71,13 @@ interface RunState {
   startedAt: string;
   endedAt: string | null;
   contract: JobContract;
+  /**
+   * The workspace the job declared, kept for the audit trail when the run
+   * actually executes somewhere else. `contract.workspace` is always the
+   * directory the CLI really runs in.
+   */
+  declaredWorkspace: string | null;
+  worktree: WorktreePlan | null;
   prompt: string;
   sessionConfirmed: boolean;
   requestedModel: string;
@@ -126,10 +147,15 @@ export interface TaskState {
   pending: Map<string, PendingRequestView>;
   resolvedRequests: Set<string>;
   alertsRaised: Set<string>;
+  /** Last time the still-blocking decision alert was raised; null when none is pending. */
+  lastDecisionAlertAt: number | null;
   uncertain: boolean;
   disconnected: boolean;
   previousSessionId: string | null;
   quota: ReturnType<QuotaService['view']> | null;
+  claudeUsage: ClaudeUsageAccumulator;
+  codexUsage: CodexUsageView;
+  usageRefresh: Promise<CodexUsageView> | null;
   writer: StateWriter | null;
   derivedDirty: boolean;
   lastTelemetryEventAt: number;
@@ -148,8 +174,12 @@ export interface TaskManagerOptions {
   supervision?: SupervisionThresholds;
   harness: boolean;
   quotaWaitMs?: number;
+  /** How many live subscribers can see a task; supplied by the SSE hub. */
+  observers?: (taskId: string) => number;
   /** Harness-only scheduling seam used to prove recovery cancellation. */
   recoveryCheckpoint?: () => Promise<void>;
+  /** Test seam; production uses one read-only App Server connection. */
+  codexUsage?: CodexUsageReader;
 }
 
 const WORKER_END_GRACE_MS = 15000;
@@ -162,7 +192,9 @@ export class TaskManager {
   readonly stateRoot: string;
   readonly tasks = new Map<string, TaskState>();
   readonly trustStore: TrustStore;
+  readonly worktreePolicy: WorktreePolicyStore;
   readonly quota: QuotaService;
+  readonly codexUsage: CodexUsageReader;
   readonly locks = new Map<string, LockRecord>();
   private readonly options: TaskManagerOptions;
   private globalSeq = 0;
@@ -184,7 +216,12 @@ export class TaskManager {
     this.options = options;
     this.stateRoot = options.stateRoot;
     this.trustStore = new TrustStore(options.stateRoot);
+    this.worktreePolicy = new WorktreePolicyStore(options.stateRoot);
     this.quota = new QuotaService({ waitMs: options.quotaWaitMs ?? 30000 });
+    this.codexUsage = options.codexUsage ?? (options.harness ? {
+      refresh: async () => unavailableCodexUsage('CODEX_USAGE_DISABLED_IN_HARNESS', new Date().toISOString()),
+      stop: async () => undefined,
+    } : new CodexUsageService());
   }
 
   get thresholds(): SupervisionThresholds {
@@ -232,6 +269,8 @@ export class TaskManager {
     this.stopping = true;
     if (this.supervisionTimer) clearInterval(this.supervisionTimer);
     if (this.derivedTimer) clearInterval(this.derivedTimer);
+    await this.codexUsage.stop();
+    await Promise.allSettled([...this.tasks.values()].flatMap((task) => task.usageRefresh ? [task.usageRefresh] : []));
     await this.settlePreparations();
     for (const task of this.tasks.values()) {
       if (task.run && !task.run.finalized) {
@@ -381,12 +420,62 @@ export class TaskManager {
       await fs.rm(path.join(this.locksDir(), file), { force: true });
       this.assertOperational();
     }
+    await this.sweepOrphanWorktrees();
+  }
+
+  /**
+   * Removes worktrees no live task owns, and reports the ones it will not touch.
+   *
+   * Deliberately the LAST pass: quarantined locks are re-seeded just above, and
+   * a quarantined worktree must never be swept — a process of the previous run
+   * may still be able to write there.
+   *
+   * This is not optional once provisioning exists. `git worktree add` can
+   * outlast PREPARATION_DRAIN_MS on a large repository; shutdown logs and
+   * proceeds, leaving a registered worktree with no task. Without this sweep
+   * that leaks, one directory per interrupted start.
+   *
+   * Removal is narrow by design: only a tree with no uncommitted work, and only
+   * through git, which refuses a dirty tree on its own. Anything dirty or
+   * unattributable is listed and left alone.
+   */
+  private async sweepOrphanWorktrees(): Promise<void> {
+    const owned = new Set<string>();
+    for (const task of this.tasks.values()) owned.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) owned.add(lock.holderTaskId.slice(0, 16));
+    let orphans: Awaited<ReturnType<typeof listOrphans>>;
+    try {
+      orphans = await listOrphans(this.stateRoot, (_repoKey, prefix) => owned.has(prefix));
+    } catch {
+      return;
+    }
+    for (const orphan of orphans) {
+      this.assertOperational();
+      if (orphan.dirtyFiles.length > 0) {
+        this.options.log(`worktree órfão preservado (${orphan.dirtyFiles.length} arquivo(s) não commitado(s)): ${orphan.path}`);
+        continue;
+      }
+      // The repository is reached through the worktree itself; if that fails,
+      // the directory is not a usable worktree and is left for a human.
+      let repository: Repository;
+      try {
+        repository = await resolveRepository(orphan.path);
+      } catch {
+        this.options.log(`worktree órfão não atribuível, preservado: ${orphan.path}`);
+        continue;
+      }
+      const removal = await withRepositoryMutex(repository.repoKey, () => removeWorktree(repository, orphan.path));
+      this.options.log(removal.removed
+        ? `worktree órfão limpo removido: ${orphan.path}`
+        : `worktree órfão preservado (git recusou a remoção): ${orphan.path} — ${removal.reason ?? 'sem motivo informado'}`);
+    }
   }
 
   private async openTask(record: TaskRecord, dir: string): Promise<TaskState> {
     const existing = this.tasks.get(record.taskId);
     if (existing) return existing;
     const log = await EventLog.open(path.join(dir, 'events.jsonl'));
+    const history = await log.readFrom(0);
     const queue = await this.loadQueue(dir);
     const pointer = await readJsonShared<{ sessionId?: string }>(path.join(dir, 'session.json'));
     const task: TaskState = {
@@ -405,10 +494,14 @@ export class TaskManager {
       pending: new Map(),
       resolvedRequests: new Set(),
       alertsRaised: new Set(),
+      lastDecisionAlertAt: null,
       uncertain: record.requiresReview,
       disconnected: false,
       previousSessionId: pointer.status === 'ok' && typeof pointer.value.sessionId === 'string' ? pointer.value.sessionId : null,
       quota: null,
+      claudeUsage: ClaudeUsageAccumulator.fromEvents(history),
+      codexUsage: unavailableCodexUsage(),
+      usageRefresh: null,
       writer: null,
       derivedDirty: false,
       lastTelemetryEventAt: 0,
@@ -443,7 +536,32 @@ export class TaskManager {
     await this.append(task, task.run?.runId ?? 'none', 'task_registered', { source, rotated: Boolean(existing) });
     this.options.log(`task ${taskId} registered (${source})`);
     this.changed(task);
+    if (!this.options.harness) void this.refreshUsage(task);
     return { taskId, taskHandle: handle, created: !existing, requiresReview: record.requiresReview };
+  }
+
+  /**
+   * Mints a new handle for an existing task and invalidates the previous one.
+   *
+   * Rotation is a takeover, not a copy: whoever held the old handle stops being
+   * able to act on the task. That is the property that keeps a paired
+   * coordinator from silently sharing control with a stale one, and it is why
+   * this is appended to the durable log rather than done quietly.
+   */
+  async rotateHandle(task: TaskState, reason: 'voice-pairing', source: ActionSource): Promise<{ taskId: string; taskHandle: string; requiresReview: boolean }> {
+    const { handle, hash } = mintTaskHandle();
+    const previousRotatedAt = task.record.handleRotatedAt;
+    task.record = { ...task.record, handleHash: hash, handleRotatedAt: new Date().toISOString() };
+    await this.persistRecord(task);
+    await this.append(task, task.run?.runId ?? 'none', 'task_handle_rotated', {
+      reason,
+      source,
+      previousRotatedAt,
+      note: 'Um handle novo foi emitido; o anterior deixou de valer. Quem o detinha não age mais nesta tarefa.',
+    });
+    this.options.log(`task ${task.record.taskId}: handle rotacionado (${reason}, ${source})`);
+    this.changed(task);
+    return { taskId: task.record.taskId, taskHandle: handle, requiresReview: task.record.requiresReview };
   }
 
   resolveHandle(handle: unknown): TaskState {
@@ -496,6 +614,68 @@ export class TaskManager {
    * be proven gone: a writer is never restored while a survivor is possible.
    * The decision and its reason are recorded in the task log.
    */
+  /**
+   * What worktrees exist under this state root and which are unaccounted for.
+   *
+   * Ownership is decided here, not in the git module, because only the task
+   * manager knows which tasks are live and which locks are quarantined. A
+   * quarantined worktree is never reported as an orphan: a process of the
+   * previous run may still be able to write there, and the audited release
+   * path — not a sweep — is what ends that.
+   */
+  async worktreeInventory(): Promise<{ policies: WorktreePolicyRecord[]; orphans: Array<{ path: string; repoKey: string; taskId: string; dirtyFiles: string[] }> }> {
+    const ownedPrefixes = new Set<string>();
+    for (const task of this.tasks.values()) ownedPrefixes.add(task.record.taskId.slice(0, 16));
+    for (const lock of this.locks.values()) if (lock.quarantined) ownedPrefixes.add(lock.holderTaskId.slice(0, 16));
+    const orphans = await listOrphans(this.stateRoot, (_repoKey, taskPrefix) => ownedPrefixes.has(taskPrefix));
+    return { policies: await this.worktreePolicy.list(), orphans };
+  }
+
+  /**
+   * Removes a retained worktree, on the operator's explicit instruction.
+   *
+   * Retention exists because uncommitted work is the normal end state of a run,
+   * so discarding it has to be stated, not defaulted: a dirty tree is only
+   * removed with confirmDiscardUncommitted, and the files being discarded are
+   * named back in the answer. A tree whose lock is still quarantined is never
+   * removed here — releasing ownership is the other, survivor-checking action.
+   */
+  async releaseWorktree(target: string, request: { note: string | null; confirmDiscardUncommitted: boolean }, source: ActionSource): Promise<{ removed: boolean; path: string; discarded: string[]; note: string }> {
+    const note = (request.note ?? '').trim();
+    if (!note) throw new HttpError(400, 'NOTE_REQUIRED', { message: 'Remover um worktree exige uma nota; a remoção fica registrada.' });
+    const canonical = canonicalize(target);
+    for (const lock of this.locks.values()) {
+      if (canonicalize(lock.workspace) !== canonical) continue;
+      if (lock.quarantined) {
+        throw new HttpError(409, 'WORKSPACE_LOCK_QUARANTINED', {
+          holderTaskId: lock.holderTaskId,
+          note: lock.quarantineNote,
+          remediation: 'Um processo da execução anterior pode continuar escrevendo aqui. Libere a posse pela rota de travas, que reverifica sobreviventes, antes de remover o diretório.',
+        });
+      }
+      throw new HttpError(409, 'WORKSPACE_WRITER_LOCKED', { holderTaskId: lock.holderTaskId, holderRunId: lock.holderRunId, message: 'Este worktree ainda pertence a uma execução ativa.' });
+    }
+    let repository: Repository;
+    try {
+      repository = await resolveRepository(target);
+    } catch (error) {
+      throw new HttpError(400, (error as { code?: string }).code ?? 'NOT_A_GIT_REPOSITORY', { message: (error as Error).message });
+    }
+    const dirty = await gitStatus(target);
+    if (dirty.length > 0 && !request.confirmDiscardUncommitted) {
+      throw new HttpError(409, 'WORKTREE_HAS_UNCOMMITTED_WORK', {
+        files: dirty.slice(0, 50),
+        message: `Este worktree tem ${dirty.length} arquivo(s) com alterações não commitadas. Commite a partir dele, ou repita com confirmDiscardUncommitted para descartar.`,
+      });
+    }
+    // Forced only here, only after the operator confirmed, and only for the
+    // files just named back to them.
+    const removal = await withRepositoryMutex(repository.repoKey, () => removeWorktree(repository, target, { force: dirty.length > 0 }));
+    if (!removal.removed) throw new HttpError(409, 'WORKTREE_REMOVE_REFUSED', { message: removal.reason ?? 'git recusou a remoção.' });
+    this.options.log(`worktree removido por ação administrativa (${source}): ${target} — ${note}`);
+    return { removed: true, path: target, discarded: dirty.slice(0, 50), note };
+  }
+
   async releaseQuarantinedLock(workspaceKey: string, request: { note: string | null; confirmHistoricalRisk: boolean; expectedTaskId: string | null; expectedRunId: string | null }, source: ActionSource): Promise<{ released: boolean; workspaceKey: string; livePids: number[]; note: string; historicalAncestryConclusive: boolean }> {
     const lock = this.locks.get(workspaceKey);
     if (!lock) throw new HttpError(404, 'LOCK_NOT_FOUND');
@@ -637,6 +817,79 @@ export class TaskManager {
     await this.deliverNext(task);
     this.changed(task);
     return this.queueView(entry);
+  }
+
+  /**
+   * A review note on a changed file becomes guidance for the next turn.
+   *
+   * Three steps, in order: validate the target, record the annotation in the
+   * durable log, and hand the rendered text to the EXISTING enqueueMessage.
+   * There is no new delivery path, no second queue and no new worker message,
+   * so every guarantee comes along unchanged — refused with NO_ACTIVE_RUN,
+   * refused while the run REQUIRES_REVIEW, delivered only between turns, never
+   * mid-turn, persisted in queue.jsonl, redacted on the way in.
+   *
+   * The target must be a file the broker already observed as changed. An
+   * annotation can therefore never name an arbitrary path, which is what keeps
+   * this from becoming a way to make Claude read somewhere it was not sent.
+   */
+  async annotate(task: TaskState, input: { file: unknown; comment: unknown; hunk?: unknown }, source: ActionSource): Promise<QueueEntryView> {
+    const file = typeof input.file === 'string' ? input.file.trim() : '';
+    const comment = typeof input.comment === 'string' ? input.comment.trim() : '';
+    if (!file) throw new HttpError(400, 'FILE_REQUIRED', { message: 'Informe o arquivo anotado em "file".' });
+    if (!comment) throw new HttpError(400, 'COMMENT_REQUIRED', { message: 'Uma anotação sem texto não orienta nada.' });
+    const workspace = task.record.workspace;
+    if (!workspace) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    const observed = await this.observedFiles(task);
+    if (!observed.includes(file)) {
+      throw new HttpError(400, 'FILE_NOT_OBSERVED', {
+        message: 'Só é possível anotar um arquivo que o broker observou como alterado nesta execução.',
+        observed: observed.slice(0, 50),
+      });
+    }
+    if (isSensitivePath(file)) throw new HttpError(403, 'SENSITIVE_FILE', { message: 'Arquivos sensíveis não são anotados nem exibidos.' });
+    const resolved = resolveWorkspacePath(workspace, file);
+    if (!resolved.inside) throw new HttpError(403, 'OUTSIDE_WORKSPACE', { message: 'O caminho anotado sai da árvore de trabalho.' });
+    const hunk = typeof input.hunk === 'string' && input.hunk.trim() ? input.hunk.trim().slice(0, 120) : null;
+    const rendered = `Anotação de revisão em ${file}${hunk ? ` (${hunk})` : ''}: ${comment}`;
+    await this.append(task, task.run?.runId ?? 'none', 'diff_annotated', {
+      file,
+      hunk,
+      commentPreview: boundedPreview(redactSensitiveText(comment), 300).preview,
+      source,
+      note: 'A anotação entra na fila como orientação e é entregue entre turnos, como qualquer outra.',
+    });
+    return this.enqueueMessage(task, rendered, source);
+  }
+
+  /** The changed-file list the annotation and diff routes validate against. */
+  private async observedFiles(task: TaskState): Promise<string[]> {
+    const fresh = await this.changedFiles(task);
+    return fresh.observed;
+  }
+
+  /**
+   * The diff of one observed file, for review.
+   *
+   * Diff output is file content the panel has never previewed, so it goes
+   * through the same redaction as everything else public, and through the same
+   * target validation as an annotation.
+   */
+  async fileDiff(task: TaskState, file: string): Promise<{ file: string; diff: string; truncated: boolean }> {
+    const workspace = task.record.workspace;
+    if (!workspace) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    const observed = await this.observedFiles(task);
+    if (!observed.includes(file)) throw new HttpError(400, 'FILE_NOT_OBSERVED', { observed: observed.slice(0, 50) });
+    if (isSensitivePath(file)) throw new HttpError(403, 'SENSITIVE_FILE');
+    const resolved = resolveWorkspacePath(workspace, file);
+    if (!resolved.inside) throw new HttpError(403, 'OUTSIDE_WORKSPACE');
+    // `--` separates the pathspec from revisions, so a file named like a ref
+    // cannot be read as one.
+    const result = await git(['diff', '--unified=3', '--', file], workspace);
+    const raw = result.code === 0 ? result.stdout : '';
+    const redacted = redactSensitiveText(raw);
+    const limit = 64_000;
+    return { file, diff: redacted.slice(0, limit), truncated: redacted.length > limit };
   }
 
   private async deliverNext(task: TaskState): Promise<void> {
@@ -786,7 +1039,7 @@ export class TaskManager {
    * Reserves the task slot and the checkout writer lock synchronously, before
    * any awaited preparation, so two concurrent starts can never both proceed.
    */
-  async startRun(task: TaskState, job: unknown, harness: Record<string, unknown> | null, source: ActionSource, acknowledgeReview: boolean): Promise<{ runId: string; status: 'STARTING' }> {
+  async startRun(task: TaskState, job: unknown, harness: Record<string, unknown> | null, source: ActionSource, acknowledgeReview: boolean, observation?: unknown): Promise<{ runId: string; status: 'STARTING' }> {
     let contract: JobContract;
     try {
       contract = resolveJobContract(job);
@@ -795,6 +1048,7 @@ export class TaskManager {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, 'LEGACY_CONTRACT_USE_LEGACY_RUNNER', { message: 'Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2.' });
+    this.assertObserved(task, observation);
     // Admission stops the moment shutdown begins, before any reservation.
     if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker está encerrando; nenhuma execução nova é aceita.' });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
@@ -809,7 +1063,16 @@ export class TaskManager {
     } catch {
       throw new HttpError(400, 'WORKSPACE_NOT_FOUND');
     }
-    const workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    // Everything a worktree run needs is resolved HERE, before the critical
+    // section, because the section itself must stay free of awaits: the writer
+    // lock has to be reserved atomically. The path is a pure function of
+    // (repository, task), so the key is computable without touching the disk.
+    let worktreePlan: WorktreePlan | null = null;
+    let workspaceKey = sha256(canonicalWorkspace).slice(0, 24);
+    if (contract.execution.mode === 'worktree') {
+      worktreePlan = await this.planWorktree(task, contract, workspace);
+      workspaceKey = sha256(canonicalizePlanned(worktreePlan.path)).slice(0, 24);
+    }
 
     // --- synchronous critical section: no await until the reservation exists.
     if (task.run && !task.run.finalized) throw new HttpError(409, 'RUN_IN_PROGRESS', { runId: task.run.runId });
@@ -853,6 +1116,8 @@ export class TaskManager {
       turns: 0,
       resumeMode: task.previousSessionId ? 'automatic' : 'new',
       simulated: false,
+      declaredWorkspace: worktreePlan ? workspace : null,
+      worktree: worktreePlan,
       writerLockKey: contract.capabilities.edit ? workspaceKey : null,
       finalized: false,
       finalizing: false,
@@ -863,13 +1128,18 @@ export class TaskManager {
     };
     task.run = run;
     if (contract.capabilities.edit) {
-      this.locks.set(workspaceKey, { workspaceKey, workspace: canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run.startedAt, quarantined: false });
+      // The lock is over the WORKING TREE the run writes to, not over the
+      // repository. Two tasks in separate worktrees hold different locks and
+      // legitimately run at once; what still serializes is the shared .git,
+      // under the repository mutex.
+      this.locks.set(workspaceKey, { workspaceKey, workspace: worktreePlan ? canonicalizePlanned(worktreePlan.path) : canonicalWorkspace, holderTaskId: task.record.taskId, holderRunId: runId, holderPid: null, acquiredAt: run.startedAt, quarantined: false });
     }
     task.uncertain = false;
     task.disconnected = false;
     task.phase = 'starting';
     task.currentTool = null;
     task.alertsRaised.clear();
+    task.lastDecisionAlertAt = null;
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
@@ -879,8 +1149,38 @@ export class TaskManager {
       await fs.mkdir(runDir, { recursive: true });
       run.prompt = contract.prompt ?? (contract.promptFile ? await fs.readFile(contract.promptFile, 'utf8') : '');
       if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante a preparação; nenhum worker será criado.' });
-      const { inventory, trust } = await this.inventoryFor(workspace);
+      // Provisioning happens BEFORE the inventory, never after. Trust has to be
+      // evaluated against the directory the CLI will actually run in; inverting
+      // this would approve the parent checkout and then launch somewhere whose
+      // customizations nobody inventoried.
+      let effectiveWorkspace = workspace;
+      if (worktreePlan) {
+        effectiveWorkspace = await this.provisionWorktree(task, run, worktreePlan);
+        if (this.stopping || task.run !== run) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante o provisionamento; nenhum worker será criado.' });
+      }
+      const { inventory, trust: initialTrust } = await this.inventoryFor(effectiveWorkspace);
+      let trust = initialTrust;
       if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker começou a encerrar durante a preparação; nenhum worker será criado.' });
+      if (!trust.trusted && worktreePlan) {
+        // A worktree is a new canonical path, so it has no approval of its own
+        // and the first parallel run would die with WORKSPACE_NOT_TRUSTED —
+        // pushing the user to approve blind. Derivation reuses the parent's
+        // approval and only when every item matches by hash; it never mints one.
+        // The parent key must be spelled exactly as the trust record was
+        // written, so it comes from the inventory's own canonicalization rather
+        // than from the lock-key spelling used above.
+        const derived = await this.trustStore.deriveFromParent({ child: inventory, parentCanonicalWorkspace: canonicalizeWorkspace(workspace) });
+        if (derived) {
+          trust = await this.trustStore.check(inventory);
+          await this.append(task, runId, 'trust_derived', {
+            workspace: inventory.canonicalWorkspace,
+            from: canonicalWorkspace,
+            approvalRevision: derived.approvalRevision,
+            items: derived.approvedItems.length,
+            note: 'Aprovação herdada do checkout de origem: todo item bate por hash. Nenhum recurso novo foi autorizado.',
+          });
+        }
+      }
       if (!trust.trusted) {
         throw new HttpError(409, 'WORKSPACE_NOT_TRUSTED', { reason: trust.reason, pending: trust.pending, changed: trust.changed, fingerprint: inventory.fingerprint, incomplete: inventory.incomplete });
       }
@@ -895,7 +1195,7 @@ export class TaskManager {
       // Ownership must be recorded before anything else happens; a failure here
       // aborts the launch and releases the reservation.
       try {
-        await this.writeCurrentRun(task, { runId, runToken, status: 'STARTING', workerPid: null, workerStartedAt: null, startedAt: run.startedAt, workspace, writerLockKey: run.writerLockKey, runDir });
+        await this.writeCurrentRun(task, { runId, runToken, status: 'STARTING', workerPid: null, workerStartedAt: null, startedAt: run.startedAt, workspace: effectiveWorkspace, writerLockKey: run.writerLockKey, runDir });
       } catch (error) {
         throw new HttpError(503, 'OWNERSHIP_RECORD_FAILED', {
           code: (error as { code?: string }).code ?? 'WRITE_FAILED',
@@ -907,7 +1207,11 @@ export class TaskManager {
         requestedModel: run.requestedModel,
         modelReason: run.modelReason,
         effort: contract.effort,
-        workspace,
+        workspace: effectiveWorkspace,
+        // Recorded so an audit of status.json can see a run that started with
+        // no panel attached, and which channel was declared instead.
+        observation: { mode: isRecord(observation) && observation.mode === 'voz' ? 'voz' : 'painel', observers: this.options.observers?.(task.record.taskId) ?? 0 },
+        ...(worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: 'broker', policyEnabledAt: worktreePlan.policy.enabledAt } } : {}),
         profile: contract.profile,
         contractVersion: contract.version,
         coordination: contract.coordination,
@@ -935,6 +1239,135 @@ export class TaskManager {
       await this.releaseReservation(task, run);
       throw error;
     }
+  }
+
+  /**
+   * A run never starts without a declared channel for watching it.
+   *
+   * Commit 0988ebb added this requirement, but only to the v1 runner, where
+   * `Wait-ClaudeLivePanelReady` really blocks. In v2 it existed solely as prose
+   * in SKILL.md and two READMEs telling the coordinator to confirm the panel —
+   * an instruction to a model, not an invariant, and therefore the only place
+   * in this codebase where the documentation promised more than the code did.
+   *
+   * The property worth keeping is not "a tab is on screen", which no broker can
+   * verify. It is that the mode of observation is DECIDED before work starts
+   * and recorded durably. `painel` is now actually checked against live SSE
+   * subscribers; `voz` is an explicit, attributable choice for a coordinator
+   * with no screen. What can no longer happen is a run starting with neither.
+   *
+   * Deliberately understated: a subscriber count proves a channel is attached,
+   * not that a human is watching.
+   */
+  private assertObserved(task: TaskState, observation: unknown): void {
+    const mode = isRecord(observation) && observation.mode === 'voz' ? 'voz' : 'painel';
+    if (mode === 'voz') return;
+    const observers = this.options.observers?.(task.record.taskId) ?? 0;
+    if (observers > 0) return;
+    throw new HttpError(409, 'OBSERVATION_REQUIRED', {
+      message: 'Nenhum painel está acompanhando esta tarefa. Abra o link do painel e aguarde ele carregar, ou declare observação por voz (observation.mode: "voz") para assumir o acompanhamento narrado.',
+      note: 'A contagem prova que um canal está anexado, não que alguém está olhando.',
+    });
+  }
+
+  /**
+   * Decides where a worktree run will live, and whether it may start at all.
+   *
+   * Everything here is a lookup or a policy check: no directory is created, so
+   * a refusal leaves nothing behind. Runs before the critical section, because
+   * the section cannot await.
+   */
+  private async planWorktree(task: TaskState, contract: JobContract, declaredWorkspace: string): Promise<WorktreePlan> {
+    let repository: Repository;
+    let policy: WorktreePolicyRecord;
+    try {
+      repository = await resolveRepository(declaredWorkspace);
+      policy = await this.worktreePolicy.require(repository.repoKey);
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'WORKTREE_UNAVAILABLE';
+      throw new HttpError(code === 'WORKTREE_POLICY_REQUIRED' ? 403 : 400, code, { message: (error as Error).message });
+    }
+    // N sessions share one account, and observation is serialized while
+    // consumption is not. Without this cap, parallelism would quietly burn a
+    // week of quota with no visible decision anywhere.
+    const active = [...this.tasks.values()].filter((other) =>
+      other.record.taskId !== task.record.taskId
+      && other.run
+      && !other.run.finalized
+      && other.run.worktree?.repository.repoKey === repository.repoKey);
+    if (active.length >= policy.maxParallelRuns) {
+      throw new HttpError(429, 'FLEET_CAPACITY_REACHED', {
+        limit: policy.maxParallelRuns,
+        holders: active.map((other) => ({ taskId: other.record.taskId, threadId: other.record.threadId, runId: other.run?.runId ?? null })),
+        message: `Já existem ${active.length} execução(ões) em worktree neste repositório, o limite aprovado. Aguarde uma terminar ou ajuste maxParallelRuns na política.`,
+      });
+    }
+    const root = policy.worktreeRoot ?? this.stateRoot;
+    const location = worktreePathFor(root, repository.repoKey, task.record.taskId);
+    try {
+      assertUsablePathLength(location.path);
+    } catch (error) {
+      throw new HttpError(400, (error as { code?: string }).code ?? 'WORKTREE_PATH_TOO_LONG', { message: (error as Error).message });
+    }
+    // Uncommitted work is never deleted, so retention is what fills a disk.
+    // Refusing with a number beats discovering it when the volume is full.
+    const retained = await listOrphans(root, () => false);
+    const mine = retained.filter((entry) => entry.repoKey === repository.repoKey && canonicalize(entry.path) !== canonicalizePlanned(location.path));
+    if (mine.length >= policy.maxRetainedWorktrees) {
+      throw new HttpError(409, 'WORKTREE_RETENTION_LIMIT', {
+        limit: policy.maxRetainedWorktrees,
+        retained: mine.map((entry) => ({ path: entry.path, dirtyFiles: entry.dirtyFiles.length })),
+        message: `Há ${mine.length} worktree(s) retido(s) deste repositório, o limite aprovado. Revise e remova os concluídos com "codeorquestra worktree list".`,
+      });
+    }
+    return {
+      repository,
+      policy,
+      path: location.path,
+      branch: contract.execution.worktree?.branch ?? `codeorquestra/${task.record.taskId.slice(0, 16)}`,
+      baseRef: contract.execution.worktree?.baseRef ?? null,
+    };
+  }
+
+  /**
+   * Creates the run's worktree and makes it the effective workspace.
+   *
+   * The single substitution of `contract.workspace` is what carries the change
+   * everywhere else: the spawn cwd, the worker descriptor, the action context's
+   * containment checks, the inventory and the changed-file list all read it.
+   */
+  private async provisionWorktree(task: TaskState, run: RunState, plan: WorktreePlan): Promise<string> {
+    let outcome;
+    try {
+      outcome = await withRepositoryMutex(plan.repository.repoKey, () => ensureWorktree({
+        repository: plan.repository,
+        target: plan.path,
+        branch: plan.branch,
+        baseRef: plan.baseRef,
+      }));
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'WORKTREE_ADD_FAILED';
+      throw new HttpError(code === 'WORKTREE_DIRTY_FROM_PREVIOUS_RUN' ? 409 : 500, code, {
+        message: (error as Error).message,
+        ...((error as { detail?: string }).detail ? { detail: (error as { detail?: string }).detail } : {}),
+      });
+    }
+    run.contract = { ...run.contract, workspace: outcome.path };
+    // The record is what the panel and the ownership file report, so it names
+    // the directory the CLI really runs in. The declared one is not lost: it
+    // stays on the run and in run_started, for the audit trail.
+    task.record.workspace = outcome.path;
+    await this.append(task, run.runId, 'worktree_provisioned', {
+      path: outcome.path,
+      branch: outcome.branch,
+      baseRef: outcome.baseRef,
+      created: outcome.created,
+      repoKey: plan.repository.repoKey,
+      declaredWorkspace: run.declaredWorkspace,
+      provisionedBy: 'broker',
+      note: 'O Claude nunca cria worktrees; a política do repositório foi aprovada pelo usuário e o broker executou.',
+    });
+    return outcome.path;
   }
 
   private async releaseReservation(task: TaskState, run: RunState): Promise<void> {
@@ -1113,7 +1546,8 @@ export class TaskManager {
         break;
       }
       case 'event': {
-        await this.append(task, run.runId, message.type, message.data, message.toolUseId);
+        const event = await this.append(task, run.runId, message.type, message.data, message.toolUseId);
+        task.claudeUsage.addEvent(event);
         this.applyEvent(task, run, message.type, message.data, message.toolUseId);
         if (message.type === 'permission_requested' || message.type === 'question_asked') this.changed(task);
         break;
@@ -1159,6 +1593,7 @@ export class TaskManager {
         await this.observeBetweenTurns(task, run);
         await this.deliverNext(task);
         this.changed(task);
+        void this.refreshUsage(task);
         break;
       }
       case 'preparation_failed': {
@@ -1368,12 +1803,52 @@ export class TaskManager {
     if (clean) {
       this.locks.delete(key);
       await fs.rm(path.join(this.locksDir(), `${key}.json`), { force: true });
+      // Only a clean release may touch the worktree. A quarantined lock means a
+      // process of this run may still be able to write there, so the directory
+      // stays until the audited release path says otherwise.
+      if (run.worktree) await this.settleWorktree(task, run, run.worktree);
     } else {
       holder.quarantined = true;
       holder.quarantineNote = note;
       await writeFileAtomic(path.join(this.locksDir(), `${key}.json`), JSON.stringify(holder, null, 2));
+      if (run.worktree) {
+        await this.append(task, run.runId, 'worktree_retained', {
+          path: run.worktree.path,
+          reason: 'quarantine',
+          note: 'A trava do worktree ficou em quarentena; o diretório é preservado e não será reutilizado até a liberação explícita.',
+        });
+      }
     }
     run.writerLockKey = null;
+  }
+
+  /**
+   * Decides what happens to a worktree once its run released the lock cleanly.
+   *
+   * Uncommitted work is NEVER deleted. `commit` can never belong to Claude, so
+   * the normal end state of a successful run is exactly that: work sitting in
+   * the tree, waiting for the coordinator. Deleting it would destroy the
+   * deliverable, so a dirty tree is retained and reported, and only a tree git
+   * itself agrees is clean is removed.
+   */
+  private async settleWorktree(task: TaskState, run: RunState, plan: WorktreePlan): Promise<void> {
+    const dirty = await gitStatus(plan.path);
+    if (dirty.length > 0) {
+      await this.append(task, run.runId, 'worktree_retained', {
+        path: plan.path,
+        branch: plan.branch,
+        reason: 'uncommitted_work',
+        files: dirty.slice(0, 50),
+        note: 'Trabalho não commitado preservado: commit nunca pertence ao Claude, então este é o estado normal de uma execução bem-sucedida. Commite a partir deste caminho ou remova o worktree explicitamente.',
+      });
+      return;
+    }
+    const removal = await withRepositoryMutex(plan.repository.repoKey, () => removeWorktree(plan.repository, plan.path));
+    await this.append(task, run.runId, removal.removed ? 'worktree_removed' : 'worktree_retained', {
+      path: plan.path,
+      branch: plan.branch,
+      ...(removal.removed ? {} : { reason: 'git_refused', detail: removal.reason ?? null }),
+    });
   }
 
   /**
@@ -1432,7 +1907,8 @@ export class TaskManager {
     const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
     if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: 'run_ended', taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
     const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
-    const status = { ...derived.status, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
+    const llmUsage = this.usageView(task);
+    const status = { ...derived.status, llmUsage, telemetryFailures: task.run?.telemetryFailures ?? derived.status.telemetryFailures, requiresReview: derived.status.requiresReview || task.record.requiresReview };
     await writer.writeStatus(status);
     try {
       await writeFileAtomic(path.join(runDir, 'acompanhamento.txt'), derived.acompanhamento, { maxWaitMs: 1500 });
@@ -1441,7 +1917,7 @@ export class TaskManager {
     }
     if (final) {
       try {
-        const outcome = await writer.writeFinalResult({ ...derived.result, telemetryFailures: status.telemetryFailures });
+        const outcome = await writer.writeFinalResult({ ...derived.result, llmUsage, telemetryFailures: status.telemetryFailures });
         if (outcome.fallback) await this.append(task, runId, 'final_result_fallback', { path: outcome.path });
       } catch (error) {
         await this.append(task, runId, 'final_result_not_persisted', { code: (error as { code?: string }).code ?? 'FINAL_RESULT_NOT_PERSISTED', message: redactSensitiveText((error as Error).message).slice(0, 300) }).catch(() => undefined);
@@ -1455,12 +1931,27 @@ export class TaskManager {
 
   private superviseAll(): void {
     for (const task of this.tasks.values()) {
+      // Per task, because supervision runs on a timer over every task at once:
+      // without this, one task that throws stops the tick and silently blinds
+      // supervision for every other task in the broker — the failure mode being
+      // exactly the silence these alerts exist to break.
+      try {
+        this.superviseTask(task);
+      } catch (error) {
+        this.options.log(`supervisão falhou para ${task.record.taskId}: ${(error as Error).name}`);
+      }
+    }
+  }
+
+  private superviseTask(task: TaskState): void {
+    {
       const run = task.run;
-      if (!run || run.finalized) continue;
+      if (!run || run.finalized) return;
       const evaluation = evaluateSupervision({
         now: Date.now(),
         runStartedAt: Date.parse(run.startedAt),
         lastActivityAt: task.lastActivityAt,
+        oldestPendingRequestAt: oldestPendingAt(task),
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -1470,14 +1961,64 @@ export class TaskManager {
         thresholds: this.thresholds,
       });
       for (const alert of evaluation.alerts) {
+        // `decision_pending` repeats while it is still true, because the whole
+        // point is that nobody has answered yet: raising it once and going
+        // quiet again would reproduce the silence it exists to break. Every
+        // other alert stays one-shot.
+        if (alert === 'decision_pending') {
+          const now = Date.now();
+          const period = (this.options.supervision ?? SUPERVISION).decisionPendingMs;
+          if (task.lastDecisionAlertAt !== null && now - task.lastDecisionAlertAt < period) continue;
+          task.lastDecisionAlertAt = now;
+          task.alertsRaised.add(alert);
+          const oldest = oldestPendingAt(task);
+          void this.append(task, run.runId, 'alert', {
+            alert,
+            action: 'none',
+            pendingRequests: task.pending.size,
+            waitingForSeconds: oldest === null ? null : Math.round((now - oldest) / 1000),
+            note: 'Uma decisão pendente bloqueia o turno. Esperar não é ociosidade, mas também não é progresso: nada avança até alguém responder.',
+          }).then(() => this.changed(task));
+          continue;
+        }
         if (task.alertsRaised.has(alert)) continue;
         task.alertsRaised.add(alert);
         void this.append(task, run.runId, 'alert', { alert, action: 'none', note: 'Alerta de supervisão; nenhum encerramento automático.' }).then(() => this.changed(task));
+      }
+      // Answered: the alert stops being true, so it stops being reported and
+      // may fire again cleanly for the next decision.
+      if (task.pending.size === 0 && task.lastDecisionAlertAt !== null) {
+        task.lastDecisionAlertAt = null;
+        task.alertsRaised.delete('decision_pending');
       }
     }
   }
 
   // ------------------------------------------------------------------ views
+
+  usageView(task: TaskState): TaskView['usage'] {
+    return { claude: task.claudeUsage.snapshot(), codex: task.codexUsage };
+  }
+
+  async refreshUsage(task: TaskState, force = false): Promise<CodexUsageView> {
+    if (task.usageRefresh) return task.usageRefresh;
+    if (this.stopping) return task.codexUsage;
+    const pending = (async () => {
+      const snapshot = await this.codexUsage.refresh(task.record.threadId, { force });
+      if (this.stopping) return snapshot;
+      task.codexUsage = snapshot;
+      await this.append(task, task.run?.runId ?? 'none', 'codex_usage_observed', { snapshot });
+      this.changed(task);
+      if (task.run) await this.writeDerivedNow(task, task.run.runId, task.run.finalized);
+      return snapshot;
+    })().finally(() => { task.usageRefresh = null; });
+    task.usageRefresh = pending;
+    return pending;
+  }
+
+  refreshAllUsage(): void {
+    for (const task of this.tasks.values()) void this.refreshUsage(task);
+  }
 
   async changedFiles(task: TaskState): Promise<{ observed: string[]; claudeAuthored: string[]; observedAt: string | null }> {
     const workspace = task.record.workspace;
@@ -1499,6 +2040,7 @@ export class TaskManager {
       now,
       runStartedAt: run ? Date.parse(run.startedAt) : now,
       lastActivityAt: task.lastActivityAt,
+      oldestPendingRequestAt: oldestPendingAt(task),
       phase: run && run.finalizing && !run.finalized ? 'busy_model' : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)) || Boolean(run && run.finalizing && !run.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -1557,7 +2099,21 @@ export class TaskManager {
       pendingRequests: [...task.pending.values()],
       queue: task.queue.map((entry) => this.queueView(entry)),
       quota: task.quota ?? this.quota.view((run?.requestedModel as AuthorizedModel | undefined) ?? 'claude-fable-5-1'),
-      changedFiles: { observed: task.changedFilesCache?.observed ?? [], claudeAuthored: run ? [...run.claudeAuthored] : [], observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null },
+      usage: this.usageView(task),
+      // Relative, like changedFiles() already returns. They disagreed before —
+      // view() emitted absolute paths and only the single-task GET overwrote
+      // them — which a fleet of worktrees would have made unreadable: two
+      // absolute paths from two checkouts look nearly identical.
+      changedFiles: {
+        observed: task.changedFilesCache?.observed ?? [],
+        claudeAuthored: run && task.record.workspace
+          ? [...run.claudeAuthored].map((file) => path.relative(task.record.workspace as string, file).replace(/\\/g, '/')).filter((file) => file && !file.startsWith('..'))
+          : [],
+        observedAt: task.changedFilesCache ? new Date(task.changedFilesCache.at).toISOString() : null,
+      },
+      worktree: run?.worktree
+        ? { path: run.worktree.path, branch: run.worktree.branch, baseRef: run.worktree.baseRef, repoKey: run.worktree.repository.repoKey, declaredWorkspace: run.declaredWorkspace }
+        : null,
       reviewPending: true,
       createdAt: task.record.createdAt,
       updatedAt: task.updatedAt,
@@ -1621,6 +2177,22 @@ export class TaskManager {
   }
 }
 
+/** A plain object, for validating loosely typed request bodies. */
+/** When the oldest unanswered request arrived, for the decision alert. */
+function oldestPendingAt(task: TaskState): number | null {
+  let oldest: number | null = null;
+  for (const request of task.pending.values()) {
+    const at = Date.parse(request.createdAt);
+    if (Number.isNaN(at)) continue;
+    if (oldest === null || at < oldest) oldest = at;
+  }
+  return oldest;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function normalizeRecord(record: TaskRecord): TaskRecord {
   return {
     ...record,
@@ -1629,24 +2201,5 @@ function normalizeRecord(record: TaskRecord): TaskRecord {
   };
 }
 
-async function gitStatus(workspace: string): Promise<string[]> {
-  try {
-    await fs.access(path.join(workspace, '.git'));
-  } catch {
-    return [];
-  }
-  return new Promise((resolve) => {
-    const child = spawn('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: workspace, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
-    let stdout = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
-    const timer = setTimeout(() => { child.kill(); resolve([]); }, 5000);
-    child.on('error', () => { clearTimeout(timer); resolve([]); });
-    child.on('exit', () => {
-      clearTimeout(timer);
-      resolve(stdout.split('\n').map((line) => line.slice(3).trim()).filter(Boolean).slice(0, 500));
-    });
-  });
-}
 
 export { isHarness };

@@ -19,6 +19,7 @@ let broker: TestBroker;
 let workspace: string;
 
 const EXPECTED_TOOLS = [
+  'codeorquestra_annotate',
   'codeorquestra_answer',
   'codeorquestra_dashboard_url',
   'codeorquestra_end',
@@ -26,10 +27,12 @@ const EXPECTED_TOOLS = [
   'codeorquestra_inventory',
   'codeorquestra_list',
   'codeorquestra_message',
+  'codeorquestra_pair',
   'codeorquestra_set_model',
   'codeorquestra_start',
   'codeorquestra_status',
   'codeorquestra_trust',
+  'codeorquestra_usage_refresh',
   'codeorquestra_wait',
 ];
 
@@ -87,10 +90,10 @@ describe('stdio adapter', () => {
 
   test('start and dashboard links require a handle minted by the registration bootstrap, never a thread id argument', async () => {
     await withClient({ CODEX_THREAD_ID: 'thread-shared-server' }, async (client) => {
-      const noHandle = await client.callTool({ name: 'codeorquestra_start', arguments: { codexThreadId: 'thread-shared-server', job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
+      const noHandle = await client.callTool({ name: 'codeorquestra_start', arguments: { observation: { mode: 'voz' }, codexThreadId: 'thread-shared-server', job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
       assert.equal(noHandle.isError, true);
       assert.match(textOf(noHandle), /TASK_HANDLE_REQUIRED/);
-      const forged = await client.callTool({ name: 'codeorquestra_start', arguments: { taskHandle: 'x'.repeat(43), job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
+      const forged = await client.callTool({ name: 'codeorquestra_start', arguments: { observation: { mode: 'voz' }, taskHandle: 'x'.repeat(43), job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
       assert.equal(forged.isError, true);
       assert.match(textOf(forged), /TASK_HANDLE_INVALID/);
       const link = await client.callTool({ name: 'codeorquestra_dashboard_url', arguments: { taskHandle: 'x'.repeat(43) } }) as ToolResult;
@@ -105,7 +108,7 @@ describe('stdio adapter', () => {
     const other = await broker.api('/api/tasks/register', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ codexThreadId: 'thread-mcp-other', source: 'codex-thread' }) });
     const otherTask = other.body as { taskId: string; taskHandle: string };
     await withClient({}, async (client) => {
-      const started = await client.callTool({ name: 'codeorquestra_start', arguments: { taskHandle, job: jobV2(workspace, { prompt: script(['say: via mcp', 'sleep: 1500']), scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
+      const started = await client.callTool({ name: 'codeorquestra_start', arguments: { observation: { mode: 'voz' }, taskHandle, job: jobV2(workspace, { prompt: script(['say: via mcp', 'sleep: 1500']), scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
       assert.equal(started.isError ?? false, false, textOf(started));
       const startBody = parse(started) as { taskId: string; runId: string };
       assert.equal(startBody.taskId, taskId);
@@ -128,6 +131,9 @@ describe('stdio adapter', () => {
       assert.match(dashboard.url, /^http:\/\/127\.0\.0\.1:\d+\/bootstrap\?token=/);
       assert.equal(dashboard.scope, taskId, 'the MCP dashboard link is scoped to the task');
       assert.equal(dashboard.note, 'Link de uso único; abra no navegador desta máquina.');
+      const usage = parse(await client.callTool({ name: 'codeorquestra_usage_refresh', arguments: { taskHandle } })) as { usage: { quality: string; failure: { code: string } } };
+      assert.equal(usage.usage.quality, 'unavailable');
+      assert.equal(usage.usage.failure.code, 'CODEX_USAGE_DISABLED_IN_HARNESS');
       const foreign = await client.callTool({ name: 'codeorquestra_wait', arguments: { taskHandle: otherTask.taskHandle, cursor: 0, waitMs: 10 } }) as ToolResult;
       const foreignBody = parse(foreign) as { events: Array<{ taskId: string; type: string }> };
       assert.ok(foreignBody.events.length >= 1 && foreignBody.events.every((event) => event.taskId === otherTask.taskId), 'the other task handle only sees its own task');

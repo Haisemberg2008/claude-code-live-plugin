@@ -147,6 +147,11 @@ var RESERVED_RULES = [
   { pattern: /^git\b.*\bpush\b/i, reason: "RESERVED_OPERATION_PUSH" },
   { pattern: /^gh\s+pr\s+(create|merge|close|ready|edit|reopen)\b/i, reason: "RESERVED_OPERATION_PUSH" },
   { pattern: /^git\b.*\b(commit|merge|cherry-pick|revert)\b/i, reason: "RESERVED_OPERATION_COMMIT" },
+  // Provisioning a worktree is the broker's job, never the agent's: a checkout
+  // created behind our back carries no writer lock, no trust record and no
+  // entry in the orphan sweep. `git worktree list` is inspection and is left to
+  // INSPECTION_RULES below.
+  { pattern: /^git\s+worktree\s+(add|remove|move|prune|lock|unlock|repair)\b/i, reason: "RESERVED_OPERATION_WORKTREE" },
   { pattern: /^(npm|pnpm|yarn|bun)\s+(publish|deprecate|dist-tag|unpublish)\b/i, reason: "RESERVED_OPERATION_DEPLOY" },
   { pattern: /^(docker\s+push|kubectl\s+(apply|delete|rollout|scale)|terraform\s+(apply|destroy)|pulumi\s+(up|destroy)|firebase\s+deploy|vercel\b|netlify\s+deploy|gh\s+release\b|helm\s+(install|upgrade|uninstall)|twine\s+upload|cargo\s+publish|dotnet\s+nuget\s+push|az\s+\S+.*\bdeploy\b|aws\s+\S+.*\bdeploy\b|gcloud\s+\S+.*\bdeploy\b|fly\s+deploy|heroku\s+)/i, reason: "RESERVED_OPERATION_DEPLOY" },
   { pattern: /^(npm|pnpm|yarn|bun)\s+(i|install|add|uninstall|remove|update|link|rm|un)\b.*(\s|^)(-g|--global)\b/i, reason: "RESERVED_OPERATION_INSTALL" },
@@ -208,7 +213,7 @@ var DEPENDENCY_RULES = [
 ];
 var PROCESS_KILL_BROAD = /^(taskkill\b.*\/im\b|Stop-Process\b.*-Name\b|pkill\b|killall\b|Get-Process\b.*\|\s*Stop-Process)/i;
 var PROCESS_KILL = /^(taskkill|Stop-Process|kill|spps)\b/i;
-var GIT_STATE_RULES = /^git\s+(add|rm|mv|switch|checkout\s+(?![-.])|init|worktree|tag|notes|update-index|submodule|lfs)\b/i;
+var GIT_STATE_RULES = /^git\s+(add|rm|mv|switch|checkout\s+(?![-.])|init|tag|notes|update-index|submodule|lfs)\b/i;
 var ENV_DISCLOSURE = /^(env|printenv|set|Get-ChildItem\s+env:|gci\s+env:|ls\s+env:|dir\s+env:|\[Environment\]::GetEnvironmentVariables)\b/i;
 var INSPECTION_RULES = [
   /^git\s+(status|diff|log|show|blame|rev-parse|ls-files|describe|shortlog|cat-file|grep|reflog|stash\s+list|worktree\s+list|config\s+(--get|--list|-l)\b|branch(\s+(-a|-r|--list|-v|-vv|--show-current|--contains))*\s*$|remote(\s+-v)?\s*$)/i,
@@ -235,6 +240,8 @@ var MESSAGES = {
   RESERVED_OPERATION_PUSH: "Opera\xE7\xE3o reservada: push, abertura ou merge de PR pertencem ao Codex ou ao usu\xE1rio; o Claude n\xE3o pode execut\xE1-los.",
   RESERVED_OPERATION_COMMIT: "Opera\xE7\xE3o reservada: commit, merge e reescrita de hist\xF3rico pertencem ao Codex ou ao usu\xE1rio.",
   RESERVED_OPERATION_DEPLOY: "Opera\xE7\xE3o reservada: publica\xE7\xE3o e deploy s\xE3o muta\xE7\xF5es externas fora do escopo do Claude.",
+  RESERVED_OPERATION_WORKTREE: "Opera\xE7\xE3o reservada: criar, remover ou mover worktrees altera o reposit\xF3rio de forma persistente e \xE9 feito pelo broker, n\xE3o pelo Claude. Listar worktrees \xE9 permitido.",
+  GIT_ADMIN_AREA: "Escrita negada: o diret\xF3rio administrativo .git cont\xE9m hooks e refer\xEAncias que passam a valer no pr\xF3ximo commit, que n\xE3o pertence ao Claude.",
   RESERVED_OPERATION_INSTALL: "Opera\xE7\xE3o reservada: instala\xE7\xE3o global, de plugins ou de gerenciadores de pacotes altera a m\xE1quina e exige a\xE7\xE3o do Codex ou do usu\xE1rio.",
   RESERVED_OPERATION_CONFIG: "Opera\xE7\xE3o reservada: configura\xE7\xE3o instalada, autentica\xE7\xE3o e registro do sistema n\xE3o podem ser alterados pelo Claude.",
   SENSITIVE_FILE: "Arquivo sens\xEDvel bloqueado: credenciais, chaves, vari\xE1veis de ambiente ou configura\xE7\xE3o de autentica\xE7\xE3o n\xE3o s\xE3o lidos nem escritos.",
@@ -326,6 +333,10 @@ function isSensitivePath(candidate) {
   const text = candidate.replace(/["']/g, "");
   return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(text));
 }
+var GIT_ADMIN_SEGMENT = /(^|[\\/])\.git([\\/]|$)/i;
+function targetsGitAdminArea(candidate) {
+  return GIT_ADMIN_SEGMENT.test(candidate.replace(/["']/g, ""));
+}
 function capabilitiesOf(context) {
   if (context.capabilities) return context.capabilities;
   if (context.profile === "read") return { edit: false, test: false, commands: "none" };
@@ -387,6 +398,9 @@ function checkWriteTarget(target, context) {
   const resolved = resolveWorkspacePath(context.workspace, target);
   if (isSensitivePath(resolved.absolute)) return result("deny", "SENSITIVE_FILE", { path: target });
   if (isSensitivePath(resolved.resolved)) return result("deny", resolved.redirected ? "SENSITIVE_TARGET" : "SENSITIVE_FILE", { path: target, resolved: resolved.resolved });
+  if (targetsGitAdminArea(target) || targetsGitAdminArea(resolved.absolute) || targetsGitAdminArea(resolved.resolved)) {
+    return result("deny", "GIT_ADMIN_AREA", { path: target, ...resolved.redirected ? { resolved: resolved.resolved } : {} });
+  }
   if (!resolved.inside) return result("deny", "OUTSIDE_WORKSPACE", { path: target, ...resolved.redirected ? { resolved: resolved.resolved } : {} });
   if (!scopeContains(context, resolved.resolved)) return result("escalate", "OUTSIDE_SCOPE_PATH", { path: target, ...resolved.redirected ? { resolved: resolved.resolved } : {} });
   return null;
@@ -414,18 +428,18 @@ function stripEnvAssignments(segment) {
   return segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, "");
 }
 function tokens(segment) {
-  return segment.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^["']|["']$/g, "")) ?? [];
+  return segment.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token2) => token2.replace(/^["']|["']$/g, "")) ?? [];
 }
-function looksLikePath(token) {
-  if (/^[A-Za-z]:[\\/]/.test(token) || token.startsWith("\\\\") || token.includes("..")) return true;
-  if (token.startsWith("/")) return /^\/[^/]+\/.+/.test(token);
+function looksLikePath(token2) {
+  if (/^[A-Za-z]:[\\/]/.test(token2) || token2.startsWith("\\\\") || token2.includes("..")) return true;
+  if (token2.startsWith("/")) return /^\/[^/]+\/.+/.test(token2);
   return false;
 }
-function looksLikeFileReference(token) {
-  if (!token || token.startsWith("-")) return false;
-  if (looksLikePath(token)) return true;
-  if (token.startsWith("/")) return false;
-  return /[\\/]/.test(token) || /^\.[^\\/]+$/.test(token) || /\.[A-Za-z0-9]{1,8}$/.test(token);
+function looksLikeFileReference(token2) {
+  if (!token2 || token2.startsWith("-")) return false;
+  if (looksLikePath(token2)) return true;
+  if (token2.startsWith("/")) return false;
+  return /[\\/]/.test(token2) || /^\.[^\\/]+$/.test(token2) || /\.[A-Za-z0-9]{1,8}$/.test(token2);
 }
 var NPM_VALUE_OPTIONS = /* @__PURE__ */ new Set(["--prefix", "-C", "--workspace", "-w", "--loglevel", "--cache", "--userconfig", "--registry", "--script-shell"]);
 var NPM_FLAG_OPTIONS = /^(-s|-q|-d|-dd|-ddd|--silent|--quiet|--verbose|--no-audit|--no-fund|--ignore-scripts|--workspaces|--if-present|--json|--offline|--prefer-offline|--legacy-peer-deps|--no-save|--save-exact|--yes|-y|--no-progress|--foreground-scripts)$/i;
@@ -441,19 +455,19 @@ function normalizeCommandTokens(segmentTokens) {
     const valueOptions = isNpm ? NPM_VALUE_OPTIONS : GIT_VALUE_OPTIONS;
     const flagOptions = isNpm ? NPM_FLAG_OPTIONS : GIT_FLAG_OPTIONS;
     while (rest.length) {
-      const token = rest[0];
-      const eq = /^(--?[A-Za-z-]+)=(.*)$/.exec(token);
+      const token2 = rest[0];
+      const eq = /^(--?[A-Za-z-]+)=(.*)$/.exec(token2);
       if (eq && valueOptions.has(eq[1])) {
         if (["--prefix", "-C", "--git-dir", "--work-tree", "--cwd", "--workspace", "-w"].includes(eq[1])) declaredPaths.push(eq[2]);
         rest = rest.slice(1);
         continue;
       }
-      if (valueOptions.has(token)) {
-        if (["--prefix", "-C", "--git-dir", "--work-tree", "--workspace", "-w"].includes(token) && rest[1]) declaredPaths.push(rest[1]);
+      if (valueOptions.has(token2)) {
+        if (["--prefix", "-C", "--git-dir", "--work-tree", "--workspace", "-w"].includes(token2) && rest[1]) declaredPaths.push(rest[1]);
         rest = rest.slice(2);
         continue;
       }
-      if (flagOptions.test(token)) {
+      if (flagOptions.test(token2)) {
         rest = rest.slice(1);
         continue;
       }
@@ -465,11 +479,11 @@ function normalizeCommandTokens(segmentTokens) {
 function pathArguments(segmentTokens) {
   const found = [];
   for (let index = 1; index < segmentTokens.length; index += 1) {
-    const token = segmentTokens[index];
-    if ((token === "--cwd" || token === "-cwd" || token === "--dir" || token === "--WorkingDirectory") && index + 1 < segmentTokens.length) found.push(segmentTokens[index + 1]);
-    const eq = /^(--cwd|--dir)=(.+)$/.exec(token);
+    const token2 = segmentTokens[index];
+    if ((token2 === "--cwd" || token2 === "-cwd" || token2 === "--dir" || token2 === "--WorkingDirectory") && index + 1 < segmentTokens.length) found.push(segmentTokens[index + 1]);
+    const eq = /^(--cwd|--dir)=(.+)$/.exec(token2);
     if (eq) found.push(eq[2]);
-    if (looksLikePath(token) && !token.startsWith("-")) found.push(token);
+    if (looksLikePath(token2) && !token2.startsWith("-")) found.push(token2);
   }
   return found;
 }
@@ -487,16 +501,16 @@ function redirections(segment) {
   return { outputs, inputs };
 }
 function positionals(segmentTokens) {
-  return segmentTokens.slice(1).filter((token) => !token.startsWith("-") && !/^\/[^/]*$/.test(token));
+  return segmentTokens.slice(1).filter((token2) => !token2.startsWith("-") && !/^\/[^/]*$/.test(token2));
 }
 function optionWriteTargets(segmentTokens) {
   const command = (segmentTokens[0] ?? "").toLowerCase().replace(/\.(exe|cmd|bat)$/, "");
   const targets = [];
   const valueAfter = (flags) => {
     for (let index = 1; index < segmentTokens.length; index += 1) {
-      const token = segmentTokens[index];
-      if (flags.includes(token) && segmentTokens[index + 1]) targets.push(segmentTokens[index + 1]);
-      const eq = /^(--?[A-Za-z-]+)=(.+)$/.exec(token);
+      const token2 = segmentTokens[index];
+      if (flags.includes(token2) && segmentTokens[index + 1]) targets.push(segmentTokens[index + 1]);
+      const eq = /^(--?[A-Za-z-]+)=(.+)$/.exec(token2);
       if (eq && flags.includes(eq[1])) targets.push(eq[2]);
     }
   };
@@ -546,12 +560,12 @@ function optionWriteTargets(segmentTokens) {
       break;
     }
     case "sed":
-      if (segmentTokens.some((token) => /^-i/.test(token))) targets.push(...positionals(segmentTokens).filter((token) => !token.startsWith("s/")).slice(-1));
+      if (segmentTokens.some((token2) => /^-i/.test(token2))) targets.push(...positionals(segmentTokens).filter((token2) => !token2.startsWith("s/")).slice(-1));
       break;
     case "dd":
       valueAfter(["of"]);
-      for (const token of segmentTokens) {
-        const m = /^of=(.+)$/.exec(token);
+      for (const token2 of segmentTokens) {
+        const m = /^of=(.+)$/.exec(token2);
         if (m) targets.push(m[1]);
       }
       break;
@@ -564,7 +578,7 @@ function classifyCommandSegment(segment, context, whole) {
   const stripped = stripEnvAssignments(segment);
   const segmentTokens = tokens(stripped);
   if (segmentTokens.length === 0) return result("allow", "HARMLESS_COMMAND");
-  for (const token of segmentTokens) if (isSensitivePath(token)) return result("deny", "SENSITIVE_FILE", { token });
+  for (const token2 of segmentTokens) if (isSensitivePath(token2)) return result("deny", "SENSITIVE_FILE", { token: token2 });
   const { normalized, declaredPaths } = normalizeCommandTokens(segmentTokens);
   for (const rule of RESERVED_RULES) if (rule.pattern.test(stripped) || rule.pattern.test(normalized)) return result("deny", rule.reason, { command: stripped });
   for (const candidate of declaredPaths) {
@@ -586,9 +600,9 @@ function classifyCommandSegment(segment, context, whole) {
     if (problem) return problem;
   }
   for (let index = 1; index < segmentTokens.length; index += 1) {
-    const token = segmentTokens[index];
-    if (!looksLikeFileReference(token)) continue;
-    const problem = checkSensitiveTarget(context, token);
+    const token2 = segmentTokens[index];
+    if (!looksLikeFileReference(token2)) continue;
+    const problem = checkSensitiveTarget(context, token2);
     if (problem) return problem;
   }
   const base = normalized;
@@ -678,7 +692,7 @@ function classifyLegacy(action, context) {
   if (!allowedTools.has(action.tool)) return result("deny", "TOOL_NOT_IN_MODE", { tool: action.tool, mode });
   if (action.tool === "Bash") {
     const command = typeof action.input.command === "string" ? action.input.command : "";
-    for (const token of tokens(command)) if (isSensitivePath(token)) return result("deny", "SENSITIVE_FILE");
+    for (const token2 of tokens(command)) if (isSensitivePath(token2)) return result("deny", "SENSITIVE_FILE");
     const rule = `Bash(${command})`;
     return (context.legacyAllowedCommands ?? []).includes(rule) ? result("allow", "EXACT_ALLOWLIST") : result("deny", "NOT_IN_ALLOWLIST", { command });
   }
@@ -1084,9 +1098,9 @@ function identityFileFor(runDir) {
   return path2.join(runDir, "worker-identity.json");
 }
 var HOLD_HEARTBEAT_MS = 5e3;
-function claimWorkerIdentity(runDir, token) {
+function claimWorkerIdentity(runDir, token2) {
   mkdirSync(runDir, { recursive: true });
-  const identity = { pid: process.pid, startedAt: (/* @__PURE__ */ new Date()).toISOString(), token, createdAt: null };
+  const identity = { pid: process.pid, startedAt: (/* @__PURE__ */ new Date()).toISOString(), token: token2, createdAt: null };
   writeFileSync(identityFileFor(runDir), JSON.stringify(identity, null, 2), "utf8");
   const hold = holdFileFor(runDir);
   const descriptor2 = openSync(hold, "w");
@@ -1485,6 +1499,22 @@ var SessionClient = class {
     clearTimeout(timer);
   }
 };
+
+// src/usage/claude-usage.ts
+function token(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function sanitizeClaudeUsageReport(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const usage2 = value;
+  const report = {
+    input_tokens: token(usage2.input_tokens ?? usage2.inputTokens ?? usage2.input),
+    output_tokens: token(usage2.output_tokens ?? usage2.outputTokens ?? usage2.output),
+    cache_read_input_tokens: token(usage2.cache_read_input_tokens ?? usage2.cachedInputTokens ?? usage2.cacheRead),
+    cache_creation_input_tokens: token(usage2.cache_creation_input_tokens ?? usage2.cacheWriteInputTokens ?? usage2.cacheWrite)
+  };
+  return Object.values(report).some((item) => item !== null) ? report : null;
+}
 
 // src/worker/session.ts
 var STDERR_LIMIT = 16 * 1024;
@@ -2154,7 +2184,9 @@ var WorkerSession = class {
       truncated: preview.truncated,
       numTurns: typeof message.num_turns === "number" ? message.num_turns : null,
       durationMs: typeof message.duration_ms === "number" ? message.duration_ms : null,
-      tokens: usage2 ? { input: usage2.input_tokens ?? null, output: usage2.output_tokens ?? null } : null,
+      // Persist only the documented numeric counters. Missing fields remain
+      // absent so the meter can label a report as partial instead of zero.
+      usage: sanitizeClaudeUsageReport(usage2),
       permissionDenials: denials,
       terminalReason: typeof message.terminal_reason === "string" ? message.terminal_reason : null,
       errors: Array.isArray(message.errors) ? message.errors.map((error) => redactSensitiveText(String(error)).slice(0, 300)) : [],

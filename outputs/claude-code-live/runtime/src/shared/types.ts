@@ -101,6 +101,81 @@ export interface QuotaView {
   failure: null | { code: string; attemptedAt: string };
 }
 
+export type UsageQuality = 'reported' | 'estimated' | 'partial' | 'unavailable';
+
+export interface ClaudeModelUsage {
+  model: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  totalInputTokens: number;
+  totalObservedTokens: number;
+  quality: 'reported' | 'partial';
+}
+
+export interface ClaudeUsageView {
+  quality: 'reported' | 'partial' | 'unavailable';
+  observedAt: string | null;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  totalInputTokens: number;
+  totalObservedTokens: number;
+  byModel: ClaudeModelUsage[];
+}
+
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  remainingPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+export interface CodexRateLimitBucket {
+  id: string;
+  name: string | null;
+  planType: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+}
+
+export interface CodexUsageView {
+  quality: 'reported' | 'partial' | 'unavailable';
+  queriedAt: string | null;
+  limits: { quality: 'reported' | 'partial' | 'unavailable'; buckets: CodexRateLimitBucket[] };
+  activity: {
+    quality: 'reported' | 'partial' | 'unavailable';
+    lifetimeTokens: number | null;
+    peakDailyTokens: number | null;
+    longestRunningTurnSec: number | null;
+    currentStreakDays: number | null;
+    longestStreakDays: number | null;
+    daily: Array<{ startDate: string; tokens: number }>;
+  };
+  task: {
+    quality: 'estimated' | 'partial' | 'unavailable';
+    groups: Array<{
+      model: string | null;
+      reasoningEffort: string | null;
+      inputTokens: number | null;
+      cachedInputTokens: number | null;
+      netNewInputTokens: number | null;
+      outputTokens: number | null;
+      totalTokens: number | null;
+    }>;
+  };
+  failure: { code: string } | null;
+}
+
+export interface HybridUsageView {
+  claude: ClaudeUsageView;
+  codex: CodexUsageView;
+}
+
 export interface RunView {
   runId: string;
   status: RunStatus;
@@ -144,7 +219,10 @@ export interface TaskView {
   pendingRequests: PendingRequestView[];
   queue: QueueEntryView[];
   quota: QuotaView;
+  usage: HybridUsageView;
   changedFiles: { observed: string[]; claudeAuthored: string[]; observedAt: string | null };
+  /** Set when the run executes in a provisioned worktree instead of the declared checkout. */
+  worktree: { path: string; branch: string; baseRef: string | null; repoKey: string; declaredWorkspace: string | null } | null;
   reviewPending: boolean;
   createdAt: string;
   updatedAt: string;

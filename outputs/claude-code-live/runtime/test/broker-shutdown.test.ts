@@ -30,6 +30,7 @@ test('shutdown cancels an admitted preparation before spawning or releasing work
       body: JSON.stringify({
         taskHandle,
         job: jobV2(workspace, { prompt: 'say: este turno nunca deve iniciar', scope: { summary: 'src', paths: ['src/'] } }),
+        observation: { mode: 'voz' },
         harness: { preparationDelayMs: 750 },
       }),
     });
