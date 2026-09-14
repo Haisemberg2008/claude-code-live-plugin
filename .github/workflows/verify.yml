@@ -52,11 +52,29 @@ jobs:
         shell: bash
         run: |
           git add --renormalize dist
-          if ! git diff --cached --quiet -- dist; then
+          # build-info.json carries `builtWithNode`, which records the
+          # environment that produced the bundle, not the source. A different
+          # Node patch on the runner than on a developer machine is provenance,
+          # not drift — so that one file is excluded here and compared field by
+          # field below, rather than weakening the check or dropping the field.
+          if ! git diff --cached --quiet -- dist ':!dist/build-info.json'; then
             echo "::error::dist/ nao corresponde ao src/ commitado. Rode 'npm run build' e commite o dist/ atualizado."
             git diff --cached --stat -- dist
             exit 1
           fi
+          node -e "
+            const { execSync } = require('node:child_process');
+            const committed = JSON.parse(execSync('git show HEAD:outputs/claude-code-live/runtime/dist/build-info.json', { encoding: 'utf8' }));
+            const built = JSON.parse(require('node:fs').readFileSync('dist/build-info.json', 'utf8'));
+            const environmental = ['builtWithNode'];
+            for (const field of environmental) { delete committed[field]; delete built[field]; }
+            if (JSON.stringify(committed) !== JSON.stringify(built)) {
+              console.error('::error::build-info.json divergiu em algo que nao e do ambiente (versoes de dependencia, entrypoints ou pacotes empacotados).');
+              console.error('commitado:', JSON.stringify(committed));
+              console.error('construido:', JSON.stringify(built));
+              process.exit(1);
+            }
+          "
           echo "dist/ esta em sincronia com src/."
 
       - name: test
