@@ -147,6 +147,13 @@ export interface TaskState {
   pending: Map<string, PendingRequestView>;
   resolvedRequests: Set<string>;
   alertsRaised: Set<string>;
+  /**
+   * This run's events, kept as they are appended so the derived files can be
+   * rebuilt without re-reading the whole log. Scoped to one runId and only
+   * trusted for that one; anything else falls back to the log, which remains
+   * the source of truth.
+   */
+  derivedCache: { runId: string; events: EventRecord[] } | null;
   /** Last time the still-blocking decision alert was raised; null when none is pending. */
   lastDecisionAlertAt: number | null;
   uncertain: boolean;
@@ -494,6 +501,7 @@ export class TaskManager {
       pending: new Map(),
       resolvedRequests: new Set(),
       alertsRaised: new Set(),
+      derivedCache: null,
       lastDecisionAlertAt: null,
       uncertain: record.requiresReview,
       disconnected: false,
@@ -755,6 +763,7 @@ export class TaskManager {
       const record = await task.log.append({ type, taskId: task.record.taskId, runId, threadId: task.record.threadId, ...(toolUseId ? { toolUseId } : {}), data, gseq });
       task.lastActivityAt = Date.now();
       task.derivedDirty = true;
+      if (task.derivedCache?.runId === runId) task.derivedCache.events.push(record);
       task.updatedAt = record.ts;
       this.options.onEvent(record);
       return record;
@@ -1140,6 +1149,7 @@ export class TaskManager {
     task.currentTool = null;
     task.alertsRaised.clear();
     task.lastDecisionAlertAt = null;
+    task.derivedCache = { runId, events: [] };
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
@@ -1904,7 +1914,12 @@ export class TaskManager {
     const writer = task.writer && task.writer.directory === runDir
       ? task.writer
       : new StateWriter({ directory: runDir, telemetryMaxWaitMs: 1500, finalMaxWaitMs: 15000, onTelemetryFailure: (failure) => { if (task.run) { task.run.telemetryFailures += 1; void this.reportTelemetryFailure(task, task.run, failure.file, failure.code); } } });
-    const events = (await task.log.readFrom(0)).filter((event) => event.runId === runId);
+    // Reading the whole log here ran once per second per active run, so its
+    // cost grew with the number of events the run had produced. The cache makes
+    // the common path O(1); memory is bounded to one run's events, which this
+    // function already materialized on every call anyway.
+    const cached = task.derivedCache?.runId === runId ? task.derivedCache.events : null;
+    const events = cached ? [...cached] : (await task.log.readFrom(0)).filter((event) => event.runId === runId);
     if (terminal) events.push({ seq: (events.at(-1)?.seq ?? 0) + 1, ts: terminal.endedAt, type: 'run_ended', taskId: task.record.taskId, runId, threadId: task.record.threadId, data: terminal });
     const derived = deriveCompatibilityFiles(events, { processAlive: Boolean(task.worker) });
     const llmUsage = this.usageView(task);
@@ -1924,6 +1939,7 @@ export class TaskManager {
         this.options.log(`task ${task.record.taskId}: resultado final NÃO persistido (${(error as { code?: string }).code ?? 'erro'})`);
         throw error;
       }
+      if (task.derivedCache?.runId === runId) task.derivedCache = null;
     }
   }
 
