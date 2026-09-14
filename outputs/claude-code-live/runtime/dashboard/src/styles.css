@@ -1,9 +1,15 @@
+/* Dark only, and deliberately: this is a control panel that sits beside a
+   terminal, read in long sessions, and every colour below is chosen against
+   this ground. It paints its own background rather than borrowing one, so it
+   never renders half-themed. A light palette would be a second design, not a
+   token swap. */
 :root {
+  color-scheme: dark;
   --bg: #10131b;
   --surface: #171b26;
   --surface-2: #1d2230;
   --border: #262c3a;
-  --text: #f3efe6;
+  --text: #e7eaf2;
   --muted: #8f9bb3;
   --accent: #8b5cf6;
   --accent-soft: rgba(139, 92, 246, 0.18);
@@ -100,9 +106,13 @@ dd.wrap, li.wrap { overflow-wrap: anywhere; }
 .room-header { padding: 14px 20px 10px; border-bottom: 1px solid var(--border); }
 .room-title { font-size: 26px; font-family: var(--mono); }
 .room-sub { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
-.feed { flex: 1; min-height: 0; overflow: auto; padding: 12px 20px; display: flex; flex-direction: column; gap: 10px; font-size: 16px; }
+.feed { flex: 1; min-height: 0; overflow: auto; padding: 12px 20px; display: flex; flex-direction: column; gap: 6px; font-size: 15px; }
 .load-older { align-self: center; }
-.row { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: var(--surface); }
+/* Not a card. With hundreds of events, giving every entry a border, a radius
+   and a fill flattens the hierarchy: the message, the tool call and the
+   decision all look equally important, and none of them look urgent. */
+.row { border: 0; border-radius: 0; padding: 6px 0 6px 12px; background: none; }
+.row.message { border-left: 3px solid var(--border); }
 .row-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; font-size: 13px; }
 .author { font-weight: 600; }
 .time { color: var(--muted); font-size: 12px; margin-left: auto; }
@@ -110,15 +120,16 @@ dd.wrap, li.wrap { overflow-wrap: anywhere; }
 .origin-codex { color: var(--codex); background: var(--codex-soft); }
 .origin-claude { color: var(--claude); background: var(--claude-soft); }
 .origin-tool { color: var(--tool); background: var(--tool-soft); }
-.row.message.actor-codex { border-left: 4px solid var(--codex); background: var(--codex-soft); }
-.row.message.actor-claude { border-left: 4px solid var(--claude); background: var(--claude-soft); }
+.row.message.actor-codex { border-left: 3px solid var(--codex); }
+.row.message.actor-claude { border-left: 3px solid var(--claude); }
 .row.message.live { border-style: dashed; opacity: 0.9; }
-.row.tool { border-left: 4px solid var(--tool); background: var(--tool-soft); font-size: 14px; }
-.row.tool.error { border-color: rgba(224, 87, 79, 0.5); }
-.row.tool.blocked { border-color: rgba(224, 168, 58, 0.5); }
+.row.tool { border-left: 3px solid var(--tool); font-size: 13.5px; padding-top: 3px; padding-bottom: 3px; }
+.row.tool .row-head { margin-bottom: 0; }
+.row.tool.error { border-left-color: var(--error); }
+.row.tool.blocked { border-left-color: var(--warn); }
 .tool-details { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .tool-details h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; }
-.row.decision { border-color: var(--warn); background: rgba(224, 168, 58, 0.06); font-size: 14px; }
+.row.decision { border: 1px solid var(--warn); border-radius: var(--radius); background: rgba(224, 168, 58, 0.06); padding: 10px 12px; font-size: 14px; }
 /* The one row that stops work. It is the brightest thing in the feed on
    purpose: everything else can be read later, this cannot. */
 .row.decision.pending {
@@ -131,7 +142,7 @@ dd.wrap, li.wrap { overflow-wrap: anywhere; }
 }
 .row.decision.pending .row-head .author { font-weight: 700; }
 /* Resolved, it stops competing: the answer is history like everything else. */
-.row.decision.resolved { border-color: var(--border); background: var(--surface); box-shadow: none; }
+.row.decision.resolved { border: 1px solid var(--border); background: none; box-shadow: none; }
 
 /* Stays visible when the feed has scrolled past the request, because a blocked
    turn that scrolled out of view is exactly the silence this is here to break. */

@@ -36,6 +36,20 @@ const OUTCOME_LABELS: Record<string, string> = {
   TIMEOUT: 'Tempo esgotado',
 };
 
+/**
+ * A tool name short enough for a one-line notice.
+ *
+ * `tool` is whatever the CLI reported, which is not always a bare name: an
+ * unclassified action can arrive carrying its whole serialized input. The
+ * notice has to stay one line, so it takes the first token and bounds it; the
+ * decision card below shows the full request.
+ */
+function toolLabel(tool: string): string {
+  const first = tool.trim().split(/[\s({[]/, 1)[0] ?? tool;
+  const name = first.replace(/["',]/g, '') || tool;
+  return name.length > 32 ? `${name.slice(0, 32)}…` : name;
+}
+
 function formatElapsed(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -410,7 +424,7 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
         <div className="blocking" role="status" data-testid="blocking-notice">
           <span className="blocking-what">
             {task.pendingRequests.length === 1
-              ? (task.pendingRequests[0]!.kind === 'question' ? 'Claude fez uma pergunta e está parado.' : `Claude pediu permissão para ${task.pendingRequests[0]!.tool} e está parado.`)
+              ? (task.pendingRequests[0]!.kind === 'question' ? 'Claude fez uma pergunta e está parado.' : `Claude pediu permissão para ${toolLabel(task.pendingRequests[0]!.tool)} e está parado.`)
               : `${task.pendingRequests.length} decisões pendentes. Nada avança até serem respondidas.`}
           </span>
           <button type="button" className="blocking-go" data-testid="blocking-go" onClick={() => {
