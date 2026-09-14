@@ -1912,8 +1912,18 @@ async function readIf(file) {
     return null;
   }
 }
+function realpathOrResolve(target) {
+  try {
+    return realpathNative(target);
+  } catch {
+    return path6.resolve(target);
+  }
+}
 function rel(root, file) {
-  return path6.relative(root, file).replace(/\\/g, "/");
+  const relative = path6.relative(root, file).replace(/\\/g, "/");
+  if (!relative.startsWith("../")) return relative;
+  const retried = path6.relative(realpathOrResolve(root), realpathOrResolve(file)).replace(/\\/g, "/");
+  return retried.startsWith("../") ? relative : retried;
 }
 function mcpDetails(config) {
   const url = typeof config.url === "string" ? config.url : null;
@@ -2158,7 +2168,7 @@ async function collectChildren(collector, workspace, workspaceCanonical, dir, de
   }
 }
 async function inventoryCustomizations(workspace, options = {}) {
-  const resolved = path6.resolve(workspace);
+  const resolved = realpathOrResolve(workspace);
   const canonicalWorkspace = canonicalizeWorkspace(resolved);
   const collector = { items: [], skipped: [], incomplete: false, configs: {} };
   const toRel = (file) => rel(resolved, file);

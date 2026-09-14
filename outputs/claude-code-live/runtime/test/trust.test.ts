@@ -134,6 +134,26 @@ describe('inventoryCustomizations', () => {
     assert.deepEqual(inventory.managedSettings, { candidates: [managedCandidate], present: false, note: MANAGED_SETTINGS_NOTE });
   });
 
+  test('no item is keyed by a path that climbs out of the workspace', async () => {
+    // A relativePath is the key a trust approval is stored under, so one that
+    // escapes the workspace is not cosmetic. This reproduces environment-wise
+    // what a Windows 8.3 short name does: the caller spells the root one way
+    // while a hook entrypoint arrives realpathed the other way.
+    const inventory = await inventoryCustomizations(workspace, options);
+    for (const item of inventory.items) {
+      assert.ok(!path.isAbsolute(item.relativePath), item.relativePath);
+      const climbs = item.relativePath.split('/').filter((segment) => segment === '..').length;
+      if (item.scope === 'ancestor') {
+        // Ancestor resources really do sit above the workspace; one level in
+        // this fixture. What must never happen is a climb past the boundary.
+        assert.ok(climbs <= 1, `${item.scope}:${item.relativePath}`);
+      } else {
+        assert.equal(climbs, 0, `${item.kind}:${item.scope}:${item.relativePath}`);
+      }
+    }
+    assert.ok(inventory.items.some((item) => item.kind === 'hook'), 'o inventário precisa conter um hook para este caso valer');
+  });
+
   test('a junction pointing outside the workspace is skipped, not inventoried as a child', async (t) => {
     if (!junctionOk) { t.skip('junction unsupported on this filesystem'); return; }
     const inventory = await inventoryCustomizations(workspace, options);
