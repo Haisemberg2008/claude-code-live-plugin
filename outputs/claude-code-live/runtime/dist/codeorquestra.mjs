@@ -724,6 +724,20 @@ data: ${JSON.stringify({ reason: "REPLAY_BUFFER_OVERFLOW", from: null, epoch: op
     client.bufferedBytes = 0;
     return client;
   }
+  /**
+   * How many live subscribers would receive this task's events.
+   *
+   * Attachment is not attention: a background tab, a reconnect still pending, a
+   * curl that never closed its connection all count. This proves a channel
+   * exists and nothing more, which is the most any broker can actually verify —
+   * so the text built on it must say "um canal está anexado", never "alguém
+   * está olhando".
+   */
+  observerCount(taskId) {
+    let total = 0;
+    for (const client of this.clients) if (this.visible(client, taskId)) total += 1;
+    return total;
+  }
   visible(client, taskId) {
     if (client.taskScope && client.taskScope !== taskId) return false;
     if (client.taskId && client.taskId !== taskId) return false;
@@ -4613,7 +4627,7 @@ var TaskManager = class {
    * Reserves the task slot and the checkout writer lock synchronously, before
    * any awaited preparation, so two concurrent starts can never both proceed.
    */
-  async startRun(task, job, harness, source, acknowledgeReview) {
+  async startRun(task, job, harness, source, acknowledgeReview, observation) {
     let contract;
     try {
       contract = resolveJobContract(job);
@@ -4622,6 +4636,7 @@ var TaskManager = class {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, "LEGACY_CONTRACT_USE_LEGACY_RUNNER", { message: "Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2." });
+    this.assertObserved(task, observation);
     if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker est\xE1 encerrando; nenhuma execu\xE7\xE3o nova \xE9 aceita." });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
       throw new HttpError(409, "REQUIRES_REVIEW", { message: "A \xFAltima execu\xE7\xE3o ficou incerta ou desconectada; confirme a revis\xE3o (acknowledgeReview: true) antes de iniciar outra.", reason: task.record.reviewReason });
@@ -4753,6 +4768,9 @@ var TaskManager = class {
         modelReason: run2.modelReason,
         effort: contract.effort,
         workspace: effectiveWorkspace,
+        // Recorded so an audit of status.json can see a run that started with
+        // no panel attached, and which channel was declared instead.
+        observation: { mode: isRecord(observation) && observation.mode === "voz" ? "voz" : "painel", observers: this.options.observers?.(task.record.taskId) ?? 0 },
         ...worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: "broker", policyEnabledAt: worktreePlan.policy.enabledAt } } : {},
         profile: contract.profile,
         contractVersion: contract.version,
@@ -4778,6 +4796,34 @@ var TaskManager = class {
       await this.releaseReservation(task, run2);
       throw error;
     }
+  }
+  /**
+   * A run never starts without a declared channel for watching it.
+   *
+   * Commit 0988ebb added this requirement, but only to the v1 runner, where
+   * `Wait-ClaudeLivePanelReady` really blocks. In v2 it existed solely as prose
+   * in SKILL.md and two READMEs telling the coordinator to confirm the panel —
+   * an instruction to a model, not an invariant, and therefore the only place
+   * in this codebase where the documentation promised more than the code did.
+   *
+   * The property worth keeping is not "a tab is on screen", which no broker can
+   * verify. It is that the mode of observation is DECIDED before work starts
+   * and recorded durably. `painel` is now actually checked against live SSE
+   * subscribers; `voz` is an explicit, attributable choice for a coordinator
+   * with no screen. What can no longer happen is a run starting with neither.
+   *
+   * Deliberately understated: a subscriber count proves a channel is attached,
+   * not that a human is watching.
+   */
+  assertObserved(task, observation) {
+    const mode = isRecord(observation) && observation.mode === "voz" ? "voz" : "painel";
+    if (mode === "voz") return;
+    const observers = this.options.observers?.(task.record.taskId) ?? 0;
+    if (observers > 0) return;
+    throw new HttpError(409, "OBSERVATION_REQUIRED", {
+      message: 'Nenhum painel est\xE1 acompanhando esta tarefa. Abra o link do painel e aguarde ele carregar, ou declare observa\xE7\xE3o por voz (observation.mode: "voz") para assumir o acompanhamento narrado.',
+      note: "A contagem prova que um canal est\xE1 anexado, n\xE3o que algu\xE9m est\xE1 olhando."
+    });
   }
   /**
    * Decides where a worktree run will live, and whether it may start at all.
@@ -5572,6 +5618,9 @@ var TaskManager = class {
     return { events: collected, gapped };
   }
 };
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 function normalizeRecord(record2) {
   return {
     ...record2,
@@ -5834,6 +5883,7 @@ var Broker = class {
       stateRoot: options.stateRoot,
       log: (line) => this.log(line),
       onEvent: (event) => this.hub.broadcastEvent(event),
+      observers: (taskId) => this.hub.observerCount(taskId),
       onTaskChanged: (view) => this.hub.broadcastTask(view),
       onTransient: (frame) => this.hub.broadcastTransient(frame),
       harness: options.harness,
@@ -6073,7 +6123,7 @@ var Broker = class {
         const resolved = this.tasks.resolveHandle(body.taskHandle);
         if (resolved !== task) throw new HttpError(403, "TASK_HANDLE_MISMATCH");
         const harness = this.options.harness && body.harness && typeof body.harness === "object" ? body.harness : null;
-        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true);
+        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true, body.observation);
         return sendJson(res, 202, result);
       }
       if (action === "events" && method === "GET") {

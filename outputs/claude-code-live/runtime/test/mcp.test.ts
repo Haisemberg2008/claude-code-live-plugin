@@ -89,10 +89,10 @@ describe('stdio adapter', () => {
 
   test('start and dashboard links require a handle minted by the registration bootstrap, never a thread id argument', async () => {
     await withClient({ CODEX_THREAD_ID: 'thread-shared-server' }, async (client) => {
-      const noHandle = await client.callTool({ name: 'codeorquestra_start', arguments: { codexThreadId: 'thread-shared-server', job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
+      const noHandle = await client.callTool({ name: 'codeorquestra_start', arguments: { observation: { mode: 'voz' }, codexThreadId: 'thread-shared-server', job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
       assert.equal(noHandle.isError, true);
       assert.match(textOf(noHandle), /TASK_HANDLE_REQUIRED/);
-      const forged = await client.callTool({ name: 'codeorquestra_start', arguments: { taskHandle: 'x'.repeat(43), job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
+      const forged = await client.callTool({ name: 'codeorquestra_start', arguments: { observation: { mode: 'voz' }, taskHandle: 'x'.repeat(43), job: jobV2(workspace, { prompt: 'say: oi', scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
       assert.equal(forged.isError, true);
       assert.match(textOf(forged), /TASK_HANDLE_INVALID/);
       const link = await client.callTool({ name: 'codeorquestra_dashboard_url', arguments: { taskHandle: 'x'.repeat(43) } }) as ToolResult;
@@ -107,7 +107,7 @@ describe('stdio adapter', () => {
     const other = await broker.api('/api/tasks/register', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ codexThreadId: 'thread-mcp-other', source: 'codex-thread' }) });
     const otherTask = other.body as { taskId: string; taskHandle: string };
     await withClient({}, async (client) => {
-      const started = await client.callTool({ name: 'codeorquestra_start', arguments: { taskHandle, job: jobV2(workspace, { prompt: script(['say: via mcp', 'sleep: 1500']), scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
+      const started = await client.callTool({ name: 'codeorquestra_start', arguments: { observation: { mode: 'voz' }, taskHandle, job: jobV2(workspace, { prompt: script(['say: via mcp', 'sleep: 1500']), scope: { summary: 's', paths: ['src/'] } }) } }) as ToolResult;
       assert.equal(started.isError ?? false, false, textOf(started));
       const startBody = parse(started) as { taskId: string; runId: string };
       assert.equal(startBody.taskId, taskId);

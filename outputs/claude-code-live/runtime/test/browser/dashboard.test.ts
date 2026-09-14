@@ -60,7 +60,7 @@ async function register(threadId: string): Promise<{ taskId: string; taskHandle:
 }
 
 async function startRun(taskId: string, taskHandle: string, prompt: string): Promise<string> {
-  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: jobV2(workspace, { prompt, scope: { summary: 's', paths: ['src/'] } }) }) });
+  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: jobV2(workspace, { prompt, scope: { summary: 's', paths: ['src/'] } }), observation: { mode: 'voz' } }) });
   assert.equal(response.status, 202, response.text);
   return (response.body as { runId: string }).runId;
 }

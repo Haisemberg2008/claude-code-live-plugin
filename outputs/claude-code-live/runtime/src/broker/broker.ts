@@ -64,6 +64,7 @@ export class Broker {
       stateRoot: options.stateRoot,
       log: (line) => this.log(line),
       onEvent: (event) => this.hub.broadcastEvent(event),
+      observers: (taskId) => this.hub.observerCount(taskId),
       onTaskChanged: (view) => this.hub.broadcastTask(view),
       onTransient: (frame) => this.hub.broadcastTransient(frame),
       harness: options.harness,
@@ -330,7 +331,7 @@ export class Broker {
         const resolved = this.tasks.resolveHandle(body.taskHandle);
         if (resolved !== task) throw new HttpError(403, 'TASK_HANDLE_MISMATCH');
         const harness = this.options.harness && body.harness && typeof body.harness === 'object' ? (body.harness as Record<string, unknown>) : null;
-        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true);
+        const result = await this.tasks.startRun(task, body.job, harness, identity.source, body.acknowledgeReview === true, body.observation);
         return sendJson(res, 202, result);
       }
       if (action === 'events' && method === 'GET') {

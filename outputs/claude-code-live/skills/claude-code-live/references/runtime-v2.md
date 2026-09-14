@@ -75,7 +75,7 @@ A presenca do coordenador vem de `codeorquestra_wait` e do heartbeat reais. Sem 
 
 ## Ordem obrigatoria de abertura
 
-Uma execucao v2 segue esta ordem: registrar a tarefa, gerar o link limitado com `codeorquestra_dashboard_url`, abrir ou reutilizar uma unica aba no navegador integrado, confirmar no estado visivel o titulo CodeOrquestra e a tarefa atual listada ou selecionada, e somente entao chamar `codeorquestra_start`. Falha ao abrir ou confirmar o painel bloqueia o inicio; a execucao nao deve acontecer silenciosamente. Nao combine mecanismos de abertura em paralelo ou como fallback imediato, pois uma solicitacao ainda pendente pode criar uma aba duplicada.
+Uma execucao v2 exige um canal de acompanhamento **declarado**, e o broker verifica. Com `observation.mode: "painel"` (padrao), registre a tarefa, gere o link limitado com `codeorquestra_dashboard_url`, abra ou reutilize uma unica aba e so entao chame `codeorquestra_start`: sem assinante do fluxo de eventos daquela tarefa, o inicio e recusado com `OBSERVATION_REQUIRED`. Com `observation.mode: "voz"`, o coordenador assume explicitamente o acompanhamento narrado; a escolha fica registrada em `run_started`. Nao combine mecanismos de abertura em paralelo ou como fallback imediato, pois uma solicitacao ainda pendente pode criar uma aba duplicada. O limite, dito sem exagero: a contagem prova que um canal esta anexado, nao que alguem esta olhando.
 
 ## Contrato de job v2
 

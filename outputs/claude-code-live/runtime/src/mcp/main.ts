@@ -114,10 +114,10 @@ server.registerTool('codeorquestra_status', { description: 'Saúde do broker loc
   return { status: health.status, body: { broker: { ...(health.body as object), tagline: BRAND.tagline, version: RUNTIME_VERSION }, tasks: [] } };
 }));
 
-server.registerTool('codeorquestra_start', { description: 'Inicia uma execução v2 na tarefa identificada pelo handle. O job segue o contrato v2 (contractVersion: 2).', inputSchema: { taskHandle: handle.optional(), job: z.record(z.string(), z.unknown()), acknowledgeReview: z.boolean().optional(), codexThreadId: z.string().optional().describe('Ignorado: nunca autoriza; use taskHandle.') } }, async ({ taskHandle, job, acknowledgeReview }) => guarded(async () => {
+server.registerTool('codeorquestra_start', { description: 'Inicia uma execução v2 na tarefa identificada pelo handle. O job segue o contrato v2 (contractVersion: 2).', inputSchema: { taskHandle: handle.optional(), job: z.record(z.string(), z.unknown()), acknowledgeReview: z.boolean().optional(), observation: z.object({ mode: z.enum(['painel', 'voz']) }).optional().describe('Canal de acompanhamento. "painel" (padrao) exige uma aba do painel assinando os eventos desta tarefa; "voz" assume o acompanhamento narrado pelo coordenador.'), codexThreadId: z.string().optional().describe('Ignorado: nunca autoriza; use taskHandle.') } }, async ({ taskHandle, job, acknowledgeReview, observation }) => guarded(async () => {
   if (!taskHandle) return { status: 403, body: { error: 'TASK_HANDLE_REQUIRED', note: 'codexThreadId não é aceito como autorização; registre a tarefa no terminal com "codeorquestra task register".' } };
   const taskId = await taskIdFor(taskHandle);
-  const result = await call('POST', `/api/tasks/${taskId}/runs`, { taskHandle, job, ...(acknowledgeReview ? { acknowledgeReview: true } : {}) });
+  const result = await call('POST', `/api/tasks/${taskId}/runs`, { taskHandle, job, ...(acknowledgeReview ? { acknowledgeReview: true } : {}), ...(observation ? { observation } : {}) });
   return { status: result.status, body: { taskId, ...(result.body as object) } };
 }));
 

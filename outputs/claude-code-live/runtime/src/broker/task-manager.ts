@@ -172,6 +172,8 @@ export interface TaskManagerOptions {
   supervision?: SupervisionThresholds;
   harness: boolean;
   quotaWaitMs?: number;
+  /** How many live subscribers can see a task; supplied by the SSE hub. */
+  observers?: (taskId: string) => number;
   /** Harness-only scheduling seam used to prove recovery cancellation. */
   recoveryCheckpoint?: () => Promise<void>;
   /** Test seam; production uses one read-only App Server connection. */
@@ -1010,7 +1012,7 @@ export class TaskManager {
    * Reserves the task slot and the checkout writer lock synchronously, before
    * any awaited preparation, so two concurrent starts can never both proceed.
    */
-  async startRun(task: TaskState, job: unknown, harness: Record<string, unknown> | null, source: ActionSource, acknowledgeReview: boolean): Promise<{ runId: string; status: 'STARTING' }> {
+  async startRun(task: TaskState, job: unknown, harness: Record<string, unknown> | null, source: ActionSource, acknowledgeReview: boolean, observation?: unknown): Promise<{ runId: string; status: 'STARTING' }> {
     let contract: JobContract;
     try {
       contract = resolveJobContract(job);
@@ -1019,6 +1021,7 @@ export class TaskManager {
       throw error;
     }
     if (contract.version !== 2) throw new HttpError(409, 'LEGACY_CONTRACT_USE_LEGACY_RUNNER', { message: 'Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2.' });
+    this.assertObserved(task, observation);
     // Admission stops the moment shutdown begins, before any reservation.
     if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker está encerrando; nenhuma execução nova é aceita.' });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
@@ -1177,6 +1180,9 @@ export class TaskManager {
         modelReason: run.modelReason,
         effort: contract.effort,
         workspace: effectiveWorkspace,
+        // Recorded so an audit of status.json can see a run that started with
+        // no panel attached, and which channel was declared instead.
+        observation: { mode: isRecord(observation) && observation.mode === 'voz' ? 'voz' : 'painel', observers: this.options.observers?.(task.record.taskId) ?? 0 },
         ...(worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: 'broker', policyEnabledAt: worktreePlan.policy.enabledAt } } : {}),
         profile: contract.profile,
         contractVersion: contract.version,
@@ -1205,6 +1211,35 @@ export class TaskManager {
       await this.releaseReservation(task, run);
       throw error;
     }
+  }
+
+  /**
+   * A run never starts without a declared channel for watching it.
+   *
+   * Commit 0988ebb added this requirement, but only to the v1 runner, where
+   * `Wait-ClaudeLivePanelReady` really blocks. In v2 it existed solely as prose
+   * in SKILL.md and two READMEs telling the coordinator to confirm the panel —
+   * an instruction to a model, not an invariant, and therefore the only place
+   * in this codebase where the documentation promised more than the code did.
+   *
+   * The property worth keeping is not "a tab is on screen", which no broker can
+   * verify. It is that the mode of observation is DECIDED before work starts
+   * and recorded durably. `painel` is now actually checked against live SSE
+   * subscribers; `voz` is an explicit, attributable choice for a coordinator
+   * with no screen. What can no longer happen is a run starting with neither.
+   *
+   * Deliberately understated: a subscriber count proves a channel is attached,
+   * not that a human is watching.
+   */
+  private assertObserved(task: TaskState, observation: unknown): void {
+    const mode = isRecord(observation) && observation.mode === 'voz' ? 'voz' : 'painel';
+    if (mode === 'voz') return;
+    const observers = this.options.observers?.(task.record.taskId) ?? 0;
+    if (observers > 0) return;
+    throw new HttpError(409, 'OBSERVATION_REQUIRED', {
+      message: 'Nenhum painel está acompanhando esta tarefa. Abra o link do painel e aguarde ele carregar, ou declare observação por voz (observation.mode: "voz") para assumir o acompanhamento narrado.',
+      note: 'A contagem prova que um canal está anexado, não que alguém está olhando.',
+    });
   }
 
   /**
@@ -2070,6 +2105,11 @@ export class TaskManager {
     }
     return { events: collected, gapped };
   }
+}
+
+/** A plain object, for validating loosely typed request bodies. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function normalizeRecord(record: TaskRecord): TaskRecord {

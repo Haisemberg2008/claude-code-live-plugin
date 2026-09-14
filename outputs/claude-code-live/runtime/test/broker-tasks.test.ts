@@ -98,7 +98,7 @@ async function approveTrust(taskId: string, workspace: string): Promise<void> {
 }
 
 async function startRun(taskId: string, taskHandle: string, job: Record<string, unknown>, extra: Record<string, unknown> = {}): Promise<{ runId: string }> {
-  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job, ...extra }) });
+  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job, ...extra, observation: { mode: 'voz' } }) });
   assert.equal(response.status, 202, response.text);
   return response.body as { runId: string };
 }
@@ -248,14 +248,14 @@ describe('task identity bootstrap', () => {
     const { taskId, taskHandle } = await register('thread-bootstrap');
     assert.match(taskId, /^task-[a-f0-9]{16}$/);
     assert.match(taskHandle, /^[A-Za-z0-9_-]{43,}$/);
-    const noHandle = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ job: devJob(workspaceB, 'say: oi') }) });
+    const noHandle = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ job: devJob(workspaceB, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(noHandle.status, 403);
     assert.deepEqual(noHandle.body, { error: 'TASK_HANDLE_REQUIRED' });
-    const wrongHandle = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: 'x'.repeat(43), job: devJob(workspaceB, 'say: oi') }) });
+    const wrongHandle = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: 'x'.repeat(43), job: devJob(workspaceB, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(wrongHandle.status, 403);
     assert.deepEqual(wrongHandle.body, { error: 'TASK_HANDLE_INVALID' });
     const other = await register('thread-other');
-    const crossTask = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: other.taskHandle, job: devJob(workspaceB, 'say: oi') }) });
+    const crossTask = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: other.taskHandle, job: devJob(workspaceB, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(crossTask.status, 403);
     assert.deepEqual(crossTask.body, { error: 'TASK_HANDLE_MISMATCH' });
     const badThread = await broker.api('/api/tasks/register', { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ codexThreadId: '../escape', source: 'codex-thread' }) });
@@ -264,9 +264,9 @@ describe('task identity bootstrap', () => {
     const again = await register('thread-bootstrap');
     assert.equal(again.taskId, taskId, 'the same Codex thread maps to one durable task');
     assert.notEqual(again.taskHandle, taskHandle, 'a fresh registration rotates the handle');
-    const stale = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: oi') }) });
+    const stale = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(stale.status, 403, 'the rotated-out handle no longer authorizes');
-    const browserStart = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.browserActionHeaders(), body: JSON.stringify({ taskHandle: again.taskHandle, job: devJob(workspaceB, 'say: oi') }) });
+    const browserStart = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.browserActionHeaders(), body: JSON.stringify({ taskHandle: again.taskHandle, job: devJob(workspaceB, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(browserStart.status, 403, 'runs start from the coordinator surfaces, never from the browser');
   });
 
@@ -302,7 +302,7 @@ describe('task identity bootstrap', () => {
 describe('trust gating and run with exact model, Extra effort and a durable session', () => {
   test('an unapproved workspace with customizations cannot start; approval unlocks it; a material change invalidates it', async () => {
     const { taskId, taskHandle } = await register('thread-trust');
-    const blocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceA, 'say: oi') }) });
+    const blocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceA, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(blocked.status, 409, blocked.text);
     const body = blocked.body as { error: string; reason: string; pending: string[] };
     assert.equal(body.error, 'WORKSPACE_NOT_TRUSTED');
@@ -314,7 +314,7 @@ describe('trust gating and run with exact model, Extra effort and a durable sess
     const ended = await endTask(taskId);
     assert.equal(ended.currentRun?.status, 'COMPLETED');
     await writeFile(path.join(workspaceA, 'CLAUDE.md'), '# projeto A alterado\n');
-    const invalidated = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceA, 'say: oi') }) });
+    const invalidated = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceA, 'say: oi'), observation: { mode: 'voz' } }) });
     assert.equal(invalidated.status, 409);
     assert.equal((invalidated.body as { reason: string }).reason, 'FINGERPRINT_CHANGED');
     await approveTrust(taskId, workspaceA);
@@ -678,15 +678,15 @@ describe('locks and scoped termination', () => {
     const first = await register('thread-lock-1');
     await startRun(first.taskId, first.taskHandle, devJob(workspaceB, script(['say: editando', 'sleep: 3000'])));
     await waitForState(first.taskId, 'busy_tool');
-    const sameTask = await broker.api(`/api/tasks/${first.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: first.taskHandle, job: devJob(workspaceB, 'say: segunda') }) });
+    const sameTask = await broker.api(`/api/tasks/${first.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: first.taskHandle, job: devJob(workspaceB, 'say: segunda'), observation: { mode: 'voz' } }) });
     assert.equal(sameTask.status, 409);
     assert.equal((sameTask.body as { error: string }).error, 'RUN_IN_PROGRESS');
     const second = await register('thread-lock-2');
-    const writerBlocked = await broker.api(`/api/tasks/${second.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: second.taskHandle, job: devJob(workspaceB, 'say: conflito') }) });
+    const writerBlocked = await broker.api(`/api/tasks/${second.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: second.taskHandle, job: devJob(workspaceB, 'say: conflito'), observation: { mode: 'voz' } }) });
     assert.equal(writerBlocked.status, 409);
     assert.equal((writerBlocked.body as { error: string }).error, 'WORKSPACE_WRITER_LOCKED');
     assert.equal((writerBlocked.body as { holderTaskId: string }).holderTaskId, first.taskId);
-    const reader = await broker.api(`/api/tasks/${second.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: second.taskHandle, job: devJob(workspaceB, 'say: só leitura', { profile: 'read' }) }) });
+    const reader = await broker.api(`/api/tasks/${second.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: second.taskHandle, job: devJob(workspaceB, 'say: só leitura', { profile: 'read' }), observation: { mode: 'voz' } }) });
     assert.equal(reader.status, 202, 'a read profile coexists with a writer');
     const locks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
     const list = locks.body as Array<{ holderTaskId: string; holderPid: number | null }>;
@@ -709,7 +709,7 @@ describe('locks and scoped termination', () => {
     const start = (handle: { taskId: string; taskHandle: string }) => broker.api(`/api/tasks/${handle.taskId}/runs`, {
       method: 'POST',
       headers: broker.bearerHeaders(),
-      body: JSON.stringify({ taskHandle: handle.taskHandle, job: devJob(workspace, script(['say: corrida', 'sleep: 1500'])) }),
+      body: JSON.stringify({ taskHandle: handle.taskHandle, job: devJob(workspace, script(['say: corrida', 'sleep: 1500'])), observation: { mode: 'voz' } }),
     });
     const [first, second] = await Promise.all([start(a), start(b)]);
     const accepted = [first, second].filter((response) => response.status === 202);
@@ -735,13 +735,13 @@ describe('locks and scoped termination', () => {
     const b = await register('thread-canonical-b');
     await startRun(a.taskId, a.taskHandle, devJob(real, script(['say: canônico', 'sleep: 2500'])));
     await waitForState(a.taskId, 'busy_tool');
-    const viaAlias = await broker.api(`/api/tasks/${b.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: b.taskHandle, job: devJob(alias, 'say: mesmo checkout') }) });
+    const viaAlias = await broker.api(`/api/tasks/${b.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: b.taskHandle, job: devJob(alias, 'say: mesmo checkout'), observation: { mode: 'voz' } }) });
     assert.equal(viaAlias.status, 409, viaAlias.text);
     assert.equal((viaAlias.body as { error: string }).error, 'WORKSPACE_WRITER_LOCKED');
     assert.equal((viaAlias.body as { holderTaskId: string }).holderTaskId, a.taskId);
     await waitForState(a.taskId, 'idle');
     await endTask(a.taskId);
-    const afterRelease = await broker.api(`/api/tasks/${b.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: b.taskHandle, job: devJob(alias, 'say: agora livre') }) });
+    const afterRelease = await broker.api(`/api/tasks/${b.taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle: b.taskHandle, job: devJob(alias, 'say: agora livre'), observation: { mode: 'voz' } }) });
     assert.equal(afterRelease.status, 202, afterRelease.text);
     await waitForState(b.taskId, 'idle');
     await endTask(b.taskId);
@@ -859,7 +859,7 @@ describe('failures and recovery', () => {
     assert.ok(held, `the checkout stays held: ${JSON.stringify(locks)}`);
     assert.equal(held.quarantined, true);
 
-    const blocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: de novo') }) });
+    const blocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: de novo'), observation: { mode: 'voz' } }) });
     assert.equal(blocked.status, 409);
     assert.equal((blocked.body as { error: string }).error, 'REQUIRES_REVIEW');
 
@@ -870,7 +870,7 @@ describe('failures and recovery', () => {
     const reviewEvent = await waitForEvent(taskId, (event) => event.type === 'review_acknowledged');
     assert.equal(reviewEvent.data.ownershipReleased, false);
     assert.deepEqual(reviewEvent.data.quarantinedLocks, [held.workspaceKey]);
-    const stillLocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: de novo') }) });
+    const stillLocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: de novo'), observation: { mode: 'voz' } }) });
     assert.equal(stillLocked.status, 409);
     assert.equal((stillLocked.body as { error: string }).error, 'WORKSPACE_LOCK_QUARANTINED');
 
@@ -1055,7 +1055,7 @@ describe('fail-closed launch and honest shutdown', () => {
     const holder = await holdFileWithoutDeleteShare(currentRunFile);
     let response;
     try {
-      response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: nunca') }) });
+      response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: nunca'), observation: { mode: 'voz' } }) });
     } finally {
       await holder.release();
     }
@@ -1110,7 +1110,7 @@ describe('per-job authentication policy', () => {
 
     // 1. The job authorizes the billable path explicitly: it runs, and the
     //    credential is deliberately passed through to the CLI process.
-    const authorized = await authBroker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: authBroker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(authWorkspace, 'say: autorizado', { auth: { allowApiBilling: true } }) }) });
+    const authorized = await authBroker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: authBroker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(authWorkspace, 'say: autorizado', { auth: { allowApiBilling: true } }), observation: { mode: 'voz' } }) });
     assert.equal(authorized.status, 202, authorized.text);
     const running = await waitFor(async () => {
       const current = await view();
@@ -1127,7 +1127,7 @@ describe('per-job authentication policy', () => {
 
     // 2. The very next job does not authorize it. The CLI probe is already
     //    cached, but the billing policy is job-scoped and must be refused.
-    const refused = await authBroker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: authBroker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(authWorkspace, 'say: nunca') }) });
+    const refused = await authBroker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: authBroker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(authWorkspace, 'say: nunca'), observation: { mode: 'voz' } }) });
     assert.equal(refused.status, 202, refused.text);
     const failed = await waitFor(async () => {
       const current = await view();
@@ -1248,7 +1248,7 @@ describe('parallel worktrees', () => {
     const { taskId, taskHandle } = await register('thread-worktree-unenrolled');
     await approveTrust(taskId, workspaceA);
     const job = devJob(workspaceA, 'say: nao deve iniciar', { execution: { mode: 'worktree' } });
-    const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job }) });
+    const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job, observation: { mode: 'voz' } }) });
     // workspaceA is a plain directory, not a repository: the first thing that
     // fails says so, and it fails before anything is reserved.
     assert.ok(response.status === 400 || response.status === 403, response.text);
@@ -1328,7 +1328,7 @@ describe('parallel worktrees', () => {
 
     const refused = await broker.api(`/api/tasks/${second.taskId}/runs`, {
       method: 'POST', headers: broker.bearerHeaders(),
-      body: JSON.stringify({ taskHandle: second.taskHandle, job: job('say: nao deve iniciar') }),
+      body: JSON.stringify({ taskHandle: second.taskHandle, job: job('say: nao deve iniciar'), observation: { mode: 'voz' } }),
     });
     assert.equal(refused.status, 429, refused.text);
     const body = refused.body as { error?: string; limit?: number; holders?: Array<{ taskId: string }> };
@@ -1385,6 +1385,40 @@ describe('diff annotations', () => {
 
     const sensitive = await broker.api(`/api/tasks/${taskId}/diff?file=${encodeURIComponent('.env')}&taskHandle=${encodeURIComponent(taskHandle)}`, { headers: broker.bearerHeaders() });
     assert.ok(sensitive.status === 400 || sensitive.status === 403, sensitive.text);
+
+    await broker.api(`/api/tasks/${taskId}/end`, { method: 'POST', headers: broker.bearerHeaders(), body: '{}' });
+  });
+});
+
+describe('observation before work', () => {
+  test('a run with no panel attached and no declared channel is refused before any reservation', async () => {
+    const { taskId, taskHandle } = await register('thread-observacao');
+    await approveTrust(taskId, workspaceA);
+    // No `observation` at all: the default is `painel`, and no SSE client is
+    // subscribed to this task in the harness.
+    const refused = await broker.api(`/api/tasks/${taskId}/runs`, {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ taskHandle, job: devJob(workspaceA, 'say: nao deve iniciar') }),
+    });
+    assert.equal(refused.status, 409, refused.text);
+    assert.equal((refused.body as { error?: string }).error, 'OBSERVATION_REQUIRED');
+
+    // The refusal happens above the synchronous critical section, so nothing
+    // was reserved: no lock, and no run on the task.
+    const locks = await broker.api('/api/locks', { headers: broker.bearerHeaders() });
+    const mine = (locks.body as Array<{ holderTaskId: string }>).filter((lock) => lock.holderTaskId === taskId);
+    assert.deepEqual(mine, [], 'nenhuma trava pode sobrar de um job recusado');
+    assert.equal((await task(taskId)).currentRun, null);
+
+    // Declaring voice is an explicit, attributable choice, and it is recorded.
+    const accepted = await broker.api(`/api/tasks/${taskId}/runs`, {
+      method: 'POST', headers: broker.bearerHeaders(),
+      body: JSON.stringify({ taskHandle, job: devJob(workspaceA, 'say: agora sim'), observation: { mode: 'voz' } }),
+    });
+    assert.equal(accepted.status, 202, accepted.text);
+    const events = await broker.api(`/api/tasks/${taskId}/events?cursor=0&taskHandle=${encodeURIComponent(taskHandle)}`, { headers: broker.bearerHeaders() });
+    const started = ((events.body as { events: Array<{ type: string; data?: Record<string, unknown> }> }).events).find((event) => event.type === 'run_started');
+    assert.deepEqual((started?.data?.observation as { mode?: string } | undefined)?.mode, 'voz', JSON.stringify(started?.data?.observation));
 
     await broker.api(`/api/tasks/${taskId}/end`, { method: 'POST', headers: broker.bearerHeaders(), body: '{}' });
   });
