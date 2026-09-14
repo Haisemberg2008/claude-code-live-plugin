@@ -117,8 +117,14 @@ describe('stdio adapter', () => {
         const view = (await broker.api(`/api/tasks/${taskId}`, { headers: broker.bearerHeaders() })).body as { currentRun: { runId: string; workerPid: number } | null };
         return view.currentRun?.runId === startBody.runId && view.currentRun.workerPid ? view : undefined;
       }, { timeoutMs: 15000, description: 'run visible over HTTP' });
-      const waited = parse(await client.callTool({ name: 'codeorquestra_wait', arguments: { taskHandle, cursor: 0, waitMs: 500 } })) as { events: Array<{ type: string }>; cursor: number };
+      const waited = parse(await client.callTool({ name: 'codeorquestra_wait', arguments: { taskHandle, cursor: 0, waitMs: 500 } })) as { events: Array<{ type: string }>; cursor: number; task: Record<string, unknown> };
       assert.ok(waited.events.some((event) => event.type === 'run_started'));
+      // The polling loop gets a summary, not the full view: re-spending the
+      // coordinator's context on unchanged data shortens the session it runs.
+      assert.ok(!('quota' in waited.task), 'o payload de poll nao carrega o bloco de quota');
+      assert.ok(!('usage' in waited.task), 'nem o bloco de uso');
+      assert.equal(typeof (waited.task.changedFiles as { observedCount?: unknown }).observedCount, 'number', 'arquivos observados viram contagem');
+      assert.ok(Array.isArray(waited.task.pendingRequests), 'decisoes pendentes continuam completas: e o que exige acao');
       assert.ok(waited.cursor >= 1);
       const message = parse(await client.callTool({ name: 'codeorquestra_message', arguments: { taskHandle, text: 'say: orientação mcp' } })) as { source: string; messageId: string };
       assert.equal(message.source, 'mcp');

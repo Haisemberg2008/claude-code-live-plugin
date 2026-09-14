@@ -311,7 +311,13 @@ describe('action protection', () => {
     assert.deepEqual(browserWorktrees.body, { error: 'LOCAL_ADMIN_REQUIRED' });
     const adminWorktrees = await broker.api('/api/worktrees', { headers: broker.bearerHeaders() });
     assert.equal(adminWorktrees.status, 200, adminWorktrees.text);
-    assert.deepEqual(adminWorktrees.body, { policies: [], orphans: [] }, 'sem repositorio habilitado, o inventario e vazio e nao um erro');
+    const inventory = adminWorktrees.body as { policies: unknown[]; orphans: unknown[]; fleet: { runs: unknown[]; byRepository: unknown[]; account: Record<string, unknown> } };
+    assert.deepEqual(inventory.policies, [], 'sem repositorio habilitado, o inventario e vazio e nao um erro');
+    assert.deepEqual(inventory.orphans, []);
+    // N execucoes dividem uma conta, e o consumo nao e serializado como a
+    // observacao: aprovar paralelismo sem ver o custo e aprovar as cegas.
+    assert.deepEqual(inventory.fleet.runs, [], 'sem execucao ativa, a frota e vazia');
+    assert.ok('session' in inventory.fleet.account && 'week' in inventory.fleet.account, JSON.stringify(inventory.fleet.account));
   });
 
   test('the MCP label is refused for administrative routes as defence in depth', async () => {
