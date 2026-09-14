@@ -121,6 +121,14 @@ server.registerTool('codeorquestra_start', { description: 'Inicia uma execução
   return { status: result.status, body: { taskId, ...(result.body as object) } };
 }));
 
+server.registerTool('codeorquestra_pair', {
+  description: 'Pareia esta sessão com a tarefa do painel usando o código curto exibido na tela. Devolve o taskHandle desta tarefa; o handle anterior deixa de valer.',
+  inputSchema: { code: z.string().min(4).max(24).describe('Código curto lido no painel. Espaços e hífens são ignorados.') },
+}, async ({ code }) => guarded(async () => {
+  const result = await call('POST', '/api/tasks/pair', { code });
+  return { status: result.status, body: result.body };
+}));
+
 server.registerTool('codeorquestra_wait', { description: 'Aguarda novos eventos da tarefa a partir de um cursor (long-poll). Atualiza a presença do coordenador.', inputSchema: { taskHandle: handle, cursor: z.number().int().min(0).default(0), waitMs: z.number().int().min(0).max(30000).default(10000) } }, async ({ taskHandle, cursor, waitMs }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call('GET', `/api/tasks/${taskId}/events?cursor=${cursor}&waitMs=${waitMs}&taskHandle=${encodeURIComponent(taskHandle)}`);

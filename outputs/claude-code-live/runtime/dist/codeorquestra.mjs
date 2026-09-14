@@ -434,6 +434,9 @@ import { createHash, randomBytes as randomBytes2, timingSafeEqual } from "node:c
 import { promises as fs2 } from "node:fs";
 import path2 from "node:path";
 var BOOTSTRAP_TOKEN_TTL_MS = 10 * 6e4;
+var PAIRING_CODE_TTL_MS = 5 * 6e4;
+var PAIRING_CODE_LENGTH = 6;
+var PAIRING_ALPHABET = "234679ACDEFGHJKMNPQRTUVWXYZ";
 function randomToken(bytes = 32) {
   return randomBytes2(bytes).toString("base64url");
 }
@@ -449,6 +452,7 @@ var IdentityRegistry = class {
   secret = "";
   secretFile;
   bootstrapTokens = /* @__PURE__ */ new Map();
+  pairingCodes = /* @__PURE__ */ new Map();
   sessions = /* @__PURE__ */ new Map();
   constructor(brokerDir) {
     this.secretFile = path2.join(brokerDir, "secret");
@@ -499,6 +503,45 @@ var IdentityRegistry = class {
     const session = { sessionId: `sess-${randomToken(8)}`, cookie: randomToken(32), taskScope: entry.taskScope, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
     this.sessions.set(session.cookie, session);
     return { ok: true, session };
+  }
+  /** Drops expired codes. `keep` is evaluated by the caller, so its own expiry stays reportable. */
+  prunePairingCodes(now = Date.now(), keep) {
+    for (const [key, value] of this.pairingCodes) {
+      if (key !== keep && now - value.createdAt > PAIRING_CODE_TTL_MS) this.pairingCodes.delete(key);
+    }
+  }
+  /**
+   * A short code a person reads off the panel and hands to the coordinator.
+   *
+   * Short because it has to be repeatable by a human, which is the whole point:
+   * the alternative is copying a 43-character handle out of a terminal. Its
+   * shortness is affordable because it is single use, expires in five minutes,
+   * and can only be minted by a browser session — which itself only exists
+   * after someone redeemed a single-use, time-limited link on this machine.
+   */
+  mintPairingCode(taskId) {
+    this.prunePairingCodes();
+    let code = "";
+    do {
+      code = Array.from(randomBytes2(PAIRING_CODE_LENGTH), (byte) => PAIRING_ALPHABET[byte % PAIRING_ALPHABET.length]).join("");
+    } while (this.pairingCodes.has(code));
+    const createdAt = Date.now();
+    this.pairingCodes.set(code, { taskId, createdAt, used: false });
+    return { code, expiresAt: new Date(createdAt + PAIRING_CODE_TTL_MS).toISOString() };
+  }
+  /** Single use AND time limited, exactly like the bootstrap link. */
+  redeemPairingCode(raw, now = Date.now()) {
+    const code = raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    this.prunePairingCodes(now, code);
+    const entry = this.pairingCodes.get(code);
+    if (!entry) return { ok: false, code: "PAIRING_CODE_INVALID" };
+    if (entry.used) return { ok: false, code: "PAIRING_CODE_USED" };
+    if (now - entry.createdAt > PAIRING_CODE_TTL_MS) {
+      this.pairingCodes.delete(code);
+      return { ok: false, code: "PAIRING_CODE_EXPIRED" };
+    }
+    entry.used = true;
+    return { ok: true, taskId: entry.taskId };
   }
   sessionForCookie(cookie) {
     return this.sessions.get(cookie) ?? null;
@@ -4233,6 +4276,29 @@ var TaskManager = class {
     if (!this.options.harness) void this.refreshUsage(task);
     return { taskId, taskHandle: handle, created: !existing, requiresReview: record2.requiresReview };
   }
+  /**
+   * Mints a new handle for an existing task and invalidates the previous one.
+   *
+   * Rotation is a takeover, not a copy: whoever held the old handle stops being
+   * able to act on the task. That is the property that keeps a paired
+   * coordinator from silently sharing control with a stale one, and it is why
+   * this is appended to the durable log rather than done quietly.
+   */
+  async rotateHandle(task, reason, source) {
+    const { handle, hash } = mintTaskHandle();
+    const previousRotatedAt = task.record.handleRotatedAt;
+    task.record = { ...task.record, handleHash: hash, handleRotatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    await this.persistRecord(task);
+    await this.append(task, task.run?.runId ?? "none", "task_handle_rotated", {
+      reason,
+      source,
+      previousRotatedAt,
+      note: "Um handle novo foi emitido; o anterior deixou de valer. Quem o detinha n\xE3o age mais nesta tarefa."
+    });
+    this.options.log(`task ${task.record.taskId}: handle rotacionado (${reason}, ${source})`);
+    this.changed(task);
+    return { taskId: task.record.taskId, taskHandle: handle, requiresReview: task.record.requiresReview };
+  }
   resolveHandle(handle) {
     if (typeof handle !== "string" || !handle) throw new HttpError(403, "TASK_HANDLE_REQUIRED");
     for (const task of this.tasks.values()) if (verifyTaskHandle(handle, task.record.handleHash)) return task;
@@ -6166,6 +6232,17 @@ var Broker = class {
         if (identity.source === "mcp") throw new HttpError(403, "TASK_HANDLE_REQUIRED");
         return sendJson(res, 200, this.tasks.views(identity.taskScope));
       }
+      if (parts[2] === "pair" && method === "POST") {
+        if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
+        const outcome = this.identity.redeemPairingCode(typeof body.code === "string" ? body.code : "");
+        if (!outcome.ok) {
+          throw new HttpError(403, outcome.code, {
+            message: outcome.code === "PAIRING_CODE_USED" ? "Esse c\xF3digo j\xE1 foi usado. Gere outro no painel." : outcome.code === "PAIRING_CODE_EXPIRED" ? "Esse c\xF3digo expirou. Gere outro no painel." : "C\xF3digo de pareamento desconhecido. Confira o que est\xE1 na tela do painel."
+          });
+        }
+        const paired = this.tasks.getTask(outcome.taskId);
+        return sendJson(res, 200, await this.tasks.rotateHandle(paired, "voice-pairing", identity.source));
+      }
       if (parts[2] === "register" && method === "POST") {
         this.requireAdministrative(identity);
         const source2 = typeof body.source === "string" ? body.source : "unknown";
@@ -6259,6 +6336,11 @@ var Broker = class {
           if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "TEXT_REQUIRED");
           const entry = await this.tasks.enqueueMessage(task, body.text, source);
           return sendJson(res, 202, entry);
+        }
+        case "pairing": {
+          if (identity.source !== "browser") throw new HttpError(403, "BROWSER_PAIRING_ONLY", { message: "O c\xF3digo de pareamento \xE9 gerado na tela do painel, por uma pessoa nesta m\xE1quina." });
+          const minted = this.identity.mintPairingCode(task.record.taskId);
+          return sendJson(res, 200, { ...minted, note: "Leia este c\xF3digo para o coordenador. Vale uma vez s\xF3 e por cinco minutos; ao ser usado, o handle da tarefa \xE9 rotacionado." });
         }
         case "annotations": {
           const entry = await this.tasks.annotate(task, { file: body.file, comment: body.comment, hunk: body.hunk }, source);

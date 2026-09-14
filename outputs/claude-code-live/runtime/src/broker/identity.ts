@@ -10,6 +10,13 @@ import type { ActionSource } from '../shared/types.ts';
 
 /** Lifetime of a one-time dashboard link. */
 export const BOOTSTRAP_TOKEN_TTL_MS = 10 * 60_000;
+export const PAIRING_CODE_TTL_MS = 5 * 60_000;
+export const PAIRING_CODE_LENGTH = 6;
+/**
+ * No 0/O, 1/I/L, 5/S, 8/B: the code exists to be read off a screen and repeated
+ * out loud, so a character that can be misheard costs a retry for nothing.
+ */
+const PAIRING_ALPHABET = '234679ACDEFGHJKMNPQRTUVWXYZ';
 
 export function randomToken(bytes = 32): string {
   return randomBytes(bytes).toString('base64url');
@@ -45,10 +52,17 @@ interface BootstrapToken {
   used: boolean;
 }
 
+interface PairingCode {
+  taskId: string;
+  createdAt: number;
+  used: boolean;
+}
+
 export class IdentityRegistry {
   private secret = '';
   private readonly secretFile: string;
   private readonly bootstrapTokens = new Map<string, BootstrapToken>();
+  private readonly pairingCodes = new Map<string, PairingCode>();
   private readonly sessions = new Map<string, BrowserSession>();
 
   constructor(brokerDir: string) {
@@ -106,6 +120,51 @@ export class IdentityRegistry {
     const session: BrowserSession = { sessionId: `sess-${randomToken(8)}`, cookie: randomToken(32), taskScope: entry.taskScope, createdAt: new Date().toISOString() };
     this.sessions.set(session.cookie, session);
     return { ok: true, session };
+  }
+
+  /** Drops expired codes. `keep` is evaluated by the caller, so its own expiry stays reportable. */
+  private prunePairingCodes(now = Date.now(), keep?: string): void {
+    for (const [key, value] of this.pairingCodes) {
+      if (key !== keep && now - value.createdAt > PAIRING_CODE_TTL_MS) this.pairingCodes.delete(key);
+    }
+  }
+
+  /**
+   * A short code a person reads off the panel and hands to the coordinator.
+   *
+   * Short because it has to be repeatable by a human, which is the whole point:
+   * the alternative is copying a 43-character handle out of a terminal. Its
+   * shortness is affordable because it is single use, expires in five minutes,
+   * and can only be minted by a browser session — which itself only exists
+   * after someone redeemed a single-use, time-limited link on this machine.
+   */
+  mintPairingCode(taskId: string): { code: string; expiresAt: string } {
+    this.prunePairingCodes();
+    let code = '';
+    do {
+      code = Array.from(randomBytes(PAIRING_CODE_LENGTH), (byte) => PAIRING_ALPHABET[byte % PAIRING_ALPHABET.length]).join('');
+    } while (this.pairingCodes.has(code));
+    const createdAt = Date.now();
+    this.pairingCodes.set(code, { taskId, createdAt, used: false });
+    return { code, expiresAt: new Date(createdAt + PAIRING_CODE_TTL_MS).toISOString() };
+  }
+
+  /** Single use AND time limited, exactly like the bootstrap link. */
+  redeemPairingCode(raw: string, now = Date.now()): { ok: true; taskId: string } | { ok: false; code: 'PAIRING_CODE_INVALID' | 'PAIRING_CODE_USED' | 'PAIRING_CODE_EXPIRED' } {
+    // Normalized before lookup because it arrives the way a person said or
+    // typed it: spacing and hyphens are presentation, and the alphabet has no
+    // lowercase.
+    const code = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    this.prunePairingCodes(now, code);
+    const entry = this.pairingCodes.get(code);
+    if (!entry) return { ok: false, code: 'PAIRING_CODE_INVALID' };
+    if (entry.used) return { ok: false, code: 'PAIRING_CODE_USED' };
+    if (now - entry.createdAt > PAIRING_CODE_TTL_MS) {
+      this.pairingCodes.delete(code);
+      return { ok: false, code: 'PAIRING_CODE_EXPIRED' };
+    }
+    entry.used = true;
+    return { ok: true, taskId: entry.taskId };
   }
 
   sessionForCookie(cookie: string): BrowserSession | null {

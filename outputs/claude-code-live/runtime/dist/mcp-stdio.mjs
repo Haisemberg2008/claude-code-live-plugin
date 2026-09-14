@@ -36675,6 +36675,13 @@ server.registerTool("codeorquestra_start", { description: "Inicia uma execu\xE7\
   const result = await call("POST", `/api/tasks/${taskId}/runs`, { taskHandle, job, ...acknowledgeReview ? { acknowledgeReview: true } : {}, ...observation ? { observation } : {} });
   return { status: result.status, body: { taskId, ...result.body } };
 }));
+server.registerTool("codeorquestra_pair", {
+  description: "Pareia esta sess\xE3o com a tarefa do painel usando o c\xF3digo curto exibido na tela. Devolve o taskHandle desta tarefa; o handle anterior deixa de valer.",
+  inputSchema: { code: external_exports.string().min(4).max(24).describe("C\xF3digo curto lido no painel. Espa\xE7os e h\xEDfens s\xE3o ignorados.") }
+}, async ({ code }) => guarded(async () => {
+  const result = await call("POST", "/api/tasks/pair", { code });
+  return { status: result.status, body: result.body };
+}));
 server.registerTool("codeorquestra_wait", { description: "Aguarda novos eventos da tarefa a partir de um cursor (long-poll). Atualiza a presen\xE7a do coordenador.", inputSchema: { taskHandle: handle, cursor: external_exports.number().int().min(0).default(0), waitMs: external_exports.number().int().min(0).max(3e4).default(1e4) } }, async ({ taskHandle, cursor, waitMs }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
   return call("GET", `/api/tasks/${taskId}/events?cursor=${cursor}&waitMs=${waitMs}&taskHandle=${encodeURIComponent(taskHandle)}`);

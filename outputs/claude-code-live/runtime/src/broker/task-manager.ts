@@ -540,6 +540,30 @@ export class TaskManager {
     return { taskId, taskHandle: handle, created: !existing, requiresReview: record.requiresReview };
   }
 
+  /**
+   * Mints a new handle for an existing task and invalidates the previous one.
+   *
+   * Rotation is a takeover, not a copy: whoever held the old handle stops being
+   * able to act on the task. That is the property that keeps a paired
+   * coordinator from silently sharing control with a stale one, and it is why
+   * this is appended to the durable log rather than done quietly.
+   */
+  async rotateHandle(task: TaskState, reason: 'voice-pairing', source: ActionSource): Promise<{ taskId: string; taskHandle: string; requiresReview: boolean }> {
+    const { handle, hash } = mintTaskHandle();
+    const previousRotatedAt = task.record.handleRotatedAt;
+    task.record = { ...task.record, handleHash: hash, handleRotatedAt: new Date().toISOString() };
+    await this.persistRecord(task);
+    await this.append(task, task.run?.runId ?? 'none', 'task_handle_rotated', {
+      reason,
+      source,
+      previousRotatedAt,
+      note: 'Um handle novo foi emitido; o anterior deixou de valer. Quem o detinha não age mais nesta tarefa.',
+    });
+    this.options.log(`task ${task.record.taskId}: handle rotacionado (${reason}, ${source})`);
+    this.changed(task);
+    return { taskId: task.record.taskId, taskHandle: handle, requiresReview: task.record.requiresReview };
+  }
+
   resolveHandle(handle: unknown): TaskState {
     if (typeof handle !== 'string' || !handle) throw new HttpError(403, 'TASK_HANDLE_REQUIRED');
     for (const task of this.tasks.values()) if (verifyTaskHandle(handle, task.record.handleHash)) return task;

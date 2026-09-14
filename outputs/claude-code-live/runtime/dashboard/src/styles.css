@@ -173,3 +173,11 @@ input.note { background: var(--bg); color: var(--text); border: 1px solid var(--
 .fleet-facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; font-size: 12.5px; }
 .fleet-facts dt { color: var(--muted); }
 .fleet-facts dd { margin: 0; overflow-wrap: anywhere; }
+
+/* Pairing code: meant to be read off the screen and repeated out loud. */
+.pairing { margin: 6px 0 0; font-size: 13px; }
+.pairing-code {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 20px; font-weight: 600; letter-spacing: .12em;
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface);
+}

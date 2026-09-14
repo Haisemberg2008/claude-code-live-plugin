@@ -302,6 +302,23 @@ export class Broker {
         if (identity.source === 'mcp') throw new HttpError(403, 'TASK_HANDLE_REQUIRED');
         return sendJson(res, 200, this.tasks.views(identity.taskScope));
       }
+      if (parts[2] === 'pair' && method === 'POST') {
+        // Redeeming rotates the task handle, so it is a coordinator action, not
+        // a panel one: the browser shows the code and never consumes it.
+        if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
+        const outcome = this.identity.redeemPairingCode(typeof body.code === 'string' ? body.code : '');
+        if (!outcome.ok) {
+          throw new HttpError(403, outcome.code, {
+            message: outcome.code === 'PAIRING_CODE_USED'
+              ? 'Esse código já foi usado. Gere outro no painel.'
+              : outcome.code === 'PAIRING_CODE_EXPIRED'
+                ? 'Esse código expirou. Gere outro no painel.'
+                : 'Código de pareamento desconhecido. Confira o que está na tela do painel.',
+          });
+        }
+        const paired = this.tasks.getTask(outcome.taskId);
+        return sendJson(res, 200, await this.tasks.rotateHandle(paired, 'voice-pairing', identity.source));
+      }
       if (parts[2] === 'register' && method === 'POST') {
         this.requireAdministrative(identity);
         const source = typeof body.source === 'string' ? body.source : 'unknown';
@@ -386,6 +403,14 @@ export class Broker {
           if (typeof body.text !== 'string' || !body.text.trim()) throw new HttpError(400, 'TEXT_REQUIRED');
           const entry = await this.tasks.enqueueMessage(task, body.text, source);
           return sendJson(res, 202, entry);
+        }
+        case 'pairing': {
+          // Minted only by a panel session, which exists only after a person
+          // redeemed a single-use link on this machine. A session scoped to
+          // another task never reaches here: scopedTask refused it above.
+          if (identity.source !== 'browser') throw new HttpError(403, 'BROWSER_PAIRING_ONLY', { message: 'O código de pareamento é gerado na tela do painel, por uma pessoa nesta máquina.' });
+          const minted = this.identity.mintPairingCode(task.record.taskId);
+          return sendJson(res, 200, { ...minted, note: 'Leia este código para o coordenador. Vale uma vez só e por cinco minutos; ao ser usado, o handle da tarefa é rotacionado.' });
         }
         case 'annotations': {
           const entry = await this.tasks.annotate(task, { file: body.file, comment: body.comment, hunk: body.hunk }, source);

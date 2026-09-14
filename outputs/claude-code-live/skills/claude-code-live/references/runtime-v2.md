@@ -60,6 +60,7 @@ O adaptador stdio (`mcp-stdio.mjs`) se conecta ao broker ja em execucao — nunc
 | `codeorquestra_start` | inicia uma execucao v2 na tarefa do handle (job `contractVersion: 2`) |
 | `codeorquestra_wait` | long-poll de eventos a partir de um cursor; atualiza a presenca do coordenador |
 | `codeorquestra_list` | execucao ativa e historico da tarefa |
+| `codeorquestra_pair` | pareia com a tarefa do painel usando o codigo curto da tela; devolve o taskHandle |
 | `codeorquestra_message` | enfileira orientacao para o proximo turno |
 | `codeorquestra_annotate` | anota um arquivo alterado; a anotacao vira orientacao na fila, entregue entre turnos |
 | `codeorquestra_answer` | responde permissao ou pergunta (`requestId` + `runId` exatos) |
@@ -200,3 +201,47 @@ O que o runtime garante e o que ele nao garante:
   Claude, o estado normal de uma execucao bem-sucedida e trabalho pendente na
   arvore: ele e retido e reportado. So uma arvore que o proprio git considera
   limpa e removida, e uma trava em quarentena nao remove nada.
+
+## Parear sem o terminal
+
+O `taskHandle` e a capacidade que impede uma tarefa de consultar, orientar ou
+cancelar outra. Obte-lo pelo terminal (`codeorquestra task register`) funciona,
+mas exige copiar 43 caracteres — o que quebra qualquer fluxo em que o
+coordenador nao esta no teclado.
+
+O painel gera um codigo curto para a tarefa aberta. O coordenador o informa:
+
+```
+codeorquestra_pair { code: "K7M4QD" }
+```
+
+e recebe o `taskHandle` daquela tarefa. Espacos, hifens e caixa sao ignorados; o
+alfabeto nao tem 0/O, 1/I/L, 5/S nem 8/B, para o codigo sobreviver a ser lido em
+voz alta.
+
+Onde cada propriedade fica:
+
+* **cunhar e acao do painel** — so uma sessao de navegador emite codigo, e essa
+  sessao so existe depois que alguem resgatou, nesta maquina, um link de uso
+  unico com validade. As identidades de coordenador sao recusadas com
+  `BROWSER_PAIRING_ONLY`;
+* **resgatar e acao do coordenador** — o navegador que mostrou o codigo nao o
+  consome (`LOCAL_ADMIN_REQUIRED`);
+* **isolamento entre tarefas** — um painel limitado a tarefa A nao emite codigo
+  para B; a rota recusa antes de chegar ao pareamento;
+* **uso unico e cinco minutos** — as mesmas propriedades do link de bootstrap;
+* **resgatar rotaciona o handle** — quem detinha o anterior deixa de agir na
+  tarefa, e a rotacao entra no log duravel como `task_handle_rotated`. Isso e
+  deliberado: pareamento e tomada de posse, nao compartilhamento.
+
+`codeorquestra task register` continua existindo e nao mudou; o pareamento e um
+segundo caminho para a mesma capacidade, nao um substituto.
+
+## Decisao pendente deixa de ser silenciosa
+
+Uma permissao ou pergunta bloqueia o turno ate alguem responder. Essa espera
+continua fora do alerta de inatividade, porque esperar nao e ociosidade — mas
+passados dois minutos entra `decision_pending`, que diz a outra coisa
+verdadeira: ninguem respondeu e nada avanca. O alerta **repete** enquanto
+continuar valendo, e some quando a decisao e respondida. Como todo alerta de
+supervisao, ele so avisa: nada e encerrado.

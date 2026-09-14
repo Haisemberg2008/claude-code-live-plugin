@@ -349,6 +349,7 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
   const [busy, setBusy] = useState<string | null>(null);
   // Confirmation is bound to the exact task and run it was opened for.
   const [confirmEnd, setConfirmEnd] = useState<{ taskId: string; runId: string | null } | null>(null);
+  const [pairing, setPairing] = useState<{ code: string; expiresAt: string } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const feedRef = useRef<HTMLDivElement>(null);
 
@@ -388,7 +389,22 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
           {task.coordinatorPresence === 'absent' ? <span className="badge warn">{task.coordinatorLabel ?? 'aguardando coordenador'}</span> : <span className="badge ok">coordenador presente</span>}
           {task.alerts.map((alert) => <span key={alert} className="badge warn">alerta: {alert}</span>)}
           {run?.currentTool ? <span className="badge">ferramenta: {run.currentTool}</span> : null}
+          <button type="button" className="ghost small" data-testid="pairing-button" onClick={async () => {
+            setActionError(null);
+            try {
+              setPairing(await postAction(task.taskId, 'pairing', {}) as { code: string; expiresAt: string });
+            } catch (error) {
+              setActionError(error instanceof ApiError ? `pairing: ${error.code}` : String(error));
+            }
+          }}>Código de pareamento</button>
         </div>
+        {pairing ? (
+          <p className="pairing" data-testid="pairing-code">
+            {/* Spaced so it can be read aloud a character at a time. */}
+            <span className="pairing-code">{pairing.code.split('').join(' ')}</span>
+            <span className="muted"> — vale uma vez, até {formatTime(pairing.expiresAt)}. Ao ser usado, o handle desta tarefa é rotacionado e o anterior deixa de valer.</span>
+          </p>
+        ) : null}
       </div>
       <div className="feed" ref={feedRef}>
         <div className="feed-top">
