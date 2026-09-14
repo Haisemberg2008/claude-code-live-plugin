@@ -322,6 +322,34 @@ describe('dashboard', () => {
     await endTask(taskId);
   });
 
+  test('a blocked turn stays visible and reachable even after the feed scrolls past it', async (t) => {
+    if (unavailable) { t.skip(unavailable); return; }
+    const { taskId, taskHandle } = await register('thread-ui-bloqueio');
+    await startRun(taskId, taskHandle, script(['ask: Qual banco usar?', 'say: anotado']));
+    const item = page.locator('[data-testid="task-item"]').filter({ hasText: 'thread-ui-bloqueio' });
+    await item.waitFor({ timeout: 15000 });
+    await item.click();
+    const main = page.getByRole('main');
+
+    // A blocked turn is the one thing on screen that stops work, so it is
+    // announced outside the feed and does not depend on scroll position.
+    const notice = main.locator('[data-testid="blocking-notice"]');
+    await notice.waitFor({ timeout: 15000 });
+    await notice.getByText(/Claude fez uma pergunta e está parado/).waitFor();
+
+    const question = main.locator('[data-testid="question-request"]');
+    await question.waitFor({ timeout: 15000 });
+    await main.locator('[data-testid="blocking-go"]').click();
+    await question.waitFor({ state: 'visible' });
+
+    // Answered, it stops competing: the notice goes away with the block.
+    await question.getByRole('radio', { name: 'Sim' }).check();
+    await question.getByRole('button', { name: 'Enviar resposta' }).click();
+    await notice.waitFor({ state: 'detached', timeout: 20000 });
+    await waitFor(async () => ((await taskState(taskId)) === 'idle' ? true : undefined), { timeoutMs: 20000, description: 'blocked task idle' });
+    await endTask(taskId);
+  });
+
   test('the end confirmation is bound to the task it was opened for, and elapsed time keeps moving during silence', async (t) => {
     if (unavailable) { t.skip(unavailable); return; }
     const { taskId, taskHandle } = await register('thread-ui-confirm');

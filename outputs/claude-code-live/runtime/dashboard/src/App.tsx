@@ -406,6 +406,19 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
           </p>
         ) : null}
       </div>
+      {task.pendingRequests.length ? (
+        <div className="blocking" role="status" data-testid="blocking-notice">
+          <span className="blocking-what">
+            {task.pendingRequests.length === 1
+              ? (task.pendingRequests[0]!.kind === 'question' ? 'Claude fez uma pergunta e está parado.' : `Claude pediu permissão para ${task.pendingRequests[0]!.tool} e está parado.`)
+              : `${task.pendingRequests.length} decisões pendentes. Nada avança até serem respondidas.`}
+          </span>
+          <button type="button" className="blocking-go" data-testid="blocking-go" onClick={() => {
+            const target = document.getElementById(`decision-${task.pendingRequests[0]!.requestId}`);
+            target?.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+          }}>Ir para a decisão</button>
+        </div>
+      ) : null}
       <div className="feed" ref={feedRef}>
         <div className="feed-top">
           <button type="button" className="ghost small" onClick={onLoadHistory}>Carregar histórico</button>
@@ -556,7 +569,7 @@ function DecisionRow({ row, task, onAnswer }: { row: Extract<Row, { kind: 'decis
   const runId = pending?.runId ?? task.currentRun?.runId ?? '';
   const resolved = row.resolution;
   return (
-    <article className={`row decision ${resolved ? 'resolved' : 'pending'}`} data-testid={row.requestKind === 'question' ? 'question-request' : 'permission-request'}>
+    <article id={`decision-${row.requestId}`} className={`row decision ${resolved ? 'resolved' : 'pending'}`} data-testid={row.requestKind === 'question' ? 'question-request' : 'permission-request'}>
       <div className="row-head">
         <span className="author">{row.requestKind === 'question' ? 'Pergunta do Claude' : `Permissão: ${row.tool}`}</span>
         <span className="badge warn">{row.reason}</span>
