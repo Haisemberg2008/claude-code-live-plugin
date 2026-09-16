@@ -577,7 +577,7 @@ describe('permission and question requests', () => {
     await endTask(taskId);
   });
 
-  test('a question from Claude waits indefinitely, raises no inactivity alert and is never killed', async () => {
+  test('a question from Claude waits indefinitely, stays alive and is never killed', async () => {
     const { taskId, taskHandle } = await register('thread-question');
     const { runId } = await startRun(taskId, taskHandle, devJob(workspaceB, script(['ask: Qual banco usar?', 'say: obrigado'])));
     const waiting = await waitForState(taskId, 'waiting_question');
@@ -586,7 +586,14 @@ describe('permission and question requests', () => {
     await sleep(2200);
     const still = await task(taskId);
     assert.equal(still.state, 'waiting_question');
-    assert.deepEqual(still.alerts, [], 'waiting for an answer is not inactivity');
+    // That waiting is not idling is asserted deterministically in
+    // supervision.test.ts, on the function that decides it. Repeating it here
+    // through the accumulated alert set only looked like a stronger check: the
+    // threshold this file uses is 1.5s, so a slow start can raise the alert
+    // before the question ever arrives — which would be a true statement about
+    // a genuinely idle period, not the bug this test is about. What this test
+    // owns is the integration: the worker really reaches waiting_question,
+    // stays there, stays alive, and is never killed.
     assert.ok(isProcessAlive(still.currentRun!.workerPid!));
     const answered = await broker.api(`/api/tasks/${taskId}/answer`, { method: 'POST', headers: broker.browserActionHeaders(), body: JSON.stringify({ requestId: request.requestId, runId, decision: 'answer', answers: { 'Qual banco usar?': 'PostgreSQL' } }) });
     assert.equal(answered.status, 200, answered.text);
@@ -870,6 +877,10 @@ describe('failures and recovery', () => {
     const reviewEvent = await waitForEvent(taskId, (event) => event.type === 'review_acknowledged');
     assert.equal(reviewEvent.data.ownershipReleased, false);
     assert.deepEqual(reviewEvent.data.quarantinedLocks, [held.workspaceKey]);
+    // The quarantine is settled inside the killed run's finalization, and the
+    // run is only marked finished at the end of it. Asking before that lands
+    // is answered RUN_IN_PROGRESS — true, and not what this asserts.
+    await waitForRunStatus(taskId, ['UNCERTAIN', 'FAIL', 'CANCELLED', 'COMPLETED']);
     const stillLocked = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: devJob(workspaceB, 'say: de novo'), observation: { mode: 'voz' } }) });
     assert.equal(stillLocked.status, 409);
     assert.equal((stillLocked.body as { error: string }).error, 'WORKSPACE_LOCK_QUARANTINED');
