@@ -1430,16 +1430,21 @@ describe('derived files', () => {
     // The cache is an optimisation, never a second source of truth. Deriving
     // from it must produce exactly what deriving from the durable log does.
     const runDir = path.join(broker.stateRoot, 'tasks', taskId, 'runs', runId);
-    const fromCache = await readFile(path.join(runDir, 'acompanhamento.txt'), 'utf8');
-
-    const log = await events(taskId);
-    const forRun = log.filter((event) => event.runId === runId);
     const { deriveCompatibilityFiles } = await import('../src/events/derive.ts');
-    const fromLog = deriveCompatibilityFiles(forRun as never, { processAlive: true }).acompanhamento;
-
-    // Compared on the lines the log can reproduce: the file on disk may carry a
-    // later snapshot than the page of events read back here.
     const head = (text: string) => text.split('\n').slice(0, 6).join('\n');
+
+    // The file on disk is written on a debounce, so at any single instant it
+    // may be a beat behind or ahead of the page of events read back here. What
+    // must hold is that the two derivations converge on the same text — never
+    // that a snapshot taken mid-write already matches.
+    let fromCache = '';
+    let fromLog = '';
+    await waitFor(async () => {
+      fromCache = await readFile(path.join(runDir, 'acompanhamento.txt'), 'utf8');
+      const forRun = (await events(taskId)).filter((event) => event.runId === runId);
+      fromLog = deriveCompatibilityFiles(forRun as never, { processAlive: true }).acompanhamento;
+      return head(fromCache) === head(fromLog) ? true : undefined;
+    }, { timeoutMs: 10000, intervalMs: 200, description: 'derivar do cache e derivar do log coincidem' }).catch(() => undefined);
     assert.equal(head(fromCache), head(fromLog), 'derivar do cache e derivar do log precisam coincidir');
     await endTask(taskId);
   });

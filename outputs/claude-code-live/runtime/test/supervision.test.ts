@@ -18,6 +18,7 @@ function evaluate(overrides: Partial<Parameters<typeof evaluateSupervision>[0]> 
     coordinatorLastSeenAt: t0 + minutes(1),
     pendingRequests: 0,
     oldestPendingRequestAt: null,
+    budgetRatio: null,
     brokerRestartedDuringRun: false,
     terminal: false,
     ...overrides,
@@ -106,5 +107,33 @@ describe('a decision nobody answered', () => {
   test('never fires without a pending request, whatever the phase says', () => {
     assert.deepEqual(evaluate({ phase: 'waiting_permission', pendingRequests: 1, oldestPendingRequestAt: null, now: t0 + minutes(90) }).alerts, []);
     assert.deepEqual(evaluate({ phase: 'busy_tool', pendingRequests: 0, oldestPendingRequestAt: t0, now: t0 + minutes(90), lastActivityAt: t0 + minutes(89) }).alerts, []);
+  });
+});
+
+describe('a budget the run is about to spend', () => {
+  test('is named at 80% and again when it runs out, and never terminates anything', () => {
+    // Below the warning line the budget is not mentioned at all.
+    assert.deepEqual(evaluate({ budgetRatio: 0.79 }).alerts, []);
+    // At it, the run goes on; the alert exists so exhaustion is never the
+    // first thing anyone hears about the budget.
+    assert.deepEqual(evaluate({ budgetRatio: 0.8 }).alerts, ['budget_warning']);
+    // Exhausted: both are true, and the action is still 'none' — the broker
+    // enforces it by refusing the next turn, not by killing this one.
+    const exhausted = evaluate({ budgetRatio: 1 });
+    assert.deepEqual(exhausted.alerts, ['budget_warning', 'budget_exhausted']);
+    assert.equal(exhausted.action, 'none');
+    assert.equal(exhausted.state, 'busy_tool');
+    assert.equal(exhausted.requiresReview, false);
+    assert.deepEqual(evaluate({ budgetRatio: 1.5 }).alerts, ['budget_warning', 'budget_exhausted']);
+  });
+
+  test('a job without limits has no budget to alert on', () => {
+    assert.deepEqual(evaluate({ budgetRatio: null }).alerts, []);
+  });
+
+  test('does not depend on waiting: a run blocked on a decision has spent what it spent', () => {
+    const result = evaluate({ budgetRatio: 1, phase: 'waiting_permission', pendingRequests: 1, oldestPendingRequestAt: t0, now: t0 + minutes(1) });
+    assert.ok(result.alerts.includes('budget_exhausted'));
+    assert.equal(result.state, 'waiting_permission');
   });
 });

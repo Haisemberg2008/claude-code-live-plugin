@@ -209,8 +209,34 @@ describe('v2 execution target', () => {
     }
   });
 
+  test('limits are optional, literal and refused when malformed', () => {
+    // A job that never mentions `limits` resolves exactly as before: no budget.
+    assert.deepEqual(resolveJobContract(jobV2(workspace)).limits, { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null });
+    assert.deepEqual(resolveJobContract(jobV2(workspace, { limits: null })).limits, { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null });
+    assert.deepEqual(resolveJobContract(jobV2(workspace, { limits: {} })).limits, { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null });
+    // One dimension limited leaves the others unlimited, not zero.
+    assert.deepEqual(resolveJobContract(jobV2(workspace, { limits: { maxTokens: 5000 } })).limits, { maxTurns: null, maxTokens: 5000, maxRuntimeSeconds: null });
+    assert.deepEqual(resolveJobContract(jobV2(workspace, { limits: { maxTurns: 3, maxTokens: 5000, maxRuntimeSeconds: 600 } })).limits, { maxTurns: 3, maxTokens: 5000, maxRuntimeSeconds: 600 });
+    // "I set a budget" and "I set no budget" must never be one typo apart.
+    for (const bad of [0, -1, 2.5, 'x', '5000', true, Number.MAX_SAFE_INTEGER + 1]) {
+      assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxTokens: bad } })), 'LIMITS_INVALID', `maxTokens=${String(bad)}`);
+      assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxTurns: bad } })), 'LIMITS_INVALID', `maxTurns=${String(bad)}`);
+      assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxRuntimeSeconds: bad } })), 'LIMITS_INVALID', `maxRuntimeSeconds=${String(bad)}`);
+    }
+    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: 5000 })), 'LIMITS_INVALID');
+    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: [5000] })), 'LIMITS_INVALID');
+    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxCost: 5 } })), 'LIMITS_INVALID');
+    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxTokens: 5000, maxCost: 5 } })), 'LIMITS_INVALID');
+  });
+
+  test('limits belong to v2 only and are refused in a legacy job instead of ignored', () => {
+    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
+    job.limits = { maxTokens: 5000 };
+    assertThrowsCode(() => resolveJobContract(job), 'V2_FIELD_IN_LEGACY');
+  });
+
   test('execution belongs to v2 only and is refused in a legacy job instead of ignored', () => {
-    const job = legacyJob(workspace, 'C:\execucoes\prompt.md');
+    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
     job.execution = { mode: 'worktree' };
     assertThrowsCode(() => resolveJobContract(job), 'V2_FIELD_IN_LEGACY');
   });

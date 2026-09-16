@@ -296,6 +296,7 @@ function TaskBadges({ task }: { task: TaskView }) {
         ? <span className={`badge ${task.currentRun.status === 'COMPLETED' ? 'ok' : task.currentRun.status === 'CANCELLED' ? '' : 'error'}`} data-testid="run-outcome">{OUTCOME_LABELS[task.currentRun.status] ?? task.currentRun.status}</span>
         : null}
       {task.pendingRequests.length ? <span className="badge warn">{task.pendingRequests.length} decisão(ões)</span> : null}
+      {task.currentRun?.budget?.exhausted ? <span className="badge error" data-testid="budget-exhausted">orçamento esgotado</span> : null}
       {task.requiresReview ? <span className="badge error">revisão</span> : null}
     </span>
   );
@@ -661,6 +662,17 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
         <dt>Falhas de telemetria</dt><dd>{run?.telemetryFailures ?? 0}</dd>
         <dt>Alertas</dt><dd className="wrap">{task.alerts.length ? task.alerts.join(', ') : 'nenhum (20 min sem atividade e 2 h decorridas só alertam)'}</dd>
       </dl>
+      <h2 className="section-title">Orçamento</h2>
+      {run?.budget ? (
+        <dl data-testid="budget">
+          {run.budget.tokens ? <><dt>Tokens</dt><dd className={run.budget.tokens.used >= run.budget.tokens.limit ? 'warn-text' : ''}>{formatCount(run.budget.tokens.used)} / {formatCount(run.budget.tokens.limit)}</dd></> : null}
+          {run.budget.turns ? <><dt>Turnos</dt><dd className={run.budget.turns.used >= run.budget.turns.limit ? 'warn-text' : ''}>{run.budget.turns.used} / {run.budget.turns.limit}</dd></> : null}
+          {run.budget.runtimeSeconds ? <><dt>Tempo</dt><dd className={run.budget.runtimeSeconds.used >= run.budget.runtimeSeconds.limit ? 'warn-text' : ''}>{formatElapsed(run.budget.runtimeSeconds.used)} / {formatElapsed(run.budget.runtimeSeconds.limit)}</dd></> : null}
+          <dt>Situação</dt><dd className={run.budget.exhausted ? 'warn-text' : ''}>{run.budget.exhausted ? 'esgotado: o turno atual termina, nenhum outro é entregue' : `${Math.min(100, Math.round(run.budget.ratio * 100))}% usado`}</dd>
+        </dl>
+      ) : (
+        <dl data-testid="budget"><dt>Limites</dt><dd className="muted">nenhum declarado no job</dd></dl>
+      )}
       <h2 className="section-title">Capacidade</h2>
       {quota.snapshot ? (
         <dl>

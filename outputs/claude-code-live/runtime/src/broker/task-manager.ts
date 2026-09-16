@@ -30,8 +30,8 @@ import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
 import { isHarness, envName } from '../shared/env.ts';
-import type { ActionSource, AuthorizedModel, CodexUsageView, EventRecord, PendingRequestView, QueueEntryView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
-import { ClaudeUsageAccumulator } from '../usage/claude-usage.ts';
+import type { ActionSource, AuthorizedModel, CodexUsageView, EventRecord, PendingRequestView, QueueEntryView, RunBudgetView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import { ClaudeUsageAccumulator, normalizeClaudeUsage } from '../usage/claude-usage.ts';
 import { CodexUsageService, type CodexUsageReader, unavailableCodexUsage } from '../usage/codex-usage.ts';
 import { sha256, mintTaskHandle, verifyTaskHandle, taskIdForThread, THREAD_ID_PATTERN } from './identity.ts';
 import { HttpError } from './http.ts';
@@ -91,6 +91,11 @@ interface RunState {
   failureCode: string | null;
   telemetryFailures: number;
   turns: number;
+  /**
+   * Tokens this run's turns reported (input + cache + output), for the budget.
+   * Distinct from the task's usage accumulator, which spans runs and replays.
+   */
+  tokensObserved: number;
   resumeMode: 'new' | 'automatic' | 'explicit';
   simulated: boolean;
   writerLockKey: string | null;
@@ -886,6 +891,8 @@ export class TaskManager {
   async enqueueMessage(task: TaskState, text: string, source: ActionSource): Promise<QueueEntryView> {
     if (!task.run || task.run.finalized || task.run.finalizing || !task.worker) throw new HttpError(409, 'NO_ACTIVE_RUN');
     if (task.uncertain) throw new HttpError(409, 'REQUIRES_REVIEW', { message: 'A execução está incerta; confirme a revisão antes de enviar novas orientações.' });
+    const budget = budgetStatus(task.run, Date.now());
+    if (budget?.exhausted) throw new HttpError(409, 'BUDGET_EXHAUSTED', { message: 'O orçamento desta execução esgotou; nenhum turno novo é entregue.', budget, note: BUDGET_EXHAUSTED_NOTE });
     const redacted = redactSensitiveText(text);
     const entry: QueueEntry = { messageId: `msg-${randomUUID()}`, source, text: redacted, textPreview: boundedPreview(redacted, 300).preview, receivedAt: new Date().toISOString(), deliveredAt: null, state: 'queued' };
     task.queue.push(entry);
@@ -976,6 +983,9 @@ export class TaskManager {
     if (task.phase !== 'idle') return;
     // A model switch is in flight: the next turn waits for a known model.
     if (task.modelTransition) return;
+    // Exhausted budget: what is queued stays queued. The turn that spent the
+    // last of it was allowed to finish; the next one is simply not started.
+    if (budgetStatus(run, Date.now())?.exhausted) return;
     const next = task.queue.find((entry) => entry.state === 'queued');
     if (!next) return;
     next.state = 'delivered';
@@ -1192,6 +1202,7 @@ export class TaskManager {
       failureCode: null,
       telemetryFailures: 0,
       turns: 0,
+      tokensObserved: 0,
       resumeMode: task.previousSessionId ? 'automatic' : 'new',
       simulated: false,
       declaredWorkspace: worktreePlan ? workspace : null,
@@ -1627,6 +1638,14 @@ export class TaskManager {
       case 'event': {
         const event = await this.append(task, run.runId, message.type, message.data, message.toolUseId);
         if (task.claudeUsage.addEvent(event)) void this.persistUsage(task);
+        if (TURN_TERMINAL_EVENTS.has(message.type)) {
+          // No dedup needed here: each worker event passes this point once.
+          // The accumulator above keeps its own, for replays. Exhaustion is
+          // observed at turn_done, which always follows, so the recorded
+          // numbers count this turn as finished rather than half-finished.
+          const usage = normalizeClaudeUsage(message.data.usage);
+          if (usage) run.tokensObserved += usage.totalObservedTokens;
+        }
         this.applyEvent(task, run, message.type, message.data, message.toolUseId);
         if (message.type === 'permission_requested' || message.type === 'question_asked') this.changed(task);
         break;
@@ -1669,6 +1688,7 @@ export class TaskManager {
         run.turns += 1;
         task.phase = 'idle';
         task.currentTool = null;
+        await this.observeBudget(task, run);
         await this.observeBetweenTurns(task, run);
         await this.deliverNext(task);
         this.changed(task);
@@ -2032,11 +2052,13 @@ export class TaskManager {
     {
       const run = task.run;
       if (!run || run.finalized) return;
+      const budget = budgetStatus(run, Date.now());
       const evaluation = evaluateSupervision({
         now: Date.now(),
         runStartedAt: Date.parse(run.startedAt),
         lastActivityAt: task.lastActivityAt,
         oldestPendingRequestAt: oldestPendingAt(task),
+        budgetRatio: budget?.ratio ?? null,
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2066,9 +2088,18 @@ export class TaskManager {
           }).then(() => this.changed(task));
           continue;
         }
+        if (alert === 'budget_exhausted') {
+          // Runtime runs out between turns, with no event to notice it on;
+          // the same idempotent path the turn handlers use records it.
+          void this.observeBudget(task, run);
+          continue;
+        }
         if (task.alertsRaised.has(alert)) continue;
         task.alertsRaised.add(alert);
-        void this.append(task, run.runId, 'alert', { alert, action: 'none', note: 'Alerta de supervisão; nenhum encerramento automático.' }).then(() => this.changed(task));
+        const data = alert === 'budget_warning' && budget
+          ? { alert, action: 'none', ...budget, note: 'Orçamento da execução acima de 80%. Nada é encerrado; ao esgotar, o próximo turno é recusado.' }
+          : { alert, action: 'none', note: 'Alerta de supervisão; nenhum encerramento automático.' };
+        void this.append(task, run.runId, 'alert', data).then(() => this.changed(task));
       }
       // Answered: the alert stops being true, so it stops being reported and
       // may fire again cleanly for the next decision.
@@ -2077,6 +2108,23 @@ export class TaskManager {
         task.alertsRaised.delete('decision_pending');
       }
     }
+  }
+
+  /**
+   * Names exhaustion once, the moment it becomes true, in the durable log.
+   *
+   * The refusal itself lives in deliverNext and enqueueMessage and needs no
+   * event to work. This is what makes it visible — to the panel, the feed and
+   * a coordinator reading the log later — instead of looking like a run that
+   * quietly stopped taking messages. Idempotent per run through alertsRaised,
+   * which startRun clears.
+   */
+  private async observeBudget(task: TaskState, run: RunState): Promise<void> {
+    const budget = budgetStatus(run, Date.now());
+    if (!budget?.exhausted || task.alertsRaised.has('budget_exhausted')) return;
+    task.alertsRaised.add('budget_exhausted');
+    await this.append(task, run.runId, 'budget_exhausted', { ...budget, note: BUDGET_EXHAUSTED_NOTE });
+    this.changed(task);
   }
 
   // ------------------------------------------------------------------ views
@@ -2150,6 +2198,8 @@ export class TaskManager {
             currentTool: full.currentRun.currentTool,
             turns: full.currentRun.turns,
             startedAt: full.currentRun.startedAt,
+            // A budget is the coordinator's decision to make, so it stays.
+            budget: full.currentRun.budget,
           }
         : null,
       // Kept in full: a pending decision is the thing the coordinator has to
@@ -2168,6 +2218,7 @@ export class TaskManager {
       runStartedAt: run ? Date.parse(run.startedAt) : now,
       lastActivityAt: task.lastActivityAt,
       oldestPendingRequestAt: oldestPendingAt(task),
+      budgetRatio: run ? (budgetStatus(run, now)?.ratio ?? null) : null,
       phase: run && run.finalizing && !run.finalized ? 'busy_model' : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)) || Boolean(run && run.finalizing && !run.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2221,6 +2272,7 @@ export class TaskManager {
         profile: run.contract.profile,
         contractVersion: run.contract.version,
         resumeMode: run.resumeMode,
+        budget: budgetStatus(run, now),
       } : null,
       previousSessionId: task.previousSessionId,
       pendingRequests: [...task.pending.values()],
@@ -2306,6 +2358,29 @@ export class TaskManager {
 
 /** A plain object, for validating loosely typed request bodies. */
 /** When the oldest unanswered request arrived, for the decision alert. */
+const TURN_TERMINAL_EVENTS = new Set(['turn_completed', 'turn_interrupted', 'turn_failed']);
+
+const BUDGET_EXHAUSTED_NOTE = 'Orçamento da execução esgotado: o turno em andamento termina normalmente, mas nenhum outro é entregue. Para continuar, encerre esta execução e inicie outra na mesma tarefa com limits maior e approvalRevision maior; a sessão anterior é retomada automaticamente.';
+
+/**
+ * Pure: what the run spent against what the job allowed. Null when the job set
+ * no limits at all, so "unlimited" and "0% used" never look alike. Tokens are
+ * input + cache + output, the number a paying user calls "tokens".
+ */
+function budgetStatus(run: RunState, now: number): RunBudgetView | null {
+  const { maxTokens, maxTurns, maxRuntimeSeconds } = run.contract.limits;
+  if (maxTokens === null && maxTurns === null && maxRuntimeSeconds === null) return null;
+  const elapsed = Math.max(0, Math.round(((run.endedAt ? Date.parse(run.endedAt) : now) - Date.parse(run.startedAt)) / 1000));
+  const tokens = maxTokens === null ? null : { used: run.tokensObserved, limit: maxTokens };
+  const turns = maxTurns === null ? null : { used: run.turns, limit: maxTurns };
+  const runtimeSeconds = maxRuntimeSeconds === null ? null : { used: elapsed, limit: maxRuntimeSeconds };
+  let ratio = 0;
+  for (const dimension of [tokens, turns, runtimeSeconds]) {
+    if (dimension) ratio = Math.max(ratio, dimension.used / dimension.limit);
+  }
+  return { tokens, turns, runtimeSeconds, ratio, exhausted: ratio >= 1 };
+}
+
 function oldestPendingAt(task: TaskState): number | null {
   let oldest: number | null = null;
   for (const request of task.pending.values()) {

@@ -1024,6 +1024,25 @@ function resolveAuth(job) {
   for (const key of Object.keys(raw)) if (key !== "allowApiBilling") throw new ContractError("AUTH_INVALID", `auth cont\xE9m o campo inesperado ${key}.`);
   return { allowApiBilling: allow === true };
 }
+var LIMIT_FIELDS = ["maxTurns", "maxTokens", "maxRuntimeSeconds"];
+function resolveLimits(job) {
+  const raw = own(job, "limits");
+  const limits2 = { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null };
+  if (raw === void 0 || raw === null) return limits2;
+  if (!isDict(raw)) throw new ContractError("LIMITS_INVALID", "limits deve ser um objeto.");
+  for (const key of Object.keys(raw)) {
+    if (!LIMIT_FIELDS.includes(key)) throw new ContractError("LIMITS_INVALID", `limits cont\xE9m o campo inesperado ${key}.`);
+  }
+  for (const field of LIMIT_FIELDS) {
+    const value = own(raw, field);
+    if (value === void 0 || value === null) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+      throw new ContractError("LIMITS_INVALID", `limits.${field} deve ser um inteiro positivo (ou ausente para n\xE3o limitar).`);
+    }
+    limits2[field] = value;
+  }
+  return limits2;
+}
 var REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/;
 function resolveRefName(value, field) {
   if (value === void 0 || value === null) return null;
@@ -1090,6 +1109,7 @@ function resolveV2(job) {
   const execution = resolveExecution(job, coordination, profileRaw);
   const codexThreadId = resolveThreadId(own(job, "codexThreadId"));
   const auth = resolveAuth(job);
+  const limits2 = resolveLimits(job);
   const resumeFrom = stringField(own(job, "resumeFrom"));
   const readOnly = profileRaw === "read" || coordination.phase === "planning";
   const capabilities = readOnly ? { edit: false, test: false, commands: "none" } : {
@@ -1110,7 +1130,7 @@ function resolveV2(job) {
     execution,
     launch: { permissionMode: "default", safeMode: false, permissionPromptsDisabled: false, restricted: false, strictMcpConfig: true },
     capabilities,
-    limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
+    limits: limits2,
     auth,
     resumeFrom,
     codexThreadId,
@@ -1159,6 +1179,9 @@ function resolveLegacyTimeoutPolicy(policy, timeoutSeconds) {
 function resolveLegacy(job) {
   if (Object.prototype.hasOwnProperty.call(job, "execution")) {
     throw new ContractError("V2_FIELD_IN_LEGACY", "O campo execution pertence ao contrato v2 (contractVersion: 2); o runner legado executa sempre no checkout declarado.");
+  }
+  if (Object.prototype.hasOwnProperty.call(job, "limits")) {
+    throw new ContractError("V2_FIELD_IN_LEGACY", "O campo limits pertence ao contrato v2 (contractVersion: 2); o runner legado s\xF3 conhece timeoutPolicy.");
   }
   const workspace = resolveWorkspace(own(job, "workspace"));
   const { prompt, promptFile } = resolvePrompt(job);
@@ -3017,6 +3040,7 @@ var SUPERVISION = {
   decisionPendingMs: 12e4
 };
 var COORDINATOR_ABSENT_LABEL = "aguardando coordenador";
+var BUDGET_WARNING_RATIO = 0.8;
 function evaluateSupervision(input) {
   const thresholds = input.thresholds ?? SUPERVISION;
   const coordinatorPresence = input.coordinatorLastSeenAt !== null && input.now - input.coordinatorLastSeenAt < thresholds.coordinatorAbsentMs ? "present" : "absent";
@@ -3035,6 +3059,10 @@ function evaluateSupervision(input) {
   if (!waiting && input.now - input.lastActivityAt >= thresholds.inactivityAlertMs) alerts.push("inactivity_20m");
   if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push("decision_pending");
   if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push("elapsed_2h");
+  if (input.budgetRatio !== null) {
+    if (input.budgetRatio >= BUDGET_WARNING_RATIO) alerts.push("budget_warning");
+    if (input.budgetRatio >= 1) alerts.push("budget_exhausted");
+  }
   const state = waiting && input.phase !== "waiting_permission" && input.phase !== "waiting_question" ? "waiting_permission" : input.phase;
   return { state, alerts, action: "none", coordinatorPresence, coordinatorLabel, requiresReview: false };
 }
@@ -4613,6 +4641,8 @@ var TaskManager = class {
   async enqueueMessage(task, text, source) {
     if (!task.run || task.run.finalized || task.run.finalizing || !task.worker) throw new HttpError(409, "NO_ACTIVE_RUN");
     if (task.uncertain) throw new HttpError(409, "REQUIRES_REVIEW", { message: "A execu\xE7\xE3o est\xE1 incerta; confirme a revis\xE3o antes de enviar novas orienta\xE7\xF5es." });
+    const budget = budgetStatus(task.run, Date.now());
+    if (budget?.exhausted) throw new HttpError(409, "BUDGET_EXHAUSTED", { message: "O or\xE7amento desta execu\xE7\xE3o esgotou; nenhum turno novo \xE9 entregue.", budget, note: BUDGET_EXHAUSTED_NOTE });
     const redacted = redactSensitiveText(text);
     const entry = { messageId: `msg-${randomUUID()}`, source, text: redacted, textPreview: boundedPreview(redacted, 300).preview, receivedAt: (/* @__PURE__ */ new Date()).toISOString(), deliveredAt: null, state: "queued" };
     task.queue.push(entry);
@@ -4696,6 +4726,7 @@ var TaskManager = class {
     if (!run2 || !task.worker || !task.workerReady || task.uncertain || run2.finalized || run2.finalizing) return;
     if (task.phase !== "idle") return;
     if (task.modelTransition) return;
+    if (budgetStatus(run2, Date.now())?.exhausted) return;
     const next = task.queue.find((entry) => entry.state === "queued");
     if (!next) return;
     next.state = "delivered";
@@ -4883,6 +4914,7 @@ var TaskManager = class {
       failureCode: null,
       telemetryFailures: 0,
       turns: 0,
+      tokensObserved: 0,
       resumeMode: task.previousSessionId ? "automatic" : "new",
       simulated: false,
       declaredWorkspace: worktreePlan ? workspace : null,
@@ -5272,6 +5304,10 @@ var TaskManager = class {
       case "event": {
         const event = await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
         if (task.claudeUsage.addEvent(event)) void this.persistUsage(task);
+        if (TURN_TERMINAL_EVENTS.has(message.type)) {
+          const usage2 = normalizeClaudeUsage(message.data.usage);
+          if (usage2) run2.tokensObserved += usage2.totalObservedTokens;
+        }
         this.applyEvent(task, run2, message.type, message.data, message.toolUseId);
         if (message.type === "permission_requested" || message.type === "question_asked") this.changed(task);
         break;
@@ -5311,6 +5347,7 @@ var TaskManager = class {
         run2.turns += 1;
         task.phase = "idle";
         task.currentTool = null;
+        await this.observeBudget(task, run2);
         await this.observeBetweenTurns(task, run2);
         await this.deliverNext(task);
         this.changed(task);
@@ -5643,11 +5680,13 @@ var TaskManager = class {
     {
       const run2 = task.run;
       if (!run2 || run2.finalized) return;
+      const budget = budgetStatus(run2, Date.now());
       const evaluation = evaluateSupervision({
         now: Date.now(),
         runStartedAt: Date.parse(run2.startedAt),
         lastActivityAt: task.lastActivityAt,
         oldestPendingRequestAt: oldestPendingAt(task),
+        budgetRatio: budget?.ratio ?? null,
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5673,15 +5712,36 @@ var TaskManager = class {
           }).then(() => this.changed(task));
           continue;
         }
+        if (alert === "budget_exhausted") {
+          void this.observeBudget(task, run2);
+          continue;
+        }
         if (task.alertsRaised.has(alert)) continue;
         task.alertsRaised.add(alert);
-        void this.append(task, run2.runId, "alert", { alert, action: "none", note: "Alerta de supervis\xE3o; nenhum encerramento autom\xE1tico." }).then(() => this.changed(task));
+        const data = alert === "budget_warning" && budget ? { alert, action: "none", ...budget, note: "Or\xE7amento da execu\xE7\xE3o acima de 80%. Nada \xE9 encerrado; ao esgotar, o pr\xF3ximo turno \xE9 recusado." } : { alert, action: "none", note: "Alerta de supervis\xE3o; nenhum encerramento autom\xE1tico." };
+        void this.append(task, run2.runId, "alert", data).then(() => this.changed(task));
       }
       if (task.pending.size === 0 && task.lastDecisionAlertAt !== null) {
         task.lastDecisionAlertAt = null;
         task.alertsRaised.delete("decision_pending");
       }
     }
+  }
+  /**
+   * Names exhaustion once, the moment it becomes true, in the durable log.
+   *
+   * The refusal itself lives in deliverNext and enqueueMessage and needs no
+   * event to work. This is what makes it visible — to the panel, the feed and
+   * a coordinator reading the log later — instead of looking like a run that
+   * quietly stopped taking messages. Idempotent per run through alertsRaised,
+   * which startRun clears.
+   */
+  async observeBudget(task, run2) {
+    const budget = budgetStatus(run2, Date.now());
+    if (!budget?.exhausted || task.alertsRaised.has("budget_exhausted")) return;
+    task.alertsRaised.add("budget_exhausted");
+    await this.append(task, run2.runId, "budget_exhausted", { ...budget, note: BUDGET_EXHAUSTED_NOTE });
+    this.changed(task);
   }
   // ------------------------------------------------------------------ views
   usageView(task) {
@@ -5749,7 +5809,9 @@ var TaskManager = class {
         observedModel: full.currentRun.observedModel,
         currentTool: full.currentRun.currentTool,
         turns: full.currentRun.turns,
-        startedAt: full.currentRun.startedAt
+        startedAt: full.currentRun.startedAt,
+        // A budget is the coordinator's decision to make, so it stays.
+        budget: full.currentRun.budget
       } : null,
       // Kept in full: a pending decision is the thing the coordinator has to
       // act on, and trimming it would hide what it is deciding about.
@@ -5766,6 +5828,7 @@ var TaskManager = class {
       runStartedAt: run2 ? Date.parse(run2.startedAt) : now,
       lastActivityAt: task.lastActivityAt,
       oldestPendingRequestAt: oldestPendingAt(task),
+      budgetRatio: run2 ? budgetStatus(run2, now)?.ratio ?? null : null,
       phase: run2 && run2.finalizing && !run2.finalized ? "busy_model" : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)) || Boolean(run2 && run2.finalizing && !run2.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5812,7 +5875,8 @@ var TaskManager = class {
         turns: run2.turns,
         profile: run2.contract.profile,
         contractVersion: run2.contract.version,
-        resumeMode: run2.resumeMode
+        resumeMode: run2.resumeMode,
+        budget: budgetStatus(run2, now)
       } : null,
       previousSessionId: task.previousSessionId,
       pendingRequests: [...task.pending.values()],
@@ -5884,6 +5948,21 @@ var TaskManager = class {
     return { events: collected, gapped };
   }
 };
+var TURN_TERMINAL_EVENTS = /* @__PURE__ */ new Set(["turn_completed", "turn_interrupted", "turn_failed"]);
+var BUDGET_EXHAUSTED_NOTE = "Or\xE7amento da execu\xE7\xE3o esgotado: o turno em andamento termina normalmente, mas nenhum outro \xE9 entregue. Para continuar, encerre esta execu\xE7\xE3o e inicie outra na mesma tarefa com limits maior e approvalRevision maior; a sess\xE3o anterior \xE9 retomada automaticamente.";
+function budgetStatus(run2, now) {
+  const { maxTokens, maxTurns, maxRuntimeSeconds } = run2.contract.limits;
+  if (maxTokens === null && maxTurns === null && maxRuntimeSeconds === null) return null;
+  const elapsed = Math.max(0, Math.round(((run2.endedAt ? Date.parse(run2.endedAt) : now) - Date.parse(run2.startedAt)) / 1e3));
+  const tokens = maxTokens === null ? null : { used: run2.tokensObserved, limit: maxTokens };
+  const turns = maxTurns === null ? null : { used: run2.turns, limit: maxTurns };
+  const runtimeSeconds = maxRuntimeSeconds === null ? null : { used: elapsed, limit: maxRuntimeSeconds };
+  let ratio = 0;
+  for (const dimension of [tokens, turns, runtimeSeconds]) {
+    if (dimension) ratio = Math.max(ratio, dimension.used / dimension.limit);
+  }
+  return { tokens, turns, runtimeSeconds, ratio, exhausted: ratio >= 1 };
+}
 function oldestPendingAt(task) {
   let oldest = null;
   for (const request of task.pending.values()) {
