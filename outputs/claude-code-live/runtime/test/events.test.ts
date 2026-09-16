@@ -1,7 +1,7 @@
 // Durable append-only event log with sequence numbers, crash-safe recovery at
 // exact byte boundaries, UTF-8 integrity, cursor replay without duplicates,
 // safe previews, redaction (including chunk-spanning credentials and hidden
-// blocks in any position) and derivation of the legacy compatibility files.
+// blocks in any position) and derivation of the per-run files.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFile, mkdir, readFile, writeFile, stat } from 'node:fs/promises';
@@ -349,7 +349,7 @@ describe('redaction and previews', () => {
 });
 
 describe('deriveCompatibilityFiles', () => {
-  test('derives legacy status/result/acompanhamento without double-counting text', async () => {
+  test('derives status/result/acompanhamento without double-counting text', async () => {
     const file = path.join(temp.root, 'derive', 'events.jsonl');
     const log = await EventLog.open(file);
     const base = { ...ids };

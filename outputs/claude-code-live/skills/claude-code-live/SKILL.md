@@ -5,113 +5,95 @@ description: Use when coordinating authorized Claude Code CLI work that needs ex
 
 # CodeOrquestra
 
-CodeOrquestra e a marca visivel desta integracao local independente para o Codex coordenar Opus e Fable; nao e produto oficial nem representa parceria entre OpenAI e Anthropic. Identificador tecnico: `codeorquestra`; o nome da skill permanece `claude-code-live` como alias legado documentado.
+CodeOrquestra e a marca visivel desta integracao local independente para o Codex coordenar Opus e Fable; nao e produto oficial nem representa parceria entre OpenAI e Anthropic. Identificador tecnico: `codeorquestra`; o nome da skill permanece `claude-code-live` como alias documentado, preservando instalacoes, caminhos de estado e automacoes existentes.
 
-Use o CLI instalado e a autenticacao existente: nada do Claude Code e empacotado nem substituido aqui, e nenhum SDK de fornecedor e importado em tempo de execucao. A skill coordena tanto sessoes locais quanto sessoes na nuvem; escolha o destino por tarefa, nao por preferencia fixa. Nao transforme isso em automacao recorrente. O usuario acompanha uma janela de terminal; o Codex coordena, le os resultados e verifica os artefatos. O encerramento do processo nunca prova que a tarefa foi aprovada.
+Use o CLI instalado e a autenticacao existente: nada do Claude Code e empacotado nem substituido aqui, e nenhum SDK de fornecedor e importado em tempo de execucao. A skill coordena sessoes locais (pelo runtime desta skill) e sessoes na nuvem (pelo proprio CLI); escolha o destino por tarefa, nao por preferencia fixa. Nao transforme isso em automacao recorrente. O Codex coordena, orienta, decide e revisa; o encerramento do processo nunca prova que a tarefa foi aprovada.
 
-Este documento descreve o runner legado (v1), que continua suportado sem alteracoes. O runtime v2 — sessao duravel multiturno, fila de orientacoes, permissoes e perguntas ao vivo, broker HTTP em loopback, adaptador MCP stdio (`codeorquestra_*`) e painel web — esta em `references/runtime-v2.md`, com detalhes de implementacao em `runtime/README.md`. As regras de dados, confianca em personalizacoes e autenticacao valem para as duas geracoes e estao em `references/security.md`.
+Este documento e o contrato principal. Os detalhes do runtime (comandos, ferramentas MCP, estados, travas, worktrees, pareamento, orcamento) estao em `references/runtime-v2.md`; dados, confianca em personalizacoes, autenticacao e superficie HTTP em `references/security.md`; sessoes na nuvem em `references/cloud.md`. O runner PowerShell (v1) foi aposentado: um job no formato antigo (sem `contractVersion`, com `mode`, `allowedCommands` ou `timeoutPolicy`) e recusado com a orientacao de migracao, nunca reinterpretado.
 
 ## Escolher o destino
 
 | Destino | Melhor quando | Fluxo |
 |---|---|---|
-| Local | O trabalho depende do checkout, arquivos locais, testes ou uma allowlist precisa | Use o job desta skill, painel ao vivo e perfis `diagnostic` ou `restricted` |
-| Nuvem | O trabalho pode ocorrer em sessao remota e se beneficia de recursos de nuvem do Claude Code | Use a sessao de nuvem do CLI, ou retome uma existente, e acompanhe-a pelo proprio CLI |
+| Local | O trabalho depende do checkout, arquivos locais e testes da maquina atual | Ferramentas `codeorquestra_*` desta skill, com painel ou acompanhamento narrado |
+| Nuvem | O trabalho pode ocorrer em sessao remota e se beneficia de recursos de nuvem do Claude Code | Sessao de nuvem do CLI, criada ou retomada e acompanhada pelo proprio CLI |
 
-Antes de escolher nuvem, confirme que o repositorio e os dados necessarios estao no ambiente remoto autorizado. Nao envie segredos, arquivos de ambiente, dados pessoais ou perfis reais para criar essa conveniencia. Antes de escolher local, verifique checkout, branch e alteracoes existentes. Se ambos servirem, prefira local para trabalho que requer validacao no computador atual; prefira nuvem para uma sessao remota independente ou revisao hospedada.
+Antes de escolher nuvem, confirme que o repositorio e os dados necessarios estao no ambiente remoto autorizado; nao envie segredos, arquivos de ambiente, dados pessoais ou perfis reais para criar essa conveniencia. Antes de escolher local, verifique checkout, branch e alteracoes existentes. Se ambos servirem, prefira local para trabalho que requer validacao no computador atual.
 
 ## Planejar e atribuir antes de executar
 
 Antes de iniciar implementacao ou qualquer mutacao, inspecione em modo somente leitura o necessario para propor um plano realista. Em uma unica tabela, apresente estas oito responsabilidades e atribua exatamente um ator a cada uma: `planning`, `inspection`, `implementation`, `testing`, `review`, `commit`, `push` e `deploy`. Os atores aceitos sao `codex`, `claude`, `user` e `not_applicable`. `deploy` inclui publicacao e qualquer mutacao externa.
 
-Explique o plano, a matriz e as permissoes que o job concedera, e aguarde aprovacao explicita do usuario. Silencio, envio do plano ou autorizacao anterior para uma tarefa diferente nao significam aprovacao. Antes da aprovacao final, uma sessao Claude pode participar do planejamento somente em `chat` ou `read`; nenhuma ferramenta de escrita ou comando e permitido.
+Explique o plano, a matriz e o que o job concedera, e aguarde aprovacao explicita do usuario. Silencio, envio do plano ou autorizacao anterior para uma tarefa diferente nao significam aprovacao. Antes da aprovacao final, uma execucao pode participar do planejamento somente com `phase: planning` (ou `profile: read`), que nao concede edicao nem comandos.
 
-Claude nunca recebe `commit`, `push` ou `deploy`. Essas responsabilidades pertencem ao Codex, ao usuario ou ficam como `not_applicable`. Depois da aprovacao, execute apenas as etapas atribuidas ao Claude. O Codex nao assume automaticamente as demais: segue a matriz e solicita nova decisao quando surgir uma acao que nao estava prevista.
+Claude nunca recebe `commit`, `push` ou `deploy`. Essas responsabilidades pertencem ao Codex, ao usuario ou ficam como `not_applicable`; o contrato recusa a atribuicao. Depois da aprovacao, execute apenas as etapas atribuidas ao Claude. O Codex nao assume automaticamente as demais: segue a matriz e solicita nova decisao quando surgir uma acao que nao estava prevista. Qualquer mudanca de plano, escopo ou responsavel exige nova aprovacao e `approvalRevision` maior.
 
 ## Contrato da tarefa
 
-Crie um arquivo de prompt completo e um job JSON fora do checkout ou dentro de uma pasta de trabalho autorizada. Use `apply_patch` para cria-los. Inclua no prompt objetivo, pasta autorizada, arquivos permitidos, criterios de aceite e regras relevantes do projeto. O executor usa safe mode: nao pressupor que CLAUDE.md, AGENTS.md, hooks ou skills do projeto serao carregados automaticamente. Leia-os e transmita as regras aplicaveis.
+O job e um objeto JSON `contractVersion: 2`, passado a `codeorquestra_start`. Inclua no prompt objetivo, pasta autorizada, criterios de aceite e as regras do projeto que se aplicam; o contexto de coordenacao entra como acrescimo ao prompt nativo do CLI. As personalizacoes do projeto (`CLAUDE.md`, `AGENTS.md`, hooks, skills, MCPs) so sao carregadas depois que o usuario as aprova pelo inventario de confianca (`codeorquestra_inventory` e `codeorquestra_trust`); enquanto algo estiver pendente, nenhuma fonte de configuracao entra.
 
 Campos do job:
 
-- `workspace`: caminho absoluto da pasta de trabalho.
-- `promptFile`: caminho absoluto do prompt, sem segredos ou PII.
-- `mode`: `chat`, `read`, `verify` ou `local`.
-- `profile`: `diagnostic` ou `restricted`; omitir equivale a `diagnostic` para compatibilidade.
-- `model`: opcional; omitir usa `fable`, atualmente apresentado ao usuario como Fable 5.1. Nao combinar com `modelPolicy`.
-- `modelPolicy`: opcional e opt-in. Em `quota-aware`, usa Fable como primario, Opus como alternativo e um limite configuravel de restante.
-- `effort`: opcional; omitir usa `high`. Valores aceitos: low, medium, high, xhigh ou max.
-- `coordination`: contrato obrigatorio com `phase`, `scopeId`, `approvalRevision`, `planSummary`, `planApproved` e `responsibilities` para as oito etapas.
-- `allowedCommands`: array opcional de objetos com `rule` e `responsibility`, por exemplo `{ "rule": "Bash(node check.cjs)", "responsibility": "testing" }`. Somente `verify` ou `local`. Inspecionar os scripts chamados antes de permitir a execucao. Nao usar Bash irrestrito nem regras genericas de interpretador.
-- `resumeFrom`: opcional; caminho para resultado.json de uma execucao anterior no mesmo workspace.
-- `codexThreadId`: fallback opcional para chamadas fora do Codex. Dentro do Codex, use automaticamente `CODEX_THREAD_ID`; nunca invente ou copie o id de outra tarefa.
-- `timeoutPolicy`: opcional. O padrao adaptativo renova a cada 1800 segundos quando houve atividade, encerra apos 1200 segundos sem eventos e aplica teto absoluto de 7200 segundos.
-- `timeoutSeconds`: compatibilidade legada para limite fixo positivo. Nao combinar com `timeoutPolicy`.
+- `contractVersion`: `2`, obrigatorio.
+- `workspace`: caminho absoluto da pasta de trabalho autorizada.
+- `prompt` ou `promptFile`: texto ou caminho absoluto, sem segredos ou PII.
+- `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura).
+- `model`: `{ "requested": "claude-fable-5-1" | "claude-opus-5", "reason": "<motivo>" }`; o identificador exato e obrigatorio e o motivo fica registrado. O runtime registra separadamente o modelo solicitado e o observado; divergencia encerra a execucao de forma visivel.
+- `effort`: `xhigh`, o unico autorizado; um rebaixamento relatado pelo CLI para a execucao em vez de trabalhar em silencio com menos.
+- `coordination`: `phase`, `scopeId`, `approvalRevision`, `planSummary`, `planApproved` e `responsibilities` para as oito etapas.
+- `scope`: `summary` e `paths` (ou `wholeWorkspace: true`), obrigatorio na execucao; escrita fora do escopo escala ao coordenador.
+- `execution`: opcional; `{ "mode": "worktree" }` pede uma arvore isolada para trabalho em paralelo (o usuario habilita o repositorio uma vez; ver a referencia).
+- `limits`: opcional; `maxTokens`, `maxTurns`, `maxRuntimeSeconds` fixam um orcamento para esta execucao.
+- `auth.allowApiBilling`: opcional; somente quando o usuario autorizar explicitamente um caminho que pode gerar cobranca por API. Sem isso, credenciais de API presentes no ambiente fazem a execucao falhar fechada.
+- `codexThreadId`: fallback opcional fora do Codex; nunca autoriza nada — a autorizacao e o `taskHandle`.
 
-`chat` nao oferece ferramentas; `read` oferece Read/Glob/Grep; `verify` acrescenta Bash somente para comandos exatos atribuidos a `inspection` ou `testing`; `local` acrescenta Write/Edit e pode executar comandos exatos de `inspection`, `implementation` ou `testing`. Cada comando exige que Claude seja o responsavel pela etapa indicada. Todos usam `dontAsk`, uma allowlist e `--permission-prompts none`: uma acao nao autorizada e negada, registrada como BLOCKED e nunca fica esperando uma aprovacao invisivel.
-
-Use `phase: planning` antes da aprovacao, somente com `chat` ou `read`; a matriz ja deve ter sido escolhida, mas `planApproved` pode ser falso e `planSummary` pode estar vazio. Use `phase: execution` somente com resumo nao vazio e `planApproved: true`. O executor recusa jobs antigos sem `coordination`, matrizes incompletas, atores invalidos, edicao quando `implementation` nao pertence ao Claude e comandos ligados a etapas de outro ator.
-
-Para implementacao atribuida ao Claude e autorizada, use por padrao `mode: local`, `profile: restricted`, modelo Fable e esforco high. Para testes atribuidos ao Claude quando outro ator implementa, use `verify`, que nao concede Write/Edit. O painel deve mostrar o modelo efetivo no inicio. Se o alias `fable` deixar de corresponder ao Fable 5.1 solicitado, pare a execucao antes de aceitar o trabalho e comunique a divergencia; nao troque silenciosamente de modelo. Para diagnostico sem comandos, continue usando `read`.
-
-| Perfil | Quando usar | Contencao |
-|---|---|---|
-| `diagnostic` | Diagnostico ou ambiente limpo sem personalizacoes do projeto | `--safe-mode`; ferramentas limitadas pelo job |
-| `restricted` | Analise ou alteracao local com a menor superficie pratica | `--restricted`, `--safe-mode` e MCP estrito; acesso limitado ao diretorio de trabalho |
-
-`restricted` e preferivel quando a tarefa nao depende de personalizacoes confiaveis do projeto. `diagnostic` nao e um sandbox de sistema operacional: ferramentas de arquivo e comandos aprovados ainda exigem um escopo confiavel e revisao; nao prometer isolamento de rede ou de filesystem.
+As capacidades derivam do contrato, nao de uma allowlist: `phase: planning` ou `profile: read` nao concedem edicao nem comandos; `implementation: claude` concede edicao; `testing: claude` concede testes. O classificador de acoes decide sobre o caminho resolvido e bloqueia arquivos sensiveis, escrita fora do escopo e operacoes reservadas ao Codex (commit, push, PR, deploy, publicacao, instalacao global, configuracao instalada, `git worktree` administrativo). O que ele nao decide sozinho vira um pedido de permissao visivel, que o coordenador responde; nada fica esperando uma aprovacao invisivel.
 
 Nao entregar credenciais, perfil real do owner, arquivos de ambiente, provider real, deploy ou banco externo ao Claude. Esta skill nao amplia a autorizacao da tarefa. No YOU Telecom CRM, o coordenador principal conserva o deploy e as mutacoes externas. Para mudancas locais, verificar a branch/worktree e preservar trabalho existente antes da delegacao.
 
 ## Executar e acompanhar
 
-Para toda execucao v2, o canal de acompanhamento e uma pre-condicao **verificada pelo broker**, nao apenas uma instrucao: com `observation.mode: "painel"` (padrao), registre a tarefa, obtenha `codeorquestra_dashboard_url`, abra ou reutilize **uma unica aba** do painel no navegador integrado e so entao chame `codeorquestra_start` — sem assinante do fluxo de eventos daquela tarefa o inicio e recusado com `OBSERVATION_REQUIRED`. Quando nao houver tela, declare `observation.mode: "voz"` e assuma o acompanhamento narrado; a escolha fica registrada em `run_started`. Use somente um mecanismo de abertura e aguarde seu resultado — nao tente um segundo navegador enquanto a primeira abertura estiver pendente. Uma aba ja aberta para a mesma tarefa deve ser reutilizada, nunca duplicada. O broker prova que um canal esta anexado; nao prova que alguem esta olhando.
+Ordem obrigatoria, verificada pelo broker:
 
-Execute `scripts/start-live.ps1 -JobFile <job.json> -RunDirectory <pasta-nova>` com PowerShell 7 pelo terminal do Codex. O executor usa `CODEX_THREAD_ID` para abrir ou reutilizar um painel, mutex e estado exclusivos da tarefa Codex atual. Jobs da mesma tarefa sao serializados; tarefas Codex diferentes podem executar simultaneamente e recebem sessoes Claude independentes. A consulta `/usage` continua serializada globalmente porque a quota pertence a conta. Comandos longos retornam uma sessao observavel; acompanhe com write_stdin. O usuario ja autorizou essa janela; nao pedir novamente.
+1. **Identidade.** `codeorquestra task register` no terminal, ou `codeorquestra_pair` com o codigo curto que o painel mostra, devolve o `taskHandle` desta tarefa Codex. Ele e a capacidade que autoriza todas as outras ferramentas; guarde-o na tarefa e nao o compartilhe. Um novo registro ou pareamento rotaciona o handle anterior.
+2. **Confianca.** `codeorquestra_inventory` lista o que o CLI carregaria; o usuario aprova por `codeorquestra_trust`. Mudanca material invalida a aprovacao.
+3. **Canal de acompanhamento.** Com `observation.mode: "painel"` (padrao), gere o link com `codeorquestra_dashboard_url`, abra ou reutilize **uma unica aba** e so entao inicie; sem assinante do fluxo daquela tarefa, o inicio e recusado com `OBSERVATION_REQUIRED`. Sem tela, declare `observation.mode: "voz"` e assuma o acompanhamento narrado; a escolha fica registrada em `run_started`. Nao combine mecanismos de abertura em paralelo nem duplique abas. A contagem prova que um canal esta anexado, nao que alguem esta olhando.
+4. **Inicio.** `codeorquestra_start` com o job. Execucoes da mesma tarefa serializam; uma trava de escrita por checkout atravessa tarefas; perfis somente leitura coexistem com um escritor.
 
-No runner legado v1, `start-live.ps1` abre ou reutiliza o painel antes de chamar o processo Claude. Nunca use `-NoPanel` fora do harness de testes; essa opcao exige adaptador simulado e nao pertence a uma execucao real.
+Durante o trabalho, a sessao e duravel e multiturno:
 
-Antes de cada execucao local, o executor consulta `/usage` sem ferramentas e mostra no painel o restante da sessao, da semana geral e da semana do Fable, com os respectivos horarios de renovacao. A consulta tambem fica registrada de forma sanitizada em `status.json` e `resultado.json`; nao persistir a resposta bruta, identificadores de MCP ou diagnosticos detalhados. Restante de 20% ou menos gera alerta; 5% ou menos gera alerta critico. A consulta nao autoriza compra de creditos, troca de modelo ou reducao de effort. Se ela falhar, mostrar `INDISPONIVEL` e deixar claro que o limite nao foi confirmado.
+- `codeorquestra_wait` faz long-poll dos eventos a partir de um cursor e registra a presenca do coordenador; sem ela o painel mostra "aguardando coordenador". Voce pode ficar em silencio por muito tempo, mas precisa voltar para decidir e para entregar.
+- `codeorquestra_message` enfileira orientacao para o **proximo** turno; `codeorquestra_annotate` anota um arquivo alterado e vira orientacao na fila. Nada e entregue no meio de um turno.
+- `codeorquestra_answer` responde permissao ou pergunta do Claude com `requestId` e `runId` exatos. Esperar uma decisao nao e inatividade, mas depois de dois minutos o alerta `decision_pending` repete ate alguem responder.
+- `codeorquestra_interrupt` aborta **o turno**; a sessao continua aberta. `codeorquestra_end` encerra a sessao e reconcilia o worker e a arvore de processos ainda atribuivel. So a interrupcao explicita aborta um turno.
+- `codeorquestra_set_model` troca o modelo entre turnos, com motivo; no meio de um turno e recusado.
+- `codeorquestra_usage_refresh` atualiza o bloco **Consumo por fonte**, somente leitura. Ele separa tokens Claude reportados, estimativa da tarefa Codex, limites e atividade Codex; nunca some provedores nem trate estimativa como medicao. Uma falha nele nao autoriza reduzir esforco, trocar modelo ou interromper Claude. Percentuais sao limites de uso da assinatura, nao saldo em dinheiro.
 
-O tempo adaptativo mede somente o processo Claude, nao a preparacao. Eventos JSON validos de texto, ferramentas ou conclusao atualizam a atividade. O executor registra renovacoes e encerra com `TIMEOUT` por `inactivity`, `hard_limit` ou, em jobs legados, `fixed_limit`. Nunca reinicie automaticamente: preserve sessao, arquivos e logs e faca o Codex revisar os artefatos antes de retomar.
+A supervisao so alerta: 20 minutos sem atividade e 2 horas decorridas geram `inactivity_20m` e `elapsed_2h`, e nada e encerrado sozinho. Um orcamento (`limits`) avisa em 80% e, ao esgotar, o broker recusa o proximo turno (`BUDGET_EXHAUSTED`) sem abortar o atual; para continuar, encerre e inicie outra execucao na mesma tarefa com `limits` maior e `approvalRevision` maior. Na mesma tarefa, a sessao Claude anterior e retomada automaticamente pela execucao seguinte; retomar nao desfaz edicoes nem repete ferramentas — reinspecione o estado e diga no prompt seguinte o que falta.
 
-Quando o usuario aprovar selecao automatica por quota, omita `model` e use `modelPolicy: { "mode": "quota-aware", "primary": "fable", "alternate": "opus", "switchAtRemainingPercent": 3 }`. O limite e opcional, padrao 3, e aceita inteiro de 1 a 20. Antes de iniciar ou retomar, calcule a capacidade compartilhada como o menor restante entre sessao e semana geral; o restante efetivo do Fable e o menor entre capacidade compartilhada e limite Fable. Use Fable acima do limite, Opus quando apenas Fable estiver no limite ou abaixo, e bloqueie quando a capacidade compartilhada estiver no limite ou abaixo. Se `/usage` falhar ou mudar de formato, bloqueie somente o job quota-aware; jobs de modelo fixo preservam o comportamento anterior. Reavalie em cada inicio/retomada para voltar ao Fable depois da renovacao. Nao use `--fallback-model` para isso. Registre politica, percentuais sanitizados, solicitado, efetivo e motivo no painel e nos JSONs. Mudanca da politica em retomada requer aprovacao nova e `approvalRevision` maior.
+Um fim de sessao que ninguem pediu nunca vira `COMPLETED`: o worker desaparecer ou o broker reiniciar com trabalho em andamento deixa a execucao `UNCERTAIN`, exige revisao explicita (`codeorquestra task review` ou `acknowledgeReview`) antes de outra execucao, e mensagens que estavam na fila nao sao reentregues. Um checkout cuja arvore de processos nao pode ser provada limpa fica em quarentena; revisar o diff nao libera a trava, e a liberacao administrativa e uma acao do usuario.
 
-Esses percentuais representam limites de uso da assinatura, nao saldo monetario de creditos pre-pagos. Para saldo financeiro, encaminhar o usuario ao painel Usage da conta; nunca inferir um valor em dinheiro a partir dos percentuais do CLI.
-
-No runtime v2, acompanhe o bloco **Consumo por fonte**. Ele separa tokens Claude reportados, estimativa da tarefa Codex, limites e atividade Codex; nunca some provedores ou trate estimativa como medicao. Para atualizar sob pedido, use `codeorquestra_usage_refresh` com o `taskHandle`. A ferramenta e somente leitura e uma falha nela nao autoriza reduzir esforco, trocar modelo ou interromper Claude.
-
-O gerenciamento nativo do CLI em segundo plano continua disponivel fora do runtime v2, mas nao substitui o painel obrigatorio nas execucoes CodeOrquestra v2. Segundo plano nao amplia permissoes: mantenha o mesmo perfil e a mesma allowlist.
+Nao mostrar eventos JSON brutos, argumentos/resultados de ferramentas, stderr ou raciocinio interno. O texto publico e armazenado; portanto somente delegar dados autorizados e sanitizados. Nao alegar redacao automatica de qualquer segredo. Fechar o painel nao encerra nada: ele e uma visualizacao.
 
 ## Trabalho em equipe Codex-Claude
 
 Para tarefas de engenharia, trabalhe em ciclos verificaveis:
 
 1. O Codex delimita o objetivo, o workspace, as regras do projeto e os criterios de aceite.
-2. O Claude executa somente as etapas que a matriz lhe atribuiu, nos arquivos autorizados e com os testes/comandos permitidos.
-3. O Codex revisa o diff e as evidencias independentemente. Quando houver lacuna, risco ou alternativa melhor, envia uma correcao objetiva retomando a mesma sessao.
+2. O Claude executa somente as etapas que a matriz lhe atribuiu, nos caminhos do escopo e com as ferramentas que o contrato deriva.
+3. O Codex revisa o diff e as evidencias independentemente. Quando houver lacuna, risco ou alternativa melhor, envia uma correcao objetiva pela fila (`codeorquestra_message` ou `codeorquestra_annotate`) na mesma sessao.
 4. O Claude revisa a proposta corrigida ou o novo diff. O Codex decide pela aceitacao com base nos artefatos e testes, nao por concordancia entre modelos.
-
-Na mesma tarefa Codex, o executor retoma automaticamente a ultima sessao Claude apenas quando thread, workspace, modo, perfil, effort, modelo/politica, plano, revisao e matriz forem identicos. Qualquer diferenca inicia sessao nova. Use `resumeFrom` para retomada explicita quando o objetivo e o workspace continuarem compativeis; resultados vinculados a outra tarefa Codex sao rejeitados. Resultados legados sem identidade de tarefa seguem as verificacoes anteriores. Qualquer mudanca aprovada exige `approvalRevision` maior. Mantenha no prompt seguinte um resumo curto das decisoes, evidencias e pendencias; deixe o Claude reler o codigo necessario com as ferramentas autorizadas, em vez de copiar o repositorio inteiro para o prompt.
 
 Os modelos colaboram por propostas, diffs, resultados de testes e respostas publicas; nao alegue acesso ao raciocinio interno de nenhum deles. Divergencias sao resolvidas por evidencia reproduzivel. O Codex permanece responsavel por autorizacao, revisao final, mutacoes externas e deploy.
 
 ## Sessoes na nuvem
 
-Para uma tarefa na nuvem, aplique primeiro o mesmo plano, matriz e aprovacao explicita. Crie uma nova sessao descrevendo somente as etapas atribuidas ao Claude ou conecte-se a uma sessao ja existente pelo identificador ou link que o usuario forneceu. O runner local nao controla o backend de nuvem; portanto o Codex deve preservar a matriz no prompt e bloquear manualmente qualquer ampliacao. Use um ambiente remoto especifico somente quando ele tiver sido indicado. Para trabalho longo, o CLI oferece execucao em segundo plano, listagem, logs, conexao ao terminal e interrupcao; acompanhe marcos reais e pare diante de bloqueio, desvio de escopo ou necessidade de nova autorizacao. O uso de recursos em nuvem, agentes hospedados, revisao remota, plugins ou navegador precisa estar no pedido do usuario e manter os mesmos limites de dados e autorizacao.
+Para uma tarefa na nuvem, aplique primeiro o mesmo plano, matriz e aprovacao explicita. Crie uma nova sessao descrevendo somente as etapas atribuidas ao Claude ou conecte-se a uma sessao ja existente pelo identificador ou link que o usuario forneceu. O runtime local nao controla o backend de nuvem; portanto o Codex deve preservar a matriz no prompt e bloquear manualmente qualquer ampliacao. Use um ambiente remoto especifico somente quando ele tiver sido indicado. Acompanhe marcos reais e pare diante de bloqueio, desvio de escopo ou necessidade de nova autorizacao. O uso de recursos em nuvem, agentes hospedados, revisao remota, plugins ou navegador precisa estar no pedido do usuario e manter os mesmos limites de dados e autorizacao.
 
 Nao trate limite de uso da assinatura como autorizacao para ampliar escopo ou iniciar varias sessoes. Em fluxos por API, use um teto de gasto apenas quando o usuario o tiver autorizado; em fluxos por assinatura, acompanhe somente a janela de uso exibida pelo produto e comunique indisponibilidade sem tentar contornar limites.
 
-Leia `acompanhamento.txt` e `status.json` na pasta da execucao em intervalos razoaveis enquanto o terminal mostra os eventos ao vivo. O modelo efetivo aparece no inicio. Nao repetir atualizacoes sem mudanca; comunicar resultado, bloqueio ou mudanca concreta. Nao mostrar eventos JSON brutos, argumentos/resultados de ferramentas, stderr ou raciocinio interno. O texto publico e armazenado; portanto somente delegar dados autorizados e sanitizados. Nao alegar redacao automatica de qualquer segredo.
-
-O usuario pode apertar Q no painel da tarefa ou pedir parada aqui. Para parar por aqui, crie `stop.request` na pasta exata da execucao com `apply_patch`; o executor solicita o encerramento do processo filho e reconcilia a arvore ainda atribuivel. Ctrl+C no terminal executor tambem aciona a limpeza no finally. Isso e coordenacao cooperativa, nao isolamento do SO: queda, saida anormal ou arvore historica inconclusiva deixam o checkout em quarentena. X ou fechar o painel encerra somente a visualizacao, nao o trabalho; o painel daquela tarefa reabre na proxima chamada.
-
-`resultado.json` contem status, sessionId, workspace, modelo, perfil, contrato de coordenacao sanitizado, politica e motivo de tempo, nomes das ferramentas, quantidade de falhas de ferramenta, negativas de permissao e resposta final. O painel mostra fase, escopo, revisao aprovada, resumo, responsaveis e renovacoes de tempo. `COMPLETED` significa que o CLI terminou, nao que a tarefa foi aprovada. `FAIL`, `BLOCKED`, `CANCELLED` e `TIMEOUT` nunca sao sucesso. Logs ficam preservados; nao sobrescrever uma pasta de execucao anterior.
-
-Para continuar na mesma tarefa Codex, crie outro job compatível em outra pasta de execucao; o executor usa o ponteiro duravel `session.json` e retoma automaticamente. Use `resumeFrom` para escolher explicitamente um resultado compativel. A retomada conserva o contexto salvo, nao desfaz edicoes nem repete ferramentas automaticamente. Reinspecione artefatos depois de interrupcao e explique o que falta no prompt seguinte. Nunca reexecutar cegamente uma mutacao. Use sessao em nuvem, plugins, diretorios adicionais, Chrome e agentes somente quando o usuario os pedir explicitamente; eles aumentam o escopo de acesso e nao fazem parte do caminho padrao.
-
 ## Aceitacao
 
-A compatibilidade de retomada inclui `allowedCommands`, normalizados e ordenados com suas responsabilidades. Resultados antigos sem esse campo nao retomam automaticamente; para retomada explicita exigem `approvalRevision` maior, assim como mudancas nos comandos. Falhas de preparacao geram estado terminal sanitizado e preservam o ponteiro da ultima sessao confirmada. `startedAt` alimenta o tempo decorrido do painel e `usageCheckedAt` data a tentativa de consulta inicial. Nao apresentar esses limites como monitoramento continuo nem prometer troca durante uma execucao. O painel identifica a tarefa no titulo e le novos bytes do log incrementalmente. Os adaptadores e parametros de teste sao exclusivos do harness local confiavel, nunca do job delegado.
+`COMPLETED` significa que o transporte terminou, nunca que o trabalho foi aprovado; `FAIL`, `CANCELLED` e `UNCERTAIN` nunca sao sucesso. Cada execucao preserva o log de eventos append-only e os arquivos derivados `acompanhamento.txt`, `status.json` e `resultado.json` na sua pasta; logs nunca sao sobrescritos. O painel separa "arquivos alterados observados" (pelo git do workspace) de "autoria do Claude comprovada" (registrada pelas ferramentas), e nunca mostra porcentagem de progresso inventada.
 
-Verifique os arquivos e execute os testes relevantes independentemente do relato do Claude. Registre a distincao entre transporte concluido, ferramentas executadas e comportamento aprovado. Use o fluxo normal do projeto para revisao, commit e eventual deploy; a skill nao os executa automaticamente. Para diagnostico da instalacao, use a verificacao de saude do CLI antes de alterar configuracoes; para limite de custo em chamadas por API, defina um teto somente quando o usuario o tiver autorizado.
+Verifique os arquivos e execute os testes relevantes independentemente do relato do Claude. Registre a distincao entre transporte concluido, ferramentas executadas e comportamento aprovado. Use o fluxo normal do projeto para revisao, commit e eventual deploy; a skill nao os executa automaticamente. Para diagnostico da instalacao, use `codeorquestra doctor`, que so faz sondagens somente leitura. Os adaptadores e parametros de teste sao exclusivos do harness local confiavel, nunca do job delegado.

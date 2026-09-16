@@ -22,7 +22,7 @@ Para conectar a sessao existente, use somente um identificador ou URL fornecido/
 claude --cloud '<session-id-ou-url>'
 ```
 
-Use `--environment <environment_id>` apenas quando o ambiente remoto especifico tiver sido indicado. `--cloud` nao herda os perfis `diagnostic` e `restricted` do executor local; portanto, limite o escopo no prompt e nas opcoes suportadas pela sessao remota e nao alegue equivalencia de contencao.
+Use `--environment <environment_id>` apenas quando o ambiente remoto especifico tiver sido indicado. `--cloud` nao herda o perfil, o escopo nem o classificador de acoes do runtime local; portanto, limite o escopo no prompt e nas opcoes suportadas pela sessao remota e nao alegue equivalencia de contencao.
 
 ## Acompanhamento e retomada
 

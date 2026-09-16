@@ -54,17 +54,6 @@ export function jobV2(workspace: string, overrides: Record<string, unknown> = {}
   };
 }
 
-export function legacyJob(workspace: string, promptFile: string): Record<string, unknown> {
-  return {
-    workspace,
-    promptFile,
-    mode: 'verify',
-    profile: 'restricted',
-    coordination: coordination({ responsibilities: responsibilities({ implementation: 'codex' }) }),
-    allowedCommands: [{ rule: 'Bash(pwsh -NoProfile -File tests.ps1)', responsibility: 'testing' }],
-  };
-}
-
 export const USAGE_SAMPLE = [
   'Current session: 10% used · resets Sep 6, 9:19pm (America/Sao_Paulo)',
   'Current week (all models): 23% used · resets Sep 10, 8:59pm (America/Sao_Paulo)',

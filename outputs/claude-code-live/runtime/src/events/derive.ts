@@ -1,14 +1,10 @@
-// Derives the legacy compatibility files (status.json, resultado.json and
-// acompanhamento.txt) from the durable event log. Text deltas are never
-// counted twice: only completed assistant messages appear in the transcript.
+// Derives the per-run files (status.json, resultado.json and
+// acompanhamento.txt) from the durable event log. The v1 runner introduced
+// them; v2 keeps them as the human-readable record of a run, with the same
+// keys so nothing that reads a run directory has to know which runtime wrote
+// it. Text deltas are never counted twice: only completed assistant messages
+// appear in the transcript.
 import type { EventRecord, RunStatus } from '../shared/types.ts';
-
-export const LEGACY_STATUS_KEYS = [
-  'status', 'codexThreadId', 'startedAt', 'sessionId', 'result', 'exitCode', 'elapsedSeconds', 'toolCalls',
-  'workspace', 'requestedModel', 'selectedModel', 'model', 'effort', 'mode', 'profile', 'coordination',
-  'usage', 'usageCheckedAt', 'toolErrors', 'permissionDenials', 'lastActivityAt', 'runtimeSeconds',
-  'resumeMode', 'allowedCommands', 'timeoutPolicy', 'timeoutReason', 'failureStage',
-] as const;
 
 export const SUPERVISED_TIMEOUT_POLICY = { mode: 'supervised', inactivityAlertSeconds: 1200, elapsedAlertSeconds: 7200, killTimers: false } as const;
 

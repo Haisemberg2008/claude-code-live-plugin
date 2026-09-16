@@ -1,18 +1,19 @@
 # Runtime v2: sessao duravel, broker local e ferramentas MCP
 
-Esta referencia descreve o runtime v2 do CodeOrquestra (`runtime/` no pacote). O runner legado v1, descrito em `local.md`, continua suportado sem alteracoes. Identificador tecnico: `codeorquestra`; alias legado documentado: `claude-code-live`.
+Esta referencia descreve o runtime do CodeOrquestra (`runtime/` no pacote), a unica geracao em uso: o runner PowerShell v1 foi aposentado em setembro de 2026. Identificador tecnico: `codeorquestra`; alias documentado: `claude-code-live`.
 
-## O que muda em relacao ao v1
+## O que o runtime garante
 
-| | v1 | v2 |
-|---|---|---|
-| Unidade de trabalho | uma execucao com prompt fixo | uma **sessao duravel** por tarefa Codex, com varios turnos |
-| Orientacao durante o trabalho | nao ha | fila de mensagens entregues no proximo turno |
-| Permissoes | `dontAsk` + allowlist; fora do escopo e negado na hora | pedido visivel ao coordenador, que decide; a espera nao e inatividade |
-| Perguntas do Claude | nao ha | `AskUserQuestion` chega ao painel e ao MCP como pergunta, com opcoes |
-| Interrupcao | encerra a execucao | aborta **o turno**; a sessao continua aberta |
-| Acompanhamento | painel de console + `acompanhamento.txt` | painel web + log de eventos append-only (os arquivos v1 continuam sendo derivados) |
-| Tempo | 20 min de inatividade e 2 h encerram | 20 min e 2 h **alertam**; nada encerra sozinho |
+| | |
+|---|---|
+| Unidade de trabalho | uma **sessao duravel** por tarefa Codex, com varios turnos |
+| Orientacao durante o trabalho | fila de mensagens entregues no proximo turno; nada entra no meio de um turno |
+| Permissoes | pedido visivel ao coordenador, que decide; a espera nao e inatividade |
+| Perguntas do Claude | `AskUserQuestion` chega ao painel e ao MCP como pergunta, com opcoes |
+| Interrupcao | aborta **o turno**; a sessao continua aberta |
+| Acompanhamento | painel web + log de eventos append-only; `status.json`, `resultado.json` e `acompanhamento.txt` continuam derivados por execucao |
+| Tempo | 20 min de inatividade e 2 h decorridas **alertam**; nada encerra sozinho. `limits` fixa um orcamento por execucao |
+| Formato v1 | um job sem `contractVersion` e recusado com `CONTRACT_VERSION_REQUIRED` e a orientacao de migracao; nunca e reinterpretado |
 
 ## Como o Claude Code e acionado
 
@@ -32,7 +33,7 @@ A troca de modelo so acontece **entre turnos**, com motivo registrado; no meio d
 
 ## Quota
 
-A leitura de `/usage` reusa o parser sanitizado do v1 sob o mesmo mutex global `Local\ClaudeLiveQuota`, para que v1 e v2 nunca consultem ao mesmo tempo. O limite de 3% e **recomendacao**, nao bloqueio: uma quota desconhecida continua desconhecida e nao impede um modelo fixo autorizado pelo usuario. Valores monetarios nunca sao inventados.
+A leitura de `/usage` usa o parser sanitizado portado do v1 sob o mutex global `Local\ClaudeLiveQuota`; o nome foi mantido para que uma instalacao antiga que ainda rode o v1 nunca consulte ao mesmo tempo. O limite de 3% e **recomendacao**, nao bloqueio: uma quota desconhecida continua desconhecida e nao impede um modelo fixo autorizado pelo usuario. Valores monetarios nunca sao inventados.
 
 ## Comandos do CLI
 
@@ -103,7 +104,7 @@ Uma execucao v2 exige um canal de acompanhamento **declarado**, e o broker verif
 }
 ```
 
-- `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura). Os perfis legados `diagnostic` e `restricted` pertencem ao v1 e sao recusados aqui.
+- `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura). Os perfis `diagnostic` e `restricted` pertenciam ao v1 e sao recusados (`PROFILE_INVALID`), assim como `mode`, `allowedCommands`, `modelPolicy`, `timeoutPolicy` e `timeoutSeconds` (`LEGACY_FIELD_IN_V2`, com o equivalente v2 nomeado na mensagem).
 - As capacidades **derivam** do contrato: `phase: "planning"` ou `profile: "read"` nao concedem edicao nem comandos; `implementation: "claude"` concede edicao; `testing: "claude"` concede testes.
 - `auth.allowApiBilling` e opcional e so deve ser usado quando o usuario autorizar explicitamente um caminho que pode gerar cobranca por API.
 - `limits` e opcional e fixa um orcamento por execucao (tokens, turnos, segundos); veja "Orcamento por execucao".
@@ -272,8 +273,9 @@ combinacao das tres dimensoes:
   `limits` maior e `approvalRevision` maior; a sessao anterior e retomada
   automaticamente. Subir o orcamento e uma re-aprovacao, e passa pelo
   mecanismo de re-aprovacao que ja existe.
-- O runner legado (v1) so conhece `timeoutPolicy`; `limits` num job v1 e
-  recusado com `V2_FIELD_IN_LEGACY`, nunca ignorado.
+- `timeoutPolicy` e `timeoutSeconds` do formato v1 sao recusados com
+  `LEGACY_FIELD_IN_V2`; `limits.maxRuntimeSeconds` e o equivalente, com a
+  diferenca de que nada e encerrado.
 
 Existe porque o teto de paralelismo e a quota da conta limitam a frota, nao uma
 execucao: um agente em laco queimava a semana inteira sem nenhuma recusa no

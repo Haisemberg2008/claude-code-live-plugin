@@ -859,18 +859,9 @@ import path14 from "node:path";
 // src/contract/job-contract.ts
 var CONTRACT_VERSION = 2;
 var AUTHORIZED_MODELS = ["claude-fable-5-1", "claude-opus-5"];
-var EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-var LEGACY_MODEL_ALIASES = /* @__PURE__ */ new Map([
-  ["fable", "claude-fable-5-1"],
-  ["opus", "claude-opus-5"],
-  ["claude-fable-5-1", "claude-fable-5-1"],
-  ["claude-opus-5", "claude-opus-5"]
-]);
 var OWNERS = ["codex", "claude", "user", "not_applicable"];
 var RESERVED_RESPONSIBILITIES = ["commit", "push", "deploy"];
 var THREAD_ID_PATTERN2 = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-var LEGACY_RULE_PATTERN = /^Bash\([^*\r\n]+\)$/;
-var LEGACY_CRITICAL_PATTERN = /(\bgit\b[^)\r\n]*\b(commit|push)\b|\bgh\s+pr\s+(create|merge)\b|\b(deploy|publish)\b)/i;
 var ContractError = class extends Error {
   code;
   constructor(code, message) {
@@ -935,11 +926,6 @@ function resolveEffortV2(value) {
   if (value === void 0 || value === null) return "xhigh";
   if (value !== "xhigh") throw new ContractError("EFFORT_NOT_XHIGH", "Somente o esfor\xE7o xhigh (Extra) \xE9 autorizado em jobs v2; nenhum downgrade \xE9 permitido.");
   return "xhigh";
-}
-function resolveEffortLegacy(value) {
-  if (value === void 0 || value === null) return "high";
-  if (typeof value !== "string" || !EFFORT_LEVELS.includes(value)) throw new ContractError("EFFORT_INVALID", "effort legado deve ser low, medium, high, xhigh ou max.");
-  return value;
 }
 function resolveThreadId(value) {
   if (value === void 0 || value === null) return null;
@@ -1094,13 +1080,13 @@ function resolveExecution(job, coordination, profile) {
   };
 }
 function resolveV2(job) {
-  for (const legacyField of ["mode", "allowedCommands", "modelPolicy", "timeoutPolicy", "timeoutSeconds"]) {
-    if (Object.prototype.hasOwnProperty.call(job, legacyField)) throw new ContractError("LEGACY_FIELD_IN_V2", `O campo legado ${legacyField} n\xE3o existe no contrato v2.`);
+  for (const [field, replacement] of Object.entries(V1_FIELD_REPLACEMENTS)) {
+    if (Object.prototype.hasOwnProperty.call(job, field)) throw new ContractError("LEGACY_FIELD_IN_V2", `O campo ${field} pertencia ao contrato v1, aposentado; no v2, ${replacement}.`);
   }
   const workspace = resolveWorkspace(own(job, "workspace"));
   const { prompt, promptFile } = resolvePrompt(job);
   const profileRaw = resolveProfileField(job, "development");
-  if (profileRaw === "diagnostic" || profileRaw === "restricted") throw new ContractError("PROFILE_INVALID", "Perfis diagnostic e restricted pertencem ao contrato legado; use development ou read.");
+  if (profileRaw === "diagnostic" || profileRaw === "restricted") throw new ContractError("PROFILE_INVALID", "Os perfis diagnostic e restricted pertenciam ao contrato v1, aposentado; use development ou read.");
   if (profileRaw !== "development" && profileRaw !== "read") throw new ContractError("PROFILE_INVALID", "profile deve ser development ou read.");
   const coordination = resolveCoordination(own(job, "coordination"));
   const model = resolveModelV2(own(job, "model"));
@@ -1133,124 +1119,22 @@ function resolveV2(job) {
     limits: limits2,
     auth,
     resumeFrom,
-    codexThreadId,
-    legacy: null
+    codexThreadId
   };
 }
-function resolveLegacyModelPolicy(value) {
-  if (value === void 0 || value === null) return null;
-  if (!isDict(value)) throw new ContractError("LEGACY_MODEL_POLICY_INVALID", "modelPolicy deve ser um objeto.");
-  for (const field of Object.keys(value)) {
-    if (!["mode", "primary", "alternate", "switchAtRemainingPercent"].includes(field)) throw new ContractError("LEGACY_MODEL_POLICY_INVALID", `modelPolicy cont\xE9m o campo inesperado ${field}.`);
-  }
-  if (own(value, "mode") !== "quota-aware" || own(value, "primary") !== "fable" || own(value, "alternate") !== "opus") {
-    throw new ContractError("LEGACY_MODEL_POLICY_INVALID", "modelPolicy.mode deve ser quota-aware com primary fable e alternate opus.");
-  }
-  const threshold = own(value, "switchAtRemainingPercent") ?? 3;
-  if (!Number.isInteger(threshold) || threshold < 1 || threshold > 20) {
-    throw new ContractError("LEGACY_MODEL_POLICY_INVALID", "modelPolicy.switchAtRemainingPercent deve ser um inteiro de 1 a 20.");
-  }
-  return { mode: "quota-aware", primary: "fable", alternate: "opus", switchAtRemainingPercent: threshold };
-}
-function positiveLegacyInteger(value, field) {
-  if (!isPositiveInteger(value) || value > 2147483647) throw new ContractError("LEGACY_TIMEOUT_INVALID", `${field} deve ser um inteiro positivo.`);
-  return value;
-}
-function resolveLegacyTimeoutPolicy(policy, timeoutSeconds) {
-  if (policy !== void 0 && policy !== null && timeoutSeconds !== void 0 && timeoutSeconds !== null) {
-    throw new ContractError("LEGACY_TIMEOUT_CONFLICT", "Use timeoutSeconds ou timeoutPolicy, nunca ambos.");
-  }
-  if (timeoutSeconds !== void 0 && timeoutSeconds !== null) {
-    return { mode: "fixed", timeoutSeconds: positiveLegacyInteger(timeoutSeconds, "timeoutSeconds") };
-  }
-  const value = policy === void 0 || policy === null ? { mode: "adaptive" } : policy;
-  if (!isDict(value)) throw new ContractError("LEGACY_TIMEOUT_INVALID", "timeoutPolicy deve ser um objeto.");
-  for (const field of Object.keys(value)) {
-    if (!["mode", "renewEverySeconds", "idleAfterSeconds", "hardStopAfterSeconds"].includes(field)) throw new ContractError("LEGACY_TIMEOUT_INVALID", `timeoutPolicy cont\xE9m o campo inesperado ${field}.`);
-  }
-  if (own(value, "mode") !== "adaptive") throw new ContractError("LEGACY_TIMEOUT_INVALID", "timeoutPolicy.mode deve ser adaptive.");
-  const renew = positiveLegacyInteger(own(value, "renewEverySeconds") ?? 1800, "timeoutPolicy.renewEverySeconds");
-  const idle = positiveLegacyInteger(own(value, "idleAfterSeconds") ?? 1200, "timeoutPolicy.idleAfterSeconds");
-  const hard = positiveLegacyInteger(own(value, "hardStopAfterSeconds") ?? 7200, "timeoutPolicy.hardStopAfterSeconds");
-  if (renew >= hard) throw new ContractError("LEGACY_TIMEOUT_INVALID", "timeoutPolicy.renewEverySeconds deve ser menor que hardStopAfterSeconds.");
-  if (idle >= hard) throw new ContractError("LEGACY_TIMEOUT_INVALID", "timeoutPolicy.idleAfterSeconds deve ser menor que hardStopAfterSeconds.");
-  return { mode: "adaptive", renewEverySeconds: renew, idleAfterSeconds: idle, hardStopAfterSeconds: hard };
-}
-function resolveLegacy(job) {
-  if (Object.prototype.hasOwnProperty.call(job, "execution")) {
-    throw new ContractError("V2_FIELD_IN_LEGACY", "O campo execution pertence ao contrato v2 (contractVersion: 2); o runner legado executa sempre no checkout declarado.");
-  }
-  if (Object.prototype.hasOwnProperty.call(job, "limits")) {
-    throw new ContractError("V2_FIELD_IN_LEGACY", "O campo limits pertence ao contrato v2 (contractVersion: 2); o runner legado s\xF3 conhece timeoutPolicy.");
-  }
-  const workspace = resolveWorkspace(own(job, "workspace"));
-  const { prompt, promptFile } = resolvePrompt(job);
-  const coordination = resolveCoordination(own(job, "coordination"));
-  const mode = stringField(own(job, "mode"));
-  if (mode !== "chat" && mode !== "read" && mode !== "verify" && mode !== "local") throw new ContractError("MODE_INVALID", "mode deve ser chat, read, verify ou local.");
-  if (coordination.phase === "planning" && mode !== "chat" && mode !== "read") throw new ContractError("PLANNING_MODE_INVALID", "Um job de planejamento s\xF3 pode usar chat ou read.");
-  if (mode === "local" && coordination.responsibilities.implementation !== "claude") throw new ContractError("LOCAL_REQUIRES_IMPLEMENTATION", "O modo local exige que o Claude seja respons\xE1vel por implementation.");
-  const profileRaw = resolveProfileField(job, "diagnostic");
-  if (profileRaw === "development" || profileRaw === "read") throw new ContractError("PROFILE_REQUIRES_V2", "O perfil development pertence ao contrato v2 (contractVersion: 2).");
-  if (profileRaw !== "diagnostic" && profileRaw !== "restricted") throw new ContractError("PROFILE_INVALID", "profile deve ser diagnostic ou restricted.");
-  const modelRaw = own(job, "model");
-  const policyRaw = own(job, "modelPolicy");
-  if (modelRaw !== void 0 && modelRaw !== null && policyRaw !== void 0 && policyRaw !== null) throw new ContractError("LEGACY_MODEL_CONFLICT", "Use model ou modelPolicy, nunca ambos.");
-  if (modelRaw !== void 0 && modelRaw !== null && typeof modelRaw !== "string") throw new ContractError("MODEL_NOT_AUTHORIZED", "model legado deve ser texto.");
-  const modelPolicy = resolveLegacyModelPolicy(policyRaw);
-  const requested = typeof modelRaw === "string" && modelRaw.trim() ? modelRaw.trim() : modelPolicy ? modelPolicy.primary : "fable";
-  const resolved = LEGACY_MODEL_ALIASES.get(requested) ?? null;
-  const effort = resolveEffortLegacy(own(job, "effort"));
-  const timeoutPolicy = resolveLegacyTimeoutPolicy(own(job, "timeoutPolicy"), own(job, "timeoutSeconds"));
-  const codexThreadId = resolveThreadId(own(job, "codexThreadId"));
-  const commands = [];
-  const rawCommands = own(job, "allowedCommands");
-  if (rawCommands !== void 0 && rawCommands !== null && !Array.isArray(rawCommands)) throw new ContractError("LEGACY_RULE_INVALID", "allowedCommands deve ser uma lista.");
-  for (const raw of (Array.isArray(rawCommands) ? rawCommands : []).filter((c) => c !== null && c !== void 0)) {
-    if (mode !== "verify" && mode !== "local") throw new ContractError("LEGACY_COMMANDS_MODE", "allowedCommands s\xF3 existem nos modos verify ou local.");
-    if (!isDict(raw)) throw new ContractError("LEGACY_RULE_INVALID", "Cada comando permitido exige rule e responsibility.");
-    const rule = stringField(own(raw, "rule")) ?? "";
-    const responsibility = (stringField(own(raw, "responsibility")) ?? "").toLowerCase();
-    if (!rule.trim() || !responsibility.trim()) throw new ContractError("LEGACY_RULE_INVALID", "Cada comando permitido exige rule e responsibility.");
-    if (!LEGACY_RULE_PATTERN.test(rule) || /[:*]/.test(rule)) throw new ContractError("LEGACY_RULE_INVALID", "Somente regras Bash expl\xEDcitas sem curingas s\xE3o permitidas.");
-    if (LEGACY_CRITICAL_PATTERN.test(rule)) throw new ContractError("LEGACY_RULE_CRITICAL", "Um comando externo cr\xEDtico n\xE3o pode ser delegado ao Claude.");
-    const allowedStages = mode === "verify" ? ["inspection", "testing"] : ["inspection", "implementation", "testing"];
-    if (!allowedStages.includes(responsibility)) throw new ContractError("LEGACY_RULE_STAGE", `A responsabilidade ${responsibility} n\xE3o autoriza comandos no modo ${mode}.`);
-    if (coordination.responsibilities[responsibility] !== "claude") throw new ContractError("LEGACY_RULE_OWNER", `O Claude precisa ser respons\xE1vel por ${responsibility} para esse comando.`);
-    commands.push({ rule, responsibility });
-  }
-  const capabilities = {
-    edit: mode === "local",
-    test: (mode === "verify" || mode === "local") && coordination.responsibilities.testing === "claude",
-    commands: mode === "verify" || mode === "local" ? "exact-list" : "none"
-  };
-  return {
-    version: 1,
-    profile: profileRaw,
-    workspace,
-    prompt,
-    promptFile,
-    model: { requested, resolved, reason: "Job legado (contrato v1): configura\xE7\xE3o original preservada para consulta; execu\xE7\xE3o somente pelo runner legado." },
-    effort,
-    coordination,
-    scope: { summary: coordination.planSummary, paths: [], wholeWorkspace: false },
-    // The legacy runner has no worktree provisioning; a v1 job always runs in
-    // the declared checkout. An `execution` field here is refused above rather
-    // than ignored, so it can never look accepted.
-    execution: { mode: "checkout", worktree: null },
-    launch: { permissionMode: "dontAsk", safeMode: true, permissionPromptsDisabled: true, restricted: profileRaw === "restricted", strictMcpConfig: true },
-    capabilities,
-    limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
-    auth: { allowApiBilling: false },
-    resumeFrom: stringField(own(job, "resumeFrom")),
-    codexThreadId,
-    legacy: { mode, allowedCommands: commands, modelPolicy, timeoutPolicy, executor: "legacy-runner" }
-  };
-}
+var V1_FIELD_REPLACEMENTS = {
+  mode: "use profile (development ou read); as capacidades derivam da matriz de responsabilidades",
+  allowedCommands: "n\xE3o h\xE1 allowlist: o classificador de a\xE7\xF5es decide por caminho resolvido e escala o resto ao coordenador",
+  modelPolicy: "declare model.requested com model.reason e troque entre turnos com codeorquestra_set_model",
+  timeoutPolicy: "use limits.maxRuntimeSeconds; a supervis\xE3o s\xF3 alerta e nunca encerra",
+  timeoutSeconds: "use limits.maxRuntimeSeconds; a supervis\xE3o s\xF3 alerta e nunca encerra"
+};
 function resolveJobContract(job) {
   if (!isDict(job)) throw new ContractError("JOB_INVALID", "O job deve ser um objeto JSON.");
   const version = own(job, "contractVersion");
-  if (version === void 0 || version === null) return resolveLegacy(job);
+  if (version === void 0 || version === null) {
+    throw new ContractError("CONTRACT_VERSION_REQUIRED", `contractVersion \xE9 obrigat\xF3rio. Um job sem ele tem o formato v1, cujo runner PowerShell foi aposentado; envie contractVersion: ${CONTRACT_VERSION} conforme references/runtime-v2.md.`);
+  }
   if (version !== CONTRACT_VERSION) throw new ContractError("CONTRACT_VERSION_UNSUPPORTED", `contractVersion ${String(version)} n\xE3o \xE9 suportado; use ${CONTRACT_VERSION}.`);
   return resolveV2(job);
 }
@@ -2448,7 +2332,7 @@ function reportPwshFallback() {
   if (pwshFallbackReported) return;
   pwshFallbackReported = true;
   process.stderr.write(
-    "CodeOrquestra: PowerShell 7 (pwsh) n\xE3o est\xE1 instalado; o mutex de quota passa a usar arquivo de trava. Isso ainda exclui outros brokers v2. A exclus\xE3o m\xFAtua com o runner legado v1 n\xE3o se aplica aqui, porque o v1 tamb\xE9m \xE9 executado por pwsh.\n"
+    "CodeOrquestra: PowerShell 7 (pwsh) n\xE3o est\xE1 instalado; o mutex de quota passa a usar arquivo de trava. Isso ainda exclui outros brokers. A exclus\xE3o m\xFAtua com uma instala\xE7\xE3o antiga do runner v1 n\xE3o se aplica aqui, porque aquele runner tamb\xE9m dependia do pwsh.\n"
   );
 }
 function acquireWindows(name, waitMs, attemptedAt) {
@@ -2497,7 +2381,7 @@ function acquireWindows(name, waitMs, attemptedAt) {
         });
       } else if (stdout.includes("TIMEOUT")) {
         clearTimeout(timer);
-        fail(new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o mutex global de quota (v1 ou outra consulta v2 em andamento).", attemptedAt));
+        fail(new QuotaLockError("QUOTA_LOCK_TIMEOUT", "Tempo esgotado aguardando o mutex global de quota (outra consulta em andamento).", attemptedAt));
       }
     });
     void exited.then(() => {
@@ -4858,7 +4742,6 @@ var TaskManager = class {
       if (error instanceof ContractError) throw new HttpError(400, "CONTRACT_INVALID", { code: error.code, message: error.message });
       throw error;
     }
-    if (contract.version !== 2) throw new HttpError(409, "LEGACY_CONTRACT_USE_LEGACY_RUNNER", { message: "Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2." });
     this.assertObserved(task, observation);
     if (this.stopping) throw new HttpError(503, "BROKER_SHUTTING_DOWN", { message: "O broker est\xE1 encerrando; nenhuma execu\xE7\xE3o nova \xE9 aceita." });
     if ((task.record.requiresReview || task.uncertain) && !acknowledgeReview) {
