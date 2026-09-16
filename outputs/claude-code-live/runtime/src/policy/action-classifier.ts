@@ -15,7 +15,7 @@
 //     directory past the scope check.
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Responsibilities } from '../shared/types.ts';
+import type { Responsibilities, TurnPolicyLevel } from '../shared/types.ts';
 
 export type Decision = 'allow' | 'deny' | 'escalate';
 
@@ -42,6 +42,11 @@ export interface ActionContext {
   authorizedModels?: string[];
   /** Effort this run was authorized with; a delegation may not weaken it. */
   requiredEffort?: string;
+  /**
+   * Extra escalation the coordinator applied mid-run. It can turn an `allow`
+   * into a decision; it can never turn a `deny` into anything else.
+   */
+  escalate?: TurnPolicyLevel;
 }
 
 export interface ActionResult {
@@ -238,6 +243,7 @@ const MESSAGES: Record<string, string> = {
   DELEGATION_WITHOUT_CAPABILITY: 'A delegação pediria capacidades que esta execução não concede; o subagente não pode exceder o contrato.',
   BUILTIN_SAFE: 'Ferramenta interna sem efeito externo.',
   READ_ONLY_PROFILE: 'Perfil somente leitura: ferramentas de escrita e comandos não estão disponíveis.',
+  POLICY_ESCALATE: 'Restrição pedida pelo coordenador nesta execução: esta ação, que seria permitida, passa a exigir decisão explícita.',
   HARMLESS_COMMAND: 'Comando inofensivo.',
 };
 
@@ -730,7 +736,32 @@ function classifyDelegation(tool: string, input: Record<string, unknown>, contex
   return result('allow', 'BUILTIN_SAFE', { agent });
 }
 
+/**
+ * Whether the coordinator's mid-run restriction covers this tool.
+ *
+ * Tools with no external effect are never covered, at any rung: asking you to
+ * approve a todo list or a question would only ask you the same thing twice.
+ */
+function policyCovers(tool: string, escalate: TurnPolicyLevel): boolean {
+  if (escalate === 'none' || HARMLESS_TOOLS.has(tool)) return false;
+  if (escalate === 'all') return true;
+  // A shell command is an unbounded write, so it is covered by both rungs.
+  if (SHELL_TOOLS.has(tool)) return true;
+  return escalate === 'writes' && FILE_WRITE_TOOLS.has(tool);
+}
+
+/**
+ * The contract decides first; the coordinator's restriction can only make the
+ * answer stricter. A denial stays a denial, and nothing here can widen what
+ * the contract granted.
+ */
 export function classifyToolAction(action: ToolAction, context: ActionContext): ActionResult {
+  const decided = classifyByContract(action, context);
+  if (decided.decision !== 'allow' || !policyCovers(action.tool, context.escalate ?? 'none')) return decided;
+  return result('escalate', 'POLICY_ESCALATE', { tool: action.tool, wouldHaveBeen: decided.reason });
+}
+
+function classifyByContract(action: ToolAction, context: ActionContext): ActionResult {
   const { tool, input } = action;
   if (tool.startsWith('mcp__')) return classifyMcp(tool, context);
   if (DELEGATION_TOOLS.has(tool) || tool === 'Skill') return classifyDelegation(tool, input, context);

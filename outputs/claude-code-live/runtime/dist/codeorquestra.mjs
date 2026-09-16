@@ -224,6 +224,7 @@ var BRAND = {
 };
 var RUNTIME_VERSION = "0.1.0";
 var RESPONSIBILITY_KEYS = ["planning", "inspection", "implementation", "testing", "review", "commit", "push", "deploy"];
+var TURN_POLICY_LEVELS = ["none", "commands", "writes", "all"];
 
 // src/state/atomic-file.ts
 import { promises as fs } from "node:fs";
@@ -2943,6 +2944,7 @@ function evaluateSupervision(input) {
   if (!waiting && input.now - input.lastActivityAt >= thresholds.inactivityAlertMs) alerts.push("inactivity_20m");
   if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push("decision_pending");
   if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push("elapsed_2h");
+  if (input.thrashing) alerts.push("thrashing");
   if (input.budgetRatio !== null) {
     if (input.budgetRatio >= BUDGET_WARNING_RATIO) alerts.push("budget_warning");
     if (input.budgetRatio >= 1) alerts.push("budget_exhausted");
@@ -3097,6 +3099,36 @@ var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
     };
   }
 };
+
+// src/broker/thrashing.ts
+var TRAIL_LIMIT = 20;
+var ERROR_STORM_LENGTH = 5;
+var REPEAT_FAILING_MIN = 3;
+var REPEAT_ANY_MIN = 5;
+var REPEAT_WINDOW = 10;
+function detectThrashing(trail) {
+  const done = trail.filter((entry) => entry.error !== null);
+  const window2 = done.slice(-REPEAT_WINDOW);
+  const bySig = /* @__PURE__ */ new Map();
+  for (const entry of window2) {
+    const list = bySig.get(entry.sig) ?? [];
+    list.push(entry);
+    bySig.set(entry.sig, list);
+  }
+  for (const entries of bySig.values()) {
+    const allFailed = entries.every((entry) => entry.error === true);
+    if (entries.length >= REPEAT_ANY_MIN || entries.length >= REPEAT_FAILING_MIN && allFailed) {
+      const last = entries[entries.length - 1];
+      return { pattern: "repeat", tool: last.name, inputPreview: last.inputPreview, count: entries.length, sig: last.sig };
+    }
+  }
+  const tail = done.slice(-ERROR_STORM_LENGTH);
+  if (tail.length === ERROR_STORM_LENGTH && tail.every((entry) => entry.error === true)) {
+    const last = tail[tail.length - 1];
+    return { pattern: "error_storm", tool: last.name, inputPreview: last.inputPreview, count: ERROR_STORM_LENGTH, sig: `error_storm:${last.sig}` };
+  }
+  return null;
+}
 
 // src/usage/codex-usage.ts
 import { spawn as spawn4 } from "node:child_process";
@@ -4527,6 +4559,7 @@ var TaskManager = class {
     if (task.uncertain) throw new HttpError(409, "REQUIRES_REVIEW", { message: "A execu\xE7\xE3o est\xE1 incerta; confirme a revis\xE3o antes de enviar novas orienta\xE7\xF5es." });
     const budget = budgetStatus(task.run, Date.now());
     if (budget?.exhausted) throw new HttpError(409, "BUDGET_EXHAUSTED", { message: "O or\xE7amento desta execu\xE7\xE3o esgotou; nenhum turno novo \xE9 entregue.", budget, note: BUDGET_EXHAUSTED_NOTE });
+    if (task.run.endAfterTurn) throw new HttpError(409, "ENDING", { message: "Esta execu\xE7\xE3o encerra quando o turno atual terminar; nenhuma orienta\xE7\xE3o nova \xE9 aceita." });
     const redacted = redactSensitiveText(text);
     const entry = { messageId: `msg-${randomUUID()}`, source, text: redacted, textPreview: boundedPreview(redacted, 300).preview, receivedAt: (/* @__PURE__ */ new Date()).toISOString(), deliveredAt: null, state: "queued" };
     task.queue.push(entry);
@@ -4611,6 +4644,7 @@ var TaskManager = class {
     if (task.phase !== "idle") return;
     if (task.modelTransition) return;
     if (budgetStatus(run2, Date.now())?.exhausted) return;
+    if (run2.endAfterTurn) return;
     const next = task.queue.find((entry) => entry.state === "queued");
     if (!next) return;
     next.state = "delivered";
@@ -4649,8 +4683,27 @@ var TaskManager = class {
     this.sendToWorker(task, { t: "interrupt", source });
     if (source !== "browser") this.touchCoordinator(task);
   }
-  async end(task, source) {
+  /**
+   * Ends the session, now or once the running turn finishes.
+   *
+   * Ending now interrupts the turn, which is why it reports CANCELLED: that is
+   * the honest outcome of stopping work in the middle. `afterTurn` is the
+   * other thing a coordinator means by "we are done" — let it finish what it
+   * is doing and then stop — and it closes COMPLETED, because nothing was cut
+   * short. It is not an interrupt and never becomes one: if the turn runs for
+   * an hour, the end waits an hour.
+   */
+  async end(task, source, afterTurn = false) {
     if (!task.run || !task.worker || task.run.finalized) throw new HttpError(409, "NO_ACTIVE_RUN");
+    if (afterTurn && task.phase !== "idle") {
+      if (!task.run.endAfterTurn) {
+        task.run.endAfterTurn = { source, requestedAt: (/* @__PURE__ */ new Date()).toISOString() };
+        await this.append(task, task.run.runId, "end_after_turn_requested", { source, note: END_AFTER_TURN_NOTE });
+        this.changed(task);
+      }
+      if (source !== "browser") this.touchCoordinator(task);
+      return { ending: true, afterTurn: true };
+    }
     this.sendToWorker(task, { t: "end", source });
     if (source !== "browser") this.touchCoordinator(task);
     const run2 = task.run;
@@ -4658,6 +4711,7 @@ var TaskManager = class {
       if (task.run === run2 && !run2.finalized) void this.finalize(task, run2, "CANCELLED", "END_TIMEOUT", "O worker n\xE3o encerrou no prazo; a \xE1rvore de processos foi terminada.", 1, null);
     }, WORKER_END_GRACE_MS);
     task.endTimer.unref();
+    return { ending: true, afterTurn: false };
   }
   /**
    * Switches the model between turns.
@@ -4798,6 +4852,11 @@ var TaskManager = class {
       telemetryFailures: 0,
       turns: 0,
       tokensObserved: 0,
+      toolTrail: [],
+      thrashingSeen: /* @__PURE__ */ new Set(),
+      thrashing: null,
+      policy: null,
+      endAfterTurn: null,
       resumeMode: task.previousSessionId ? "automatic" : "new",
       simulated: false,
       declaredWorkspace: worktreePlan ? workspace : null,
@@ -5192,6 +5251,7 @@ var TaskManager = class {
           if (usage2) run2.tokensObserved += usage2.totalObservedTokens;
         }
         this.applyEvent(task, run2, message.type, message.data, message.toolUseId);
+        if (message.type === "tool_result" || message.type === "tool_blocked") await this.observeThrashing(task, run2);
         if (message.type === "permission_requested" || message.type === "question_asked") this.changed(task);
         break;
       }
@@ -5232,6 +5292,13 @@ var TaskManager = class {
         task.currentTool = null;
         await this.observeBudget(task, run2);
         await this.observeBetweenTurns(task, run2);
+        if (run2.endAfterTurn) {
+          const requested = run2.endAfterTurn;
+          run2.endAfterTurn = null;
+          await this.end(task, requested.source);
+          this.changed(task);
+          break;
+        }
         await this.deliverNext(task);
         this.changed(task);
         void this.refreshUsage(task);
@@ -5262,10 +5329,32 @@ var TaskManager = class {
       case "assistant_text":
         if (typeof data.model === "string") run2.observedModel = data.model;
         break;
-      case "tool_start":
+      case "tool_start": {
+        if (toolUseId && typeof data.name === "string") {
+          run2.toolTrail.push({
+            toolUseId,
+            sig: `${data.name}:${typeof data.inputHash === "string" ? data.inputHash : ""}`,
+            name: data.name,
+            inputPreview: typeof data.inputPreview === "string" ? data.inputPreview : "",
+            error: null
+          });
+          if (run2.toolTrail.length > TRAIL_LIMIT) run2.toolTrail.splice(0, run2.toolTrail.length - TRAIL_LIMIT);
+        }
         if (toolUseId && typeof data.name === "string" && ["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(data.name) && typeof data.inputPreview === "string") {
           const match = /"(?:file_path|notebook_path)":"((?:[^"\\]|\\.)*)"/.exec(data.inputPreview);
           if (match) run2.claudeAuthored.add(match[1].replace(/\\\\/g, "\\"));
+        }
+        break;
+      }
+      case "tool_result":
+      case "tool_blocked": {
+        const entry = toolUseId ? run2.toolTrail.find((item) => item.toolUseId === toolUseId) : void 0;
+        if (entry) entry.error = type === "tool_blocked" || data.isError === true;
+        break;
+      }
+      case "policy_changed":
+        if (typeof data.escalate === "string" && TURN_POLICY_LEVELS.includes(data.escalate)) {
+          run2.policy = data.escalate === "none" ? null : { escalate: data.escalate, reason: typeof data.reason === "string" ? data.reason : "", since: (/* @__PURE__ */ new Date()).toISOString() };
         }
         break;
       case "turn_completed":
@@ -5570,6 +5659,7 @@ var TaskManager = class {
         lastActivityAt: task.lastActivityAt,
         oldestPendingRequestAt: oldestPendingAt(task),
         budgetRatio: budget?.ratio ?? null,
+        thrashing: run2.thrashing !== null,
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5625,6 +5715,47 @@ var TaskManager = class {
     task.alertsRaised.add("budget_exhausted");
     await this.append(task, run2.runId, "budget_exhausted", { ...budget, note: BUDGET_EXHAUSTED_NOTE });
     this.changed(task);
+  }
+  /**
+   * Names a loop once, with the evidence, and does nothing else.
+   *
+   * Nothing is throttled, denied or stopped here: an agent repeating itself
+   * may be stuck or may be converging, and only the coordinator can tell. What
+   * the runtime owes is that the shape is not invisible — the alert carries
+   * the tool, the input and the count so the next decision is an informed one.
+   */
+  async observeThrashing(task, run2) {
+    const verdict = detectThrashing(run2.toolTrail);
+    if (!verdict) return;
+    const { sig, ...report } = verdict;
+    const key = `${verdict.pattern}:${sig}`;
+    if (run2.thrashingSeen.has(key)) return;
+    run2.thrashingSeen.add(key);
+    run2.thrashing = { ...report, at: (/* @__PURE__ */ new Date()).toISOString() };
+    task.alertsRaised.add("thrashing");
+    await this.append(task, run2.runId, "alert", { alert: "thrashing", action: "none", ...report, note: THRASHING_NOTE });
+    this.changed(task);
+  }
+  /**
+   * Adds permission checks to a run that is already going.
+   *
+   * Between watching a loop and ending the session there has to be something
+   * that keeps the work alive, and this is it. It only ever asks for more
+   * decisions, so it applies immediately — mid-turn included, which is when a
+   * loop is actually running. The view reports the restriction only once the
+   * worker confirms it: a safety claim nobody applied is worse than none.
+   */
+  async setPolicy(task, escalate, reason, source) {
+    if (typeof escalate !== "string" || !TURN_POLICY_LEVELS.includes(escalate)) {
+      throw new HttpError(400, "POLICY_INVALID", { message: `escalate deve ser ${TURN_POLICY_LEVELS.join(", ")}.` });
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      throw new HttpError(400, "POLICY_REASON_REQUIRED", { message: "Informe por que a restri\xE7\xE3o est\xE1 sendo aplicada; o motivo fica registrado." });
+    }
+    if (!task.run || !task.worker || task.run.finalized || task.run.finalizing) throw new HttpError(409, "NO_ACTIVE_RUN");
+    this.sendToWorker(task, { t: "set_policy", escalate, reason: reason.trim(), source });
+    if (source !== "browser") this.touchCoordinator(task);
+    return { requested: escalate, applied: "on_confirmation", inForce: task.run.policy?.escalate ?? "none" };
   }
   // ------------------------------------------------------------------ views
   usageView(task) {
@@ -5693,8 +5824,12 @@ var TaskManager = class {
         currentTool: full.currentRun.currentTool,
         turns: full.currentRun.turns,
         startedAt: full.currentRun.startedAt,
-        // A budget is the coordinator's decision to make, so it stays.
-        budget: full.currentRun.budget
+        // A budget, a loop and a restriction are all things the
+        // coordinator decides on, so they survive the trim.
+        budget: full.currentRun.budget,
+        thrashing: full.currentRun.thrashing,
+        policy: full.currentRun.policy,
+        endingAfterTurn: full.currentRun.endingAfterTurn
       } : null,
       // Kept in full: a pending decision is the thing the coordinator has to
       // act on, and trimming it would hide what it is deciding about.
@@ -5712,6 +5847,7 @@ var TaskManager = class {
       lastActivityAt: task.lastActivityAt,
       oldestPendingRequestAt: oldestPendingAt(task),
       budgetRatio: run2 ? budgetStatus(run2, now)?.ratio ?? null : null,
+      thrashing: run2?.thrashing != null,
       phase: run2 && run2.finalizing && !run2.finalized ? "busy_model" : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)) || Boolean(run2 && run2.finalizing && !run2.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5759,7 +5895,10 @@ var TaskManager = class {
         profile: run2.contract.profile,
         contractVersion: run2.contract.version,
         resumeMode: run2.resumeMode,
-        budget: budgetStatus(run2, now)
+        budget: budgetStatus(run2, now),
+        thrashing: run2.thrashing,
+        policy: run2.policy,
+        endingAfterTurn: run2.endAfterTurn !== null
       } : null,
       previousSessionId: task.previousSessionId,
       pendingRequests: [...task.pending.values()],
@@ -5832,6 +5971,8 @@ var TaskManager = class {
   }
 };
 var TURN_TERMINAL_EVENTS = /* @__PURE__ */ new Set(["turn_completed", "turn_interrupted", "turn_failed"]);
+var THRASHING_NOTE = "A execu\xE7\xE3o repete a mesma chamada ou acumula falhas. Nada foi encerrado nem restringido: avalie e, se for o caso, restrinja as a\xE7\xF5es desta execu\xE7\xE3o (codeorquestra_set_policy) ou encerre ao fim do turno (codeorquestra_end com afterTurn).";
+var END_AFTER_TURN_NOTE = "Encerramento pedido para quando o turno atual terminar. O turno n\xE3o \xE9 interrompido e nenhuma orienta\xE7\xE3o nova \xE9 entregue; a execu\xE7\xE3o fecha como COMPLETED.";
 var BUDGET_EXHAUSTED_NOTE = "Or\xE7amento da execu\xE7\xE3o esgotado: o turno em andamento termina normalmente, mas nenhum outro \xE9 entregue. Para continuar, encerre esta execu\xE7\xE3o e inicie outra na mesma tarefa com limits maior e approvalRevision maior; a sess\xE3o anterior \xE9 retomada automaticamente.";
 function budgetStatus(run2, now) {
   const { maxTokens, maxTurns, maxRuntimeSeconds } = run2.contract.limits;
@@ -6453,10 +6594,11 @@ var Broker = class {
           await this.tasks.interrupt(task, source);
           return sendJson(res, 202, { interrupted: true });
         case "end":
-          await this.tasks.end(task, source);
-          return sendJson(res, 202, { ending: true });
+          return sendJson(res, 202, await this.tasks.end(task, source, body.afterTurn === true));
         case "model":
           return sendJson(res, 200, await this.tasks.setModel(task, body.model, body.reason, source));
+        case "policy":
+          return sendJson(res, 200, await this.tasks.setPolicy(task, body.escalate, body.reason, source));
         case "heartbeat":
           if (identity.source === "browser") throw new HttpError(403, "LOCAL_ADMIN_REQUIRED");
           this.tasks.touchCoordinator(task);

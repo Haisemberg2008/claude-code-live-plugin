@@ -36710,9 +36710,13 @@ server.registerTool("codeorquestra_interrupt", { description: "Interrompe o turn
   const taskId = await taskIdFor(taskHandle);
   return call("POST", `/api/tasks/${taskId}/interrupt`, { taskHandle });
 }));
-server.registerTool("codeorquestra_end", { description: "Solicita o encerramento da sess\xE3o e reconcilia o worker e a \xE1rvore ainda atribu\xEDvel daquela tarefa.", inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
+server.registerTool("codeorquestra_end", { description: "Solicita o encerramento da sess\xE3o e reconcilia o worker e a \xE1rvore ainda atribu\xEDvel daquela tarefa. Com afterTurn, espera o turno atual terminar sozinho (encerra COMPLETED, sem interromper); sem ele, o turno em andamento \xE9 interrompido e a execu\xE7\xE3o fecha CANCELLED.", inputSchema: { taskHandle: handle, afterTurn: external_exports.boolean().optional().describe("Esperar o turno atual terminar em vez de interromp\xEA-lo.") } }, async ({ taskHandle, afterTurn }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
-  return call("POST", `/api/tasks/${taskId}/end`, { taskHandle });
+  return call("POST", `/api/tasks/${taskId}/end`, { taskHandle, ...afterTurn === void 0 ? {} : { afterTurn } });
+}));
+server.registerTool("codeorquestra_set_policy", { description: 'Restringe o que esta execu\xE7\xE3o pode fazer sem perguntar, a partir da pr\xF3xima chamada de ferramenta (vale no meio do turno). S\xF3 acrescenta decis\xF5es: nunca concede o que o contrato negou. "commands" escala comandos de shell; "writes" escala comandos e escritas de arquivo; "all" escala toda a\xE7\xE3o com efeito externo; "none" volta ao contrato.', inputSchema: { taskHandle: handle, escalate: external_exports.enum(["none", "commands", "writes", "all"]), reason: external_exports.string().min(1).describe("Por que a restri\xE7\xE3o est\xE1 sendo aplicada; fica registrada.") } }, async ({ taskHandle, escalate, reason }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call("POST", `/api/tasks/${taskId}/policy`, { taskHandle, escalate, reason });
 }));
 server.registerTool("codeorquestra_set_model", { description: "Troca o modelo entre turnos (claude-fable-5-1 ou claude-opus-5) com motivo registrado.", inputSchema: { taskHandle: handle, model: external_exports.enum(["claude-fable-5-1", "claude-opus-5"]), reason: external_exports.string().min(1) } }, async ({ taskHandle, model, reason }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);

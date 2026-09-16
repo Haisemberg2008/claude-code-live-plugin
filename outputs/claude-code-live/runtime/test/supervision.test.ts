@@ -19,6 +19,7 @@ function evaluate(overrides: Partial<Parameters<typeof evaluateSupervision>[0]> 
     pendingRequests: 0,
     oldestPendingRequestAt: null,
     budgetRatio: null,
+    thrashing: false,
     brokerRestartedDuringRun: false,
     terminal: false,
     ...overrides,
@@ -135,5 +136,26 @@ describe('a budget the run is about to spend', () => {
     const result = evaluate({ budgetRatio: 1, phase: 'waiting_permission', pendingRequests: 1, oldestPendingRequestAt: t0, now: t0 + minutes(1) });
     assert.ok(result.alerts.includes('budget_exhausted'));
     assert.equal(result.state, 'waiting_permission');
+  });
+});
+
+describe('a run that looks stuck', () => {
+  test('is reported as an alert and, like every alert, terminates nothing', () => {
+    assert.deepEqual(evaluate({ thrashing: false }).alerts, []);
+    const looping = evaluate({ thrashing: true });
+    assert.deepEqual(looping.alerts, ['thrashing']);
+    assert.equal(looping.action, 'none');
+    assert.equal(looping.requiresReview, false);
+    assert.equal(looping.state, 'busy_tool', 'a looping run is still a running run');
+  });
+
+  test('coexists with the other alerts without replacing them', () => {
+    const result = evaluate({ thrashing: true, budgetRatio: 1, now: t0 + minutes(200), lastActivityAt: t0 + minutes(100), phase: 'idle' });
+    assert.deepEqual(result.alerts, ['inactivity_20m', 'elapsed_2h', 'thrashing', 'budget_warning', 'budget_exhausted']);
+    assert.equal(result.action, 'none');
+  });
+
+  test('a terminal run reports nothing at all', () => {
+    assert.deepEqual(evaluate({ thrashing: true, terminal: true }).alerts, []);
   });
 });

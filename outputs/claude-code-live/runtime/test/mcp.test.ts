@@ -29,6 +29,7 @@ const EXPECTED_TOOLS = [
   'codeorquestra_message',
   'codeorquestra_pair',
   'codeorquestra_set_model',
+  'codeorquestra_set_policy',
   'codeorquestra_start',
   'codeorquestra_status',
   'codeorquestra_trust',

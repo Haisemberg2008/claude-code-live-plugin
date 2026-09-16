@@ -128,7 +128,13 @@ export function buildRows(events: EventRecord[], queue: QueueEntryView[]): Row[]
         rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'ok', text: `Revisão confirmada por ${label(data.source)}.` });
         break;
       case 'alert':
-        rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'warn', text: `Alerta de supervisão: ${String(data.alert ?? '?')} (sem encerramento automático).` });
+        rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'warn', text: data.alert === 'thrashing' ? thrashingText(data) : `Alerta de supervisão: ${String(data.alert ?? '?')} (sem encerramento automático).` });
+        break;
+      case 'policy_changed':
+        rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'warn', text: `Restrição ${POLICY_TEXT[String(data.escalate)] ?? String(data.escalate)} por ${label(data.source)}: ${String(data.reason ?? '')}` });
+        break;
+      case 'end_after_turn_requested':
+        rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'info', text: `Encerramento pedido por ${label(data.source)} para quando o turno atual terminar; o turno não é interrompido.` });
         break;
       case 'budget_exhausted':
         rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'error', text: `Orçamento esgotado: ${budgetSummary(data)}. O turno em andamento termina; nenhum outro é entregue.` });
@@ -172,4 +178,21 @@ function budgetSummary(data: Record<string, unknown>): string {
     }
   }
   return parts.length ? parts.join(', ') : 'limite atingido';
+}
+
+const POLICY_TEXT: Record<string, string> = {
+  none: 'removida (volta ao contrato)',
+  commands: 'aplicada: comandos passam a exigir decisão',
+  writes: 'aplicada: comandos e escritas passam a exigir decisão',
+  all: 'aplicada: toda ação com efeito externo passa a exigir decisão',
+};
+
+/** The evidence, not just the label: which tool, which call, how many times. */
+function thrashingText(data: Record<string, unknown>): string {
+  const tool = String(data.tool ?? '?');
+  const count = Number(data.count ?? 0);
+  const call = typeof data.inputPreview === 'string' && data.inputPreview ? ` (${data.inputPreview.slice(0, 120)})` : '';
+  return data.pattern === 'error_storm'
+    ? `Possível laço: ${count} chamadas seguidas falharam, a última em ${tool}${call}. Nada foi encerrado.`
+    : `Possível laço: ${tool} repetiu a mesma chamada ${count} vezes${call}. Nada foi encerrado.`;
 }

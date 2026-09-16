@@ -203,6 +203,49 @@ export interface RunView {
   resumeMode: 'new' | 'automatic' | 'explicit';
   /** Null when the job declared no limits. */
   budget: RunBudgetView | null;
+  /** The last loop this run's tool history showed; advisory, never enforced. */
+  thrashing: ThrashingReport | null;
+  /** Extra permission checks the coordinator asked for; null when none are in force. */
+  policy: TurnPolicyView | null;
+  /** True once an end is waiting for the current turn to finish on its own. */
+  endingAfterTurn: boolean;
+}
+
+/**
+ * What an active run may no longer do without an explicit decision.
+ *
+ * A rung only ever asks for MORE decisions: it can never grant a capability
+ * the contract withheld. `writes` includes `commands`, because a shell command
+ * is an unbounded write and gating files while leaving the shell open would be
+ * a restriction in name only. `all` covers every action with an external
+ * effect; tools with none (todo lists, questions) are never gated, since
+ * stopping to approve a question would only ask you twice.
+ */
+export type TurnPolicyLevel = 'none' | 'commands' | 'writes' | 'all';
+
+export const TURN_POLICY_LEVELS: readonly TurnPolicyLevel[] = ['none', 'commands', 'writes', 'all'];
+
+export interface TurnPolicyView {
+  escalate: TurnPolicyLevel;
+  reason: string;
+  /** When the worker confirmed it, never when it was requested. */
+  since: string;
+}
+
+/**
+ * A shape in the recent tool history that reads as a loop: the same call
+ * repeating, or a run of failures. It is evidence handed to the coordinator,
+ * not a verdict the runtime acts on — nothing is throttled or stopped.
+ */
+export interface ThrashingVerdict {
+  pattern: 'repeat' | 'error_storm';
+  tool: string;
+  inputPreview: string;
+  count: number;
+}
+
+export interface ThrashingReport extends ThrashingVerdict {
+  at: string;
 }
 
 export interface BudgetDimensionView {

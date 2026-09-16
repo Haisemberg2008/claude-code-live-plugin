@@ -432,6 +432,53 @@ describe('dashboard', () => {
     await item.getByTestId('run-outcome').getByText('Concluída').waitFor({ timeout: 15000 });
   });
 
+  test('a looping run is flagged, restricted from the panel, and ended after its turn', async (t) => {
+    if (unavailable) { t.skip(unavailable); return; }
+    const { taskId, taskHandle } = await register('thread-ui-freio');
+    const failing = toolDirective('Bash', { command: 'npm test', $error: true });
+    await startRun(taskId, taskHandle, script([failing, failing, failing, 'sleep: 12000', 'say: fim']));
+    const item = page.locator('[data-testid="task-item"]').filter({ hasText: 'thread-ui-freio' });
+    await item.waitFor({ timeout: 15000 });
+    await item.click();
+
+    // The loop is named on the row, in the inspector and in the feed, with the
+    // evidence rather than a bare label.
+    await item.getByTestId('thrashing').getByText('laço?').waitFor({ timeout: 20000 });
+    const inspector = page.getByRole('complementary', { name: 'Inspetor' });
+    await inspector.getByTestId('thrashing-line').getByText(/Bash repetiu a mesma chamada 3 vezes/).waitFor({ timeout: 15000 });
+    await page.getByRole('main').getByText(/^Possível laço: Bash repetiu a mesma chamada 3 vezes/).waitFor({ timeout: 15000 });
+    // Naming it changed nothing on its own.
+    await inspector.getByTestId('policy-line').getByText('nenhuma além do contrato').waitFor();
+
+    // Restricting needs a recorded reason, so the button stays disabled until
+    // there is one.
+    const controls = page.locator('[data-testid="policy-controls"]');
+    const apply = controls.getByRole('button', { name: 'Aplicar restrição' });
+    assert.equal(await apply.isDisabled(), true, 'no reason, no restriction');
+    await controls.getByLabel('Restringir esta execução').selectOption('commands');
+    await controls.getByLabel('Motivo da restrição').fill('Repetindo o mesmo comando.');
+    await apply.click();
+    await item.getByTestId('policy').getByText('restrita').waitFor({ timeout: 15000 });
+    await inspector.getByTestId('policy-line').getByText(/comandos exigem decisão — Repetindo o mesmo comando\./).waitFor({ timeout: 15000 });
+    await page.getByRole('main').getByText(/Restrição aplicada: comandos passam a exigir decisão por Navegador/).waitFor({ timeout: 15000 });
+
+    // The deferred end is asserted on the request it sends, not on the badge:
+    // whether the row still shows "encerra apos o turno" depends on whether
+    // the scripted turn happens to still be running when the click lands, and
+    // racing that would make this test lie on a slow machine. What the panel
+    // owes is the right call; brake.test.ts owns the semantics.
+    await page.getByRole('button', { name: 'Encerrar sessão' }).click();
+    const [ending] = await Promise.all([
+      page.waitForResponse((response) => response.url().endsWith(`/api/tasks/${taskId}/end`) && response.request().method() === 'POST'),
+      page.getByRole('dialog').getByTestId('end-after-turn').click(),
+    ]);
+    assert.equal(ending.status(), 202);
+    assert.equal((JSON.parse(ending.request().postData() ?? '{}') as { afterTurn?: boolean }).afterTurn, true);
+    await item.locator('.state-terminal').waitFor({ timeout: 30000 });
+    await item.getByTestId('run-outcome').getByText('Concluída').waitFor({ timeout: 15000 });
+    await page.getByRole('main').getByText('fim', { exact: true }).waitFor({ timeout: 15000 });
+  });
+
   test('every browser request stayed on the broker origin and no dialog fired', async (t) => {
     if (unavailable) { t.skip(unavailable); return; }
     assert.deepEqual(externalRequests, []);
