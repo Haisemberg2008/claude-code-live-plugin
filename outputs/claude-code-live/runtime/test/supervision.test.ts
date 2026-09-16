@@ -3,7 +3,7 @@
 // derived from real heartbeats or event waits, never faked.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateSupervision, SUPERVISION, COORDINATOR_ABSENT_LABEL } from '../src/worker/supervision.ts';
+import { evaluateSupervision, SUPERVISION, COORDINATOR_ABSENT_LABEL, CONTEXT_HIGH_RATIO } from '../src/worker/supervision.ts';
 
 const t0 = Date.parse('2026-09-12T10:00:00.000Z');
 const minutes = (n: number) => n * 60_000;
@@ -20,6 +20,7 @@ function evaluate(overrides: Partial<Parameters<typeof evaluateSupervision>[0]> 
     oldestPendingRequestAt: null,
     budgetRatio: null,
     thrashing: false,
+    contextRatio: null,
     brokerRestartedDuringRun: false,
     terminal: false,
     ...overrides,
@@ -157,5 +158,18 @@ describe('a run that looks stuck', () => {
 
   test('a terminal run reports nothing at all', () => {
     assert.deepEqual(evaluate({ thrashing: true, terminal: true }).alerts, []);
+  });
+});
+
+describe('a context window filling up', () => {
+  test('is announced before it forces a compaction, and never acted on', () => {
+    assert.equal(CONTEXT_HIGH_RATIO, 0.8);
+    assert.deepEqual(evaluate({ contextRatio: null }).alerts, [], 'no measured turn, nothing to say');
+    assert.deepEqual(evaluate({ contextRatio: 0.79 }).alerts, []);
+    const high = evaluate({ contextRatio: 0.8 });
+    assert.deepEqual(high.alerts, ['context_high']);
+    assert.equal(high.action, 'none');
+    assert.equal(high.requiresReview, false);
+    assert.deepEqual(evaluate({ contextRatio: 1.4 }).alerts, ['context_high'], 'over the presumed window it is still only an alert');
   });
 });

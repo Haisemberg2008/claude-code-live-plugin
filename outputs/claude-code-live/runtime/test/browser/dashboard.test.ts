@@ -479,6 +479,38 @@ describe('dashboard', () => {
     await page.getByRole('main').getByText('fim', { exact: true }).waitFor({ timeout: 15000 });
   });
 
+  test('the inspector accounts for the run: context, tools and the history of the task', async (t) => {
+    if (unavailable) { t.skip(unavailable); return; }
+    const { taskId, taskHandle } = await register('thread-ui-contas');
+    const item = page.locator('[data-testid="task-item"]').filter({ hasText: 'thread-ui-contas' });
+    const inspector = page.getByRole('complementary', { name: 'Inspetor' });
+
+    await startRun(taskId, taskHandle, script([toolDirective('Read', { file_path: path.join(workspace, 'src', 'a.ts') }), 'say: pronto']));
+    await item.waitFor({ timeout: 15000 });
+    await item.click();
+
+    // The context gauge names what it measured and what it presumed.
+    await inspector.getByTestId('context-line').getByText(/^17 \/ 200\.000 no último turno \(0%, janela presumida\)$/).waitFor({ timeout: 20000 });
+
+    // The tools table accounts for the call that actually happened.
+    await inspector.getByRole('heading', { name: 'Ferramentas' }).waitFor();
+    const tools = inspector.locator('[data-testid="tools"]');
+    await tools.getByText('Chamadas').waitFor({ timeout: 15000 });
+    await tools.getByRole('row', { name: /Read/ }).waitFor({ timeout: 15000 });
+
+    // The run still going is not listed: the inspector above already describes
+    // it, from fresher data than its files hold.
+    await inspector.getByRole('heading', { name: 'Histórico desta tarefa' }).waitFor();
+    await inspector.getByText('Nenhuma execução anterior registrada.').waitFor({ timeout: 15000 });
+
+    await waitFor(async () => ((await taskState(taskId)) === 'idle' ? true : undefined), { timeoutMs: 20000, description: 'accounting task idle' });
+    await endTask(taskId);
+    const historyRow = inspector.locator('[data-testid="run-history"] tbody tr').first();
+    await historyRow.waitFor({ timeout: 20000 });
+    await historyRow.getByText('Concluída').waitFor({ timeout: 15000 });
+    await historyRow.getByText('27', { exact: true }).waitFor({ timeout: 15000 });
+  });
+
   test('every browser request stayed on the broker origin and no dialog fired', async (t) => {
     if (unavailable) { t.skip(unavailable); return; }
     assert.deepEqual(externalRequests, []);

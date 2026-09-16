@@ -4,7 +4,7 @@
 // text is rendered as escaped React content only.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { EventRecord, PendingRequestView, StatusResponse, TaskView, TransientFrame } from '../../src/shared/types.ts';
-import { ApiError, getBlobPage, getEvents, getEventsBefore, getStatus, postAction, subscribe, type ConnectionState } from './api.ts';
+import { ApiError, getBlobPage, getEvents, getEventsBefore, getRuns, getStatus, postAction, subscribe, type ConnectionState, type RunHistoryEntry } from './api.ts';
 import { buildRows, formatTime, SOURCE_LABELS, type Row } from './feed.ts';
 
 const PAGE_ROWS = 80;
@@ -543,6 +543,49 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
   );
 }
 
+/**
+ * Every run this task has had, with what it cost.
+ *
+ * Read from the broker's own per-run files rather than kept in the page, so a
+ * run from before this panel was opened reads exactly like the one that just
+ * ended. Refetched when the current run's status changes, which is the moment
+ * a run joins the history.
+ */
+function RunHistory({ taskId, runId, runStatus }: { taskId: string; runId: string | null; runStatus: string | null }) {
+  const [runs, setRuns] = useState<RunHistoryEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void getRuns(taskId)
+      .then((list) => { if (!cancelled) { setRuns(list); setError(null); } })
+      .catch((failure) => { if (!cancelled) setError(failure instanceof ApiError ? failure.code : 'falha ao ler o histórico'); });
+    return () => { cancelled = true; };
+  }, [taskId, runStatus]);
+  if (error) return <p className="muted small">Histórico indisponível ({error}).</p>;
+  // The run still going is described by the whole inspector above, and its
+  // files are written on a debounce, so listing it here would show a staler
+  // copy of what is already on screen. It joins the table when it ends.
+  const active = runStatus && !TERMINAL_STATUSES.has(runStatus) ? runId : null;
+  const past = (runs ?? []).filter((entry) => entry.runId !== active);
+  if (past.length === 0) return <p className="muted small">Nenhuma execução anterior registrada.</p>;
+  return (
+    <table className="mini-table" data-testid="run-history">
+      <thead><tr><th>Execução</th><th>Desfecho</th><th>Turnos</th><th>Tokens</th><th>Tempo</th></tr></thead>
+      <tbody>
+        {past.map((entry) => (
+          <tr key={entry.runId}>
+            <td className="mono" title={entry.runId}>{abbreviate(entry.runId, 10)}</td>
+            <td className={entry.status === 'COMPLETED' ? '' : 'warn-text'}>{OUTCOME_LABELS[entry.status] ?? entry.status}{entry.budgetExhausted ? ' · orçamento' : ''}</td>
+            <td>{entry.turns ?? '—'}</td>
+            <td title={entry.usageQuality === 'partial' ? 'contagem parcial: algum turno não reportou todos os contadores' : undefined}>{entry.tokens === null ? '—' : `${formatCount(entry.tokens)}${entry.usageQuality === 'partial' ? '+' : ''}`}</td>
+            <td>{entry.elapsedSeconds === null ? '—' : formatElapsed(Math.round(entry.elapsedSeconds))}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function RowView({ row, task, onAnswer }: { row: Row; task: TaskView; onAnswer: (body: Record<string, unknown>) => Promise<boolean> }) {
   if (row.kind === 'message') return <MessageRow row={row} />;
   if (row.kind === 'tool') return <ToolRow row={row} taskId={task.taskId} />;
@@ -707,6 +750,9 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
         <dt>Última atividade</dt><dd>{formatTime(run?.lastActivityAt)}</dd>
         <dt>Tempo decorrido</dt><dd>{run ? formatElapsed(liveElapsed) : '—'}</dd>
         <dt>Turnos</dt><dd>{run?.turns ?? 0}</dd>
+        <dt>Contexto</dt><dd data-testid="context-line">{run?.context
+          ? `${formatCount(run.context.lastTurnTokens)} / ${formatCount(run.context.windowTokens)} no último turno (${Math.min(100, Math.round(run.context.ratio * 100))}%, janela presumida)`
+          : 'sem turno medido ainda'}</dd>
         <dt>Falhas de telemetria</dt><dd>{run?.telemetryFailures ?? 0}</dd>
         <dt>Alertas</dt><dd className="wrap">{task.alerts.length ? task.alerts.join(', ') : 'nenhum (20 min sem atividade e 2 h decorridas só alertam)'}</dd>
         <dt>Restrição</dt><dd className="wrap" data-testid="policy-line">{run?.policy ? `${POLICY_LABELS[run.policy.escalate]} — ${run.policy.reason}` : 'nenhuma além do contrato'}</dd>
@@ -790,6 +836,31 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
         </section>
       </div>
       {refreshError ? <p className="warn-text small">Atualização indisponível: {refreshError}</p> : null}
+      <h2 className="section-title">Ferramentas</h2>
+      {run && run.tools.calls > 0 ? (
+        <div data-testid="tools">
+          <dl>
+            <dt>Chamadas</dt><dd>{run.tools.calls}</dd>
+            <dt>Erros</dt><dd className={run.tools.errors ? 'warn-text' : ''}>{run.tools.errors}</dd>
+            <dt>Bloqueadas</dt><dd className={run.tools.blocked ? 'warn-text' : ''}>{run.tools.blocked}</dd>
+          </dl>
+          <table className="mini-table">
+            <thead><tr><th>Ferramenta</th><th>Usos</th><th>Falhas</th><th>Tempo</th></tr></thead>
+            <tbody>
+              {run.tools.byTool.map((tool) => (
+                <tr key={tool.name}>
+                  <td>{tool.name}</td>
+                  <td>{tool.calls}</td>
+                  <td className={tool.errors || tool.blocked ? 'warn-text' : ''}>{tool.errors + tool.blocked}</td>
+                  <td>{tool.totalMs >= 1000 ? `${Math.round(tool.totalMs / 100) / 10}s` : `${tool.totalMs}ms`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : <p className="muted small">Nenhuma ferramenta usada nesta execução ainda.</p>}
+      <h2 className="section-title">Histórico desta tarefa</h2>
+      <RunHistory taskId={task.taskId} runId={run?.runId ?? null} runStatus={run?.status ?? null} />
       <h2 className="section-title">Arquivos alterados observados</h2>
       <p className="muted small">Observado pelo git do workspace; não é prova de autoria do Claude.</p>
       <ul className="files">{task.changedFiles.observed.length ? task.changedFiles.observed.slice(0, 50).map((file) => <li key={file} className="mono wrap">{file}</li>) : <li className="muted">nenhum observado</li>}</ul>

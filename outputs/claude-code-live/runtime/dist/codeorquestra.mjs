@@ -1140,8 +1140,144 @@ function resolveJobContract(job) {
   return resolveV2(job);
 }
 
+// src/usage/claude-usage.ts
+function token(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function sanitizeClaudeUsageReport(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const usage2 = value;
+  const report = {
+    input_tokens: token(usage2.input_tokens ?? usage2.inputTokens ?? usage2.input),
+    output_tokens: token(usage2.output_tokens ?? usage2.outputTokens ?? usage2.output),
+    cache_read_input_tokens: token(usage2.cache_read_input_tokens ?? usage2.cachedInputTokens ?? usage2.cacheRead),
+    cache_creation_input_tokens: token(usage2.cache_creation_input_tokens ?? usage2.cacheWriteInputTokens ?? usage2.cacheWrite)
+  };
+  return Object.values(report).some((item) => item !== null) ? report : null;
+}
+function normalizeClaudeUsage(value) {
+  const usage2 = sanitizeClaudeUsageReport(value);
+  if (!usage2) return null;
+  const inputTokens = usage2.input_tokens;
+  const outputTokens = usage2.output_tokens;
+  const cachedInputTokens = usage2.cache_read_input_tokens;
+  const cacheWriteInputTokens = usage2.cache_creation_input_tokens;
+  const totalInputTokens = (inputTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheWriteInputTokens ?? 0);
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    totalInputTokens,
+    totalObservedTokens: totalInputTokens + (outputTokens ?? 0),
+    quality: [inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens].every((item) => item !== null) ? "reported" : "partial"
+  };
+}
+function emptyTotal() {
+  return { turns: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalInputTokens: 0, totalObservedTokens: 0, partial: false };
+}
+function add(total, usage2) {
+  total.turns += 1;
+  total.inputTokens += usage2.inputTokens ?? 0;
+  total.outputTokens += usage2.outputTokens ?? 0;
+  total.cachedInputTokens += usage2.cachedInputTokens ?? 0;
+  total.cacheWriteInputTokens += usage2.cacheWriteInputTokens ?? 0;
+  total.totalInputTokens += usage2.totalInputTokens;
+  total.totalObservedTokens += usage2.totalObservedTokens;
+  total.partial ||= usage2.quality === "partial";
+}
+var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
+  seen = /* @__PURE__ */ new Set();
+  total = emptyTotal();
+  models = /* @__PURE__ */ new Map();
+  lastObservedAt = null;
+  static fromEvents(events) {
+    const accumulator = new _ClaudeUsageAccumulator();
+    for (const event of events) accumulator.addEvent(event);
+    return accumulator;
+  }
+  /**
+   * The accumulator's own state, so it can be restored without replaying the
+   * log that produced it.
+   *
+   * `seen` is part of the state, not an optimisation: it is what makes
+   * addEvent idempotent per (runId, turn), so a restored accumulator that
+   * later sees a repeated turn must still refuse to count it twice.
+   */
+  toJSON() {
+    return {
+      version: 1,
+      seen: [...this.seen],
+      total: { ...this.total },
+      models: [...this.models.entries()].map(([model, total]) => [model, { ...total }]),
+      lastObservedAt: this.lastObservedAt
+    };
+  }
+  /** Returns null for anything it does not fully recognise, so the caller replays the log. */
+  static fromJSON(value) {
+    if (!value || typeof value !== "object") return null;
+    const snapshot = value;
+    if (snapshot.version !== 1 || !Array.isArray(snapshot.seen) || !Array.isArray(snapshot.models) || !snapshot.total) return null;
+    const accumulator = new _ClaudeUsageAccumulator();
+    for (const key of snapshot.seen) {
+      if (typeof key !== "string") return null;
+      accumulator.seen.add(key);
+    }
+    Object.assign(accumulator.total, snapshot.total);
+    for (const entry of snapshot.models) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || !entry[1]) return null;
+      accumulator.models.set(entry[0], { ...entry[1] });
+    }
+    accumulator.lastObservedAt = typeof snapshot.lastObservedAt === "string" ? snapshot.lastObservedAt : null;
+    return accumulator;
+  }
+  addEvent(event) {
+    if (!["turn_completed", "turn_interrupted", "turn_failed"].includes(event.type)) return false;
+    const turn = token(event.data.turn);
+    if (turn === null) return false;
+    const key = `${event.runId}:${turn}`;
+    if (this.seen.has(key)) return false;
+    const usage2 = normalizeClaudeUsage(event.data.usage ?? event.data.tokens);
+    if (!usage2) return false;
+    this.seen.add(key);
+    const model = typeof event.data.model === "string" && event.data.model.trim() ? event.data.model.trim() : "desconhecido";
+    add(this.total, usage2);
+    const modelTotal = this.models.get(model) ?? emptyTotal();
+    add(modelTotal, usage2);
+    this.models.set(model, modelTotal);
+    this.lastObservedAt = event.ts;
+    return true;
+  }
+  snapshot(observedAt = this.lastObservedAt) {
+    const quality = this.total.turns === 0 ? "unavailable" : this.total.partial ? "partial" : "reported";
+    return {
+      quality,
+      observedAt: this.total.turns === 0 ? null : observedAt,
+      turns: this.total.turns,
+      inputTokens: this.total.inputTokens,
+      outputTokens: this.total.outputTokens,
+      cachedInputTokens: this.total.cachedInputTokens,
+      cacheWriteInputTokens: this.total.cacheWriteInputTokens,
+      totalInputTokens: this.total.totalInputTokens,
+      totalObservedTokens: this.total.totalObservedTokens,
+      byModel: [...this.models.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([model, total]) => ({
+        model,
+        turns: total.turns,
+        inputTokens: total.inputTokens,
+        outputTokens: total.outputTokens,
+        cachedInputTokens: total.cachedInputTokens,
+        cacheWriteInputTokens: total.cacheWriteInputTokens,
+        totalInputTokens: total.totalInputTokens,
+        totalObservedTokens: total.totalObservedTokens,
+        quality: total.partial ? "partial" : "reported"
+      }))
+    };
+  }
+};
+
 // src/events/derive.ts
 var SUPERVISED_TIMEOUT_POLICY = { mode: "supervised", inactivityAlertSeconds: 1200, elapsedAlertSeconds: 7200, killTimers: false };
+var TURN_TERMINAL_EVENTS = /* @__PURE__ */ new Set(["turn_completed", "turn_interrupted", "turn_failed"]);
 function seconds(from, to) {
   if (!from || !to) return 0;
   const delta = (Date.parse(to) - Date.parse(from)) / 1e3;
@@ -1189,8 +1325,12 @@ function deriveCompatibilityFiles(events, options = {}) {
     turns: 0,
     modelReason: null,
     endedAt: null,
-    alerts: []
+    alerts: [],
+    claudeUsage: { turns: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalInputTokens: 0, totalObservedTokens: 0, quality: "unavailable" },
+    limits: null,
+    budgetExhausted: false
   };
+  let usagePartial = false;
   const lines = [];
   const openTools = /* @__PURE__ */ new Map();
   let terminal = false;
@@ -1202,6 +1342,22 @@ function deriveCompatibilityFiles(events, options = {}) {
     }
     const data = event.data;
     status.lastActivityAt = event.ts;
+    if (TURN_TERMINAL_EVENTS.has(event.type)) {
+      const usage2 = normalizeClaudeUsage(data.usage);
+      if (usage2) {
+        const totals = status.claudeUsage;
+        totals.turns += 1;
+        totals.inputTokens += usage2.inputTokens ?? 0;
+        totals.outputTokens += usage2.outputTokens ?? 0;
+        totals.cachedInputTokens += usage2.cachedInputTokens ?? 0;
+        totals.cacheWriteInputTokens += usage2.cacheWriteInputTokens ?? 0;
+        totals.totalInputTokens += usage2.totalInputTokens;
+        totals.totalObservedTokens += usage2.totalObservedTokens;
+        usagePartial ||= usage2.quality === "partial";
+      } else {
+        usagePartial = true;
+      }
+    }
     switch (event.type) {
       case "run_started": {
         runId = event.runId;
@@ -1220,6 +1376,7 @@ function deriveCompatibilityFiles(events, options = {}) {
         status.contractVersion = data.contractVersion ?? null;
         status.resumeMode = data.resumeMode ?? "new";
         status.allowedCommands = Array.isArray(data.allowedCommands) ? data.allowedCommands : [];
+        status.limits = data.limits && typeof data.limits === "object" ? data.limits : null;
         status.status = "STARTING";
         lines.push("CODEORQUESTRA - ACOMPANHAMENTO AO VIVO");
         lines.push(`Tarefa Codex: ${status.codexThreadId ?? "desconhecida"} | Execu\xE7\xE3o: ${event.runId}`);
@@ -1306,6 +1463,11 @@ function deriveCompatibilityFiles(events, options = {}) {
         status.currentTool = null;
         break;
       }
+      case "budget_exhausted": {
+        status.budgetExhausted = true;
+        lines.push("[Or\xE7amento] Esgotado: o turno em andamento termina, nenhum outro \xE9 entregue.");
+        break;
+      }
       case "alert": {
         const alert = String(data.alert ?? "");
         if (!status.alerts.includes(alert)) status.alerts.push(alert);
@@ -1360,6 +1522,7 @@ function deriveCompatibilityFiles(events, options = {}) {
       status.requiresReview = true;
     }
   }
+  status.claudeUsage.quality = status.claudeUsage.turns === 0 ? "unavailable" : usagePartial ? "partial" : "reported";
   const end = status.endedAt ?? now;
   status.elapsedSeconds = seconds(status.startedAt, end);
   status.runtimeSeconds = seconds(sessionStartedAt, end);
@@ -2926,6 +3089,7 @@ var SUPERVISION = {
 };
 var COORDINATOR_ABSENT_LABEL = "aguardando coordenador";
 var BUDGET_WARNING_RATIO = 0.8;
+var CONTEXT_HIGH_RATIO = 0.8;
 function evaluateSupervision(input) {
   const thresholds = input.thresholds ?? SUPERVISION;
   const coordinatorPresence = input.coordinatorLastSeenAt !== null && input.now - input.coordinatorLastSeenAt < thresholds.coordinatorAbsentMs ? "present" : "absent";
@@ -2945,6 +3109,7 @@ function evaluateSupervision(input) {
   if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push("decision_pending");
   if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push("elapsed_2h");
   if (input.thrashing) alerts.push("thrashing");
+  if (input.contextRatio !== null && input.contextRatio >= CONTEXT_HIGH_RATIO) alerts.push("context_high");
   if (input.budgetRatio !== null) {
     if (input.budgetRatio >= BUDGET_WARNING_RATIO) alerts.push("budget_warning");
     if (input.budgetRatio >= 1) alerts.push("budget_exhausted");
@@ -2964,141 +3129,6 @@ function envName(name) {
 function isHarness(env = process.env) {
   return readEnv("TEST_HARNESS", env) === "1";
 }
-
-// src/usage/claude-usage.ts
-function token(value) {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-function sanitizeClaudeUsageReport(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const usage2 = value;
-  const report = {
-    input_tokens: token(usage2.input_tokens ?? usage2.inputTokens ?? usage2.input),
-    output_tokens: token(usage2.output_tokens ?? usage2.outputTokens ?? usage2.output),
-    cache_read_input_tokens: token(usage2.cache_read_input_tokens ?? usage2.cachedInputTokens ?? usage2.cacheRead),
-    cache_creation_input_tokens: token(usage2.cache_creation_input_tokens ?? usage2.cacheWriteInputTokens ?? usage2.cacheWrite)
-  };
-  return Object.values(report).some((item) => item !== null) ? report : null;
-}
-function normalizeClaudeUsage(value) {
-  const usage2 = sanitizeClaudeUsageReport(value);
-  if (!usage2) return null;
-  const inputTokens = usage2.input_tokens;
-  const outputTokens = usage2.output_tokens;
-  const cachedInputTokens = usage2.cache_read_input_tokens;
-  const cacheWriteInputTokens = usage2.cache_creation_input_tokens;
-  const totalInputTokens = (inputTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheWriteInputTokens ?? 0);
-  return {
-    inputTokens,
-    outputTokens,
-    cachedInputTokens,
-    cacheWriteInputTokens,
-    totalInputTokens,
-    totalObservedTokens: totalInputTokens + (outputTokens ?? 0),
-    quality: [inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens].every((item) => item !== null) ? "reported" : "partial"
-  };
-}
-function emptyTotal() {
-  return { turns: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalInputTokens: 0, totalObservedTokens: 0, partial: false };
-}
-function add(total, usage2) {
-  total.turns += 1;
-  total.inputTokens += usage2.inputTokens ?? 0;
-  total.outputTokens += usage2.outputTokens ?? 0;
-  total.cachedInputTokens += usage2.cachedInputTokens ?? 0;
-  total.cacheWriteInputTokens += usage2.cacheWriteInputTokens ?? 0;
-  total.totalInputTokens += usage2.totalInputTokens;
-  total.totalObservedTokens += usage2.totalObservedTokens;
-  total.partial ||= usage2.quality === "partial";
-}
-var ClaudeUsageAccumulator = class _ClaudeUsageAccumulator {
-  seen = /* @__PURE__ */ new Set();
-  total = emptyTotal();
-  models = /* @__PURE__ */ new Map();
-  lastObservedAt = null;
-  static fromEvents(events) {
-    const accumulator = new _ClaudeUsageAccumulator();
-    for (const event of events) accumulator.addEvent(event);
-    return accumulator;
-  }
-  /**
-   * The accumulator's own state, so it can be restored without replaying the
-   * log that produced it.
-   *
-   * `seen` is part of the state, not an optimisation: it is what makes
-   * addEvent idempotent per (runId, turn), so a restored accumulator that
-   * later sees a repeated turn must still refuse to count it twice.
-   */
-  toJSON() {
-    return {
-      version: 1,
-      seen: [...this.seen],
-      total: { ...this.total },
-      models: [...this.models.entries()].map(([model, total]) => [model, { ...total }]),
-      lastObservedAt: this.lastObservedAt
-    };
-  }
-  /** Returns null for anything it does not fully recognise, so the caller replays the log. */
-  static fromJSON(value) {
-    if (!value || typeof value !== "object") return null;
-    const snapshot = value;
-    if (snapshot.version !== 1 || !Array.isArray(snapshot.seen) || !Array.isArray(snapshot.models) || !snapshot.total) return null;
-    const accumulator = new _ClaudeUsageAccumulator();
-    for (const key of snapshot.seen) {
-      if (typeof key !== "string") return null;
-      accumulator.seen.add(key);
-    }
-    Object.assign(accumulator.total, snapshot.total);
-    for (const entry of snapshot.models) {
-      if (!Array.isArray(entry) || typeof entry[0] !== "string" || !entry[1]) return null;
-      accumulator.models.set(entry[0], { ...entry[1] });
-    }
-    accumulator.lastObservedAt = typeof snapshot.lastObservedAt === "string" ? snapshot.lastObservedAt : null;
-    return accumulator;
-  }
-  addEvent(event) {
-    if (!["turn_completed", "turn_interrupted", "turn_failed"].includes(event.type)) return false;
-    const turn = token(event.data.turn);
-    if (turn === null) return false;
-    const key = `${event.runId}:${turn}`;
-    if (this.seen.has(key)) return false;
-    const usage2 = normalizeClaudeUsage(event.data.usage ?? event.data.tokens);
-    if (!usage2) return false;
-    this.seen.add(key);
-    const model = typeof event.data.model === "string" && event.data.model.trim() ? event.data.model.trim() : "desconhecido";
-    add(this.total, usage2);
-    const modelTotal = this.models.get(model) ?? emptyTotal();
-    add(modelTotal, usage2);
-    this.models.set(model, modelTotal);
-    this.lastObservedAt = event.ts;
-    return true;
-  }
-  snapshot(observedAt = this.lastObservedAt) {
-    const quality = this.total.turns === 0 ? "unavailable" : this.total.partial ? "partial" : "reported";
-    return {
-      quality,
-      observedAt: this.total.turns === 0 ? null : observedAt,
-      turns: this.total.turns,
-      inputTokens: this.total.inputTokens,
-      outputTokens: this.total.outputTokens,
-      cachedInputTokens: this.total.cachedInputTokens,
-      cacheWriteInputTokens: this.total.cacheWriteInputTokens,
-      totalInputTokens: this.total.totalInputTokens,
-      totalObservedTokens: this.total.totalObservedTokens,
-      byModel: [...this.models.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([model, total]) => ({
-        model,
-        turns: total.turns,
-        inputTokens: total.inputTokens,
-        outputTokens: total.outputTokens,
-        cachedInputTokens: total.cachedInputTokens,
-        cacheWriteInputTokens: total.cacheWriteInputTokens,
-        totalInputTokens: total.totalInputTokens,
-        totalObservedTokens: total.totalObservedTokens,
-        quality: total.partial ? "partial" : "reported"
-      }))
-    };
-  }
-};
 
 // src/broker/thrashing.ts
 var TRAIL_LIMIT = 20;
@@ -3128,6 +3158,16 @@ function detectThrashing(trail) {
     return { pattern: "error_storm", tool: last.name, inputPreview: last.inputPreview, count: ERROR_STORM_LENGTH, sig: `error_storm:${last.sig}` };
   }
   return null;
+}
+
+// src/shared/models.ts
+var CONTEXT_WINDOW_TOKENS = {
+  "claude-fable-5-1": 2e5,
+  "claude-opus-5": 2e5
+};
+function contextWindowFor(model) {
+  if (!model) return null;
+  return CONTEXT_WINDOW_TOKENS[model] ?? null;
 }
 
 // src/usage/codex-usage.ts
@@ -4853,6 +4893,8 @@ var TaskManager = class {
       turns: 0,
       tokensObserved: 0,
       toolTrail: [],
+      lastTurnContextTokens: null,
+      tools: { calls: 0, errors: 0, blocked: 0, byTool: /* @__PURE__ */ new Map(), open: /* @__PURE__ */ new Map(), recent: [] },
       thrashingSeen: /* @__PURE__ */ new Set(),
       thrashing: null,
       policy: null,
@@ -4942,6 +4984,7 @@ var TaskManager = class {
         ...worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: "broker", policyEnabledAt: worktreePlan.policy.enabledAt } } : {},
         profile: contract.profile,
         contractVersion: contract.version,
+        limits: contract.limits,
         coordination: contract.coordination,
         scope: contract.scope,
         capabilities: contract.capabilities,
@@ -5246,9 +5289,12 @@ var TaskManager = class {
       case "event": {
         const event = await this.append(task, run2.runId, message.type, message.data, message.toolUseId);
         if (task.claudeUsage.addEvent(event)) void this.persistUsage(task);
-        if (TURN_TERMINAL_EVENTS.has(message.type)) {
+        if (TURN_TERMINAL_EVENTS2.has(message.type)) {
           const usage2 = normalizeClaudeUsage(message.data.usage);
-          if (usage2) run2.tokensObserved += usage2.totalObservedTokens;
+          if (usage2) {
+            run2.tokensObserved += usage2.totalObservedTokens;
+            run2.lastTurnContextTokens = usage2.totalInputTokens;
+          }
         }
         this.applyEvent(task, run2, message.type, message.data, message.toolUseId);
         if (message.type === "tool_result" || message.type === "tool_blocked") await this.observeThrashing(task, run2);
@@ -5330,6 +5376,11 @@ var TaskManager = class {
         if (typeof data.model === "string") run2.observedModel = data.model;
         break;
       case "tool_start": {
+        if (typeof data.name === "string") {
+          run2.tools.calls += 1;
+          toolUsage(run2, data.name).calls += 1;
+          if (toolUseId) run2.tools.open.set(toolUseId, { name: data.name, at: Date.now() });
+        }
         if (toolUseId && typeof data.name === "string") {
           run2.toolTrail.push({
             toolUseId,
@@ -5349,7 +5400,24 @@ var TaskManager = class {
       case "tool_result":
       case "tool_blocked": {
         const entry = toolUseId ? run2.toolTrail.find((item) => item.toolUseId === toolUseId) : void 0;
-        if (entry) entry.error = type === "tool_blocked" || data.isError === true;
+        const failed = type === "tool_blocked" || data.isError === true;
+        if (entry) entry.error = failed;
+        const open = toolUseId ? run2.tools.open.get(toolUseId) : void 0;
+        if (open && toolUseId) {
+          run2.tools.open.delete(toolUseId);
+          const usage2 = toolUsage(run2, open.name);
+          if (type === "tool_blocked") {
+            run2.tools.blocked += 1;
+            usage2.blocked += 1;
+          } else if (failed) {
+            run2.tools.errors += 1;
+            usage2.errors += 1;
+          }
+          const ms = Math.max(0, Date.now() - open.at);
+          usage2.totalMs += ms;
+          run2.tools.recent.push({ name: open.name, ok: !failed, ms, at: (/* @__PURE__ */ new Date()).toISOString() });
+          if (run2.tools.recent.length > RECENT_TOOL_CALLS) run2.tools.recent.splice(0, run2.tools.recent.length - RECENT_TOOL_CALLS);
+        }
         break;
       }
       case "policy_changed":
@@ -5660,6 +5728,7 @@ var TaskManager = class {
         oldestPendingRequestAt: oldestPendingAt(task),
         budgetRatio: budget?.ratio ?? null,
         thrashing: run2.thrashing !== null,
+        contextRatio: contextStatus(run2)?.ratio ?? null,
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5829,7 +5898,11 @@ var TaskManager = class {
         budget: full.currentRun.budget,
         thrashing: full.currentRun.thrashing,
         policy: full.currentRun.policy,
-        endingAfterTurn: full.currentRun.endingAfterTurn
+        endingAfterTurn: full.currentRun.endingAfterTurn,
+        context: full.currentRun.context,
+        // Counts only: the per-tool breakdown is for someone looking at a
+        // screen, not for a coordinator's poll loop.
+        tools: { calls: full.currentRun.tools.calls, errors: full.currentRun.tools.errors, blocked: full.currentRun.tools.blocked }
       } : null,
       // Kept in full: a pending decision is the thing the coordinator has to
       // act on, and trimming it would hide what it is deciding about.
@@ -5848,6 +5921,7 @@ var TaskManager = class {
       oldestPendingRequestAt: oldestPendingAt(task),
       budgetRatio: run2 ? budgetStatus(run2, now)?.ratio ?? null : null,
       thrashing: run2?.thrashing != null,
+      contextRatio: run2 ? contextStatus(run2)?.ratio ?? null : null,
       phase: run2 && run2.finalizing && !run2.finalized ? "busy_model" : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive2(task.worker.pid)) || Boolean(run2 && run2.finalizing && !run2.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -5898,7 +5972,9 @@ var TaskManager = class {
         budget: budgetStatus(run2, now),
         thrashing: run2.thrashing,
         policy: run2.policy,
-        endingAfterTurn: run2.endAfterTurn !== null
+        endingAfterTurn: run2.endAfterTurn !== null,
+        context: contextStatus(run2),
+        tools: toolsView(run2)
       } : null,
       previousSessionId: task.previousSessionId,
       pendingRequests: [...task.pending.values()],
@@ -5924,6 +6000,14 @@ var TaskManager = class {
   views(scope) {
     return [...this.tasks.values()].filter((task) => !scope || task.record.taskId === scope).map((task) => this.view(task));
   }
+  /**
+   * The run history, with what each run cost.
+   *
+   * Read from each run's own status.json rather than from memory, so a run
+   * from a previous broker answers the same questions as the one that just
+   * ended. A file that cannot be read reports UNKNOWN and nulls instead of
+   * zeros: "we do not know" and "it cost nothing" are different answers.
+   */
   async runsOf(task) {
     const dir = path14.join(task.dir, "runs");
     let entries = [];
@@ -5935,7 +6019,27 @@ var TaskManager = class {
     const runs = [];
     for (const runId of entries.sort()) {
       const status = await readJsonShared(path14.join(dir, runId, "status.json"));
-      runs.push({ runId, status: status.status === "ok" ? status.value.status ?? "UNKNOWN" : "UNKNOWN", startedAt: status.status === "ok" ? status.value.startedAt ?? null : null, endedAt: status.status === "ok" ? status.value.endedAt ?? null : null });
+      if (status.status === "ok") {
+        const value = status.value;
+        const usage2 = value.claudeUsage;
+        runs.push({
+          runId,
+          status: value.status ?? "UNKNOWN",
+          failureCode: value.failureCode ?? null,
+          startedAt: value.startedAt ?? null,
+          endedAt: value.endedAt ?? null,
+          elapsedSeconds: typeof value.elapsedSeconds === "number" ? value.elapsedSeconds : null,
+          turns: typeof value.turns === "number" ? value.turns : null,
+          tokens: usage2 && typeof usage2.totalObservedTokens === "number" ? usage2.totalObservedTokens : null,
+          usageQuality: usage2?.quality ?? "unavailable",
+          toolCalls: Array.isArray(value.toolCalls) ? value.toolCalls.length : null,
+          toolErrors: typeof value.toolErrors === "number" ? value.toolErrors : null,
+          limits: value.limits ?? null,
+          budgetExhausted: value.budgetExhausted === true
+        });
+        continue;
+      }
+      runs.push({ runId, status: "UNKNOWN", failureCode: null, startedAt: null, endedAt: null, elapsedSeconds: null, turns: null, tokens: null, usageQuality: "unavailable", toolCalls: null, toolErrors: null, limits: null, budgetExhausted: false });
     }
     return runs;
   }
@@ -5970,7 +6074,7 @@ var TaskManager = class {
     return { events: collected, gapped };
   }
 };
-var TURN_TERMINAL_EVENTS = /* @__PURE__ */ new Set(["turn_completed", "turn_interrupted", "turn_failed"]);
+var TURN_TERMINAL_EVENTS2 = /* @__PURE__ */ new Set(["turn_completed", "turn_interrupted", "turn_failed"]);
 var THRASHING_NOTE = "A execu\xE7\xE3o repete a mesma chamada ou acumula falhas. Nada foi encerrado nem restringido: avalie e, se for o caso, restrinja as a\xE7\xF5es desta execu\xE7\xE3o (codeorquestra_set_policy) ou encerre ao fim do turno (codeorquestra_end com afterTurn).";
 var END_AFTER_TURN_NOTE = "Encerramento pedido para quando o turno atual terminar. O turno n\xE3o \xE9 interrompido e nenhuma orienta\xE7\xE3o nova \xE9 entregue; a execu\xE7\xE3o fecha como COMPLETED.";
 var BUDGET_EXHAUSTED_NOTE = "Or\xE7amento da execu\xE7\xE3o esgotado: o turno em andamento termina normalmente, mas nenhum outro \xE9 entregue. Para continuar, encerre esta execu\xE7\xE3o e inicie outra na mesma tarefa com limits maior e approvalRevision maior; a sess\xE3o anterior \xE9 retomada automaticamente.";
@@ -5986,6 +6090,28 @@ function budgetStatus(run2, now) {
     if (dimension) ratio = Math.max(ratio, dimension.used / dimension.limit);
   }
   return { tokens, turns, runtimeSeconds, ratio, exhausted: ratio >= 1 };
+}
+var RECENT_TOOL_CALLS = 8;
+function toolUsage(run2, name) {
+  const existing = run2.tools.byTool.get(name);
+  if (existing) return existing;
+  const created = { calls: 0, errors: 0, blocked: 0, totalMs: 0 };
+  run2.tools.byTool.set(name, created);
+  return created;
+}
+function toolsView(run2) {
+  return {
+    calls: run2.tools.calls,
+    errors: run2.tools.errors,
+    blocked: run2.tools.blocked,
+    byTool: [...run2.tools.byTool.entries()].map(([name, usage2]) => ({ name, ...usage2 })).sort((a, b) => b.calls - a.calls || a.name.localeCompare(b.name)),
+    recent: [...run2.tools.recent]
+  };
+}
+function contextStatus(run2) {
+  const windowTokens = contextWindowFor(run2.observedModel ?? run2.requestedModel);
+  if (windowTokens === null || run2.lastTurnContextTokens === null) return null;
+  return { lastTurnTokens: run2.lastTurnContextTokens, windowTokens, ratio: run2.lastTurnContextTokens / windowTokens };
 }
 function oldestPendingAt(task) {
   let oldest = null;

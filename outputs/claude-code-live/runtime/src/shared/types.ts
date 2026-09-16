@@ -209,6 +209,49 @@ export interface RunView {
   policy: TurnPolicyView | null;
   /** True once an end is waiting for the current turn to finish on its own. */
   endingAfterTurn: boolean;
+  /** How full the model's context was on the last turn; null before the first one. */
+  context: RunContextView | null;
+  /** What this run's tools have done so far. */
+  tools: RunToolsView;
+}
+
+/**
+ * How much of the context window the last turn's prompt took.
+ *
+ * `lastTurnTokens` is measured — input plus cache read plus cache creation is
+ * exactly what was sent. `windowTokens` is presumed (see shared/models.ts),
+ * so `ratio` is an estimate and every surface says so.
+ */
+export interface RunContextView {
+  lastTurnTokens: number;
+  windowTokens: number;
+  ratio: number;
+}
+
+export interface RunToolUsageView {
+  name: string;
+  calls: number;
+  errors: number;
+  blocked: number;
+  /** Summed wall time of the calls that finished; open calls contribute nothing. */
+  totalMs: number;
+}
+
+export interface RunToolCallView {
+  name: string;
+  /** null while the call is still open. */
+  ok: boolean | null;
+  ms: number | null;
+  at: string;
+}
+
+export interface RunToolsView {
+  calls: number;
+  errors: number;
+  blocked: number;
+  byTool: RunToolUsageView[];
+  /** The most recent calls, oldest first. */
+  recent: RunToolCallView[];
 }
 
 /**
