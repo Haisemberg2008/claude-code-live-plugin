@@ -201,7 +201,12 @@ describe('scoped termination', () => {
       tree.process.kill('SIGKILL');
       await waitFor(async () => (!isAlive(tree.child) ? true : undefined), { timeoutMs: 15000, description: 'engine parent exits' });
       recordEngineExit(runDir, null, 'SIGKILL');
-      assert.ok(isAlive(tree.grandchild), 'the orphaned descendant is still running');
+      // On POSIX the grandchild is reparented and keeps running. On Windows it
+      // usually survives too, but it can go down with its parent's console
+      // host, and the test cannot make it not. What is under test is that
+      // NEITHER observation lets the run be called clean, so the liveness
+      // itself is only asserted where the platform guarantees it.
+      if (process.platform !== 'win32') assert.ok(isAlive(tree.grandchild), 'the orphaned descendant is still running');
 
       // The recorded exit proves the parent finished, never the tree. The
       // descendant must be found and cleared before the run may be called clean.
