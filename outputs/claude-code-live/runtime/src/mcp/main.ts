@@ -165,9 +165,14 @@ server.registerTool('codeorquestra_interrupt', { description: 'Interrompe o turn
   return call('POST', `/api/tasks/${taskId}/interrupt`, { taskHandle });
 }));
 
-server.registerTool('codeorquestra_end', { description: 'Solicita o encerramento da sessão e reconcilia o worker e a árvore ainda atribuível daquela tarefa.', inputSchema: { taskHandle: handle } }, async ({ taskHandle }) => guarded(async () => {
+server.registerTool('codeorquestra_end', { description: 'Solicita o encerramento da sessão e reconcilia o worker e a árvore ainda atribuível daquela tarefa. Com afterTurn, espera o turno atual terminar sozinho (encerra COMPLETED, sem interromper); sem ele, o turno em andamento é interrompido e a execução fecha CANCELLED.', inputSchema: { taskHandle: handle, afterTurn: z.boolean().optional().describe('Esperar o turno atual terminar em vez de interrompê-lo.') } }, async ({ taskHandle, afterTurn }) => guarded(async () => {
   const taskId = await taskIdFor(taskHandle);
-  return call('POST', `/api/tasks/${taskId}/end`, { taskHandle });
+  return call('POST', `/api/tasks/${taskId}/end`, { taskHandle, ...(afterTurn === undefined ? {} : { afterTurn }) });
+}));
+
+server.registerTool('codeorquestra_set_policy', { description: 'Restringe o que esta execução pode fazer sem perguntar, a partir da próxima chamada de ferramenta (vale no meio do turno). Só acrescenta decisões: nunca concede o que o contrato negou. "commands" escala comandos de shell; "writes" escala comandos e escritas de arquivo; "all" escala toda ação com efeito externo; "none" volta ao contrato.', inputSchema: { taskHandle: handle, escalate: z.enum(['none', 'commands', 'writes', 'all']), reason: z.string().min(1).describe('Por que a restrição está sendo aplicada; fica registrada.') } }, async ({ taskHandle, escalate, reason }) => guarded(async () => {
+  const taskId = await taskIdFor(taskHandle);
+  return call('POST', `/api/tasks/${taskId}/policy`, { taskHandle, escalate, reason });
 }));
 
 server.registerTool('codeorquestra_set_model', { description: 'Troca o modelo entre turnos (claude-fable-5-1 ou claude-opus-5) com motivo registrado.', inputSchema: { taskHandle: handle, model: z.enum(['claude-fable-5-1', 'claude-opus-5']), reason: z.string().min(1) } }, async ({ taskHandle, model, reason }) => guarded(async () => {

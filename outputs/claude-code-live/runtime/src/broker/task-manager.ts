@@ -30,8 +30,9 @@ import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
 import { isHarness, envName } from '../shared/env.ts';
-import type { ActionSource, AuthorizedModel, CodexUsageView, EventRecord, PendingRequestView, QueueEntryView, RunBudgetView, RunStatus, TaskView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import { TURN_POLICY_LEVELS, type ActionSource, type AuthorizedModel, type CodexUsageView, type EventRecord, type PendingRequestView, type QueueEntryView, type RunBudgetView, type RunStatus, type TaskView, type ThrashingReport, type TransientFrame, type TurnPolicyLevel, type TurnPolicyView, type WorkerPhase } from '../shared/types.ts';
 import { ClaudeUsageAccumulator, normalizeClaudeUsage } from '../usage/claude-usage.ts';
+import { detectThrashing, TRAIL_LIMIT, type ToolTrailEntry } from './thrashing.ts';
 import { CodexUsageService, type CodexUsageReader, unavailableCodexUsage } from '../usage/codex-usage.ts';
 import { sha256, mintTaskHandle, verifyTaskHandle, taskIdForThread, THREAD_ID_PATTERN } from './identity.ts';
 import { HttpError } from './http.ts';
@@ -96,6 +97,15 @@ interface RunState {
    * Distinct from the task's usage accumulator, which spans runs and replays.
    */
   tokensObserved: number;
+  /** Recent tool calls, oldest first, bounded. Read only by the loop detector. */
+  toolTrail: ToolTrailEntry[];
+  /** Loops already reported, so each distinct one is named once per run. */
+  thrashingSeen: Set<string>;
+  thrashing: ThrashingReport | null;
+  /** Only ever what the worker confirmed; a requested restriction is not a claim. */
+  policy: TurnPolicyView | null;
+  /** An end that waits for the running turn instead of interrupting it. */
+  endAfterTurn: { source: ActionSource; requestedAt: string } | null;
   resumeMode: 'new' | 'automatic' | 'explicit';
   simulated: boolean;
   writerLockKey: string | null;
@@ -893,6 +903,7 @@ export class TaskManager {
     if (task.uncertain) throw new HttpError(409, 'REQUIRES_REVIEW', { message: 'A execução está incerta; confirme a revisão antes de enviar novas orientações.' });
     const budget = budgetStatus(task.run, Date.now());
     if (budget?.exhausted) throw new HttpError(409, 'BUDGET_EXHAUSTED', { message: 'O orçamento desta execução esgotou; nenhum turno novo é entregue.', budget, note: BUDGET_EXHAUSTED_NOTE });
+    if (task.run.endAfterTurn) throw new HttpError(409, 'ENDING', { message: 'Esta execução encerra quando o turno atual terminar; nenhuma orientação nova é aceita.' });
     const redacted = redactSensitiveText(text);
     const entry: QueueEntry = { messageId: `msg-${randomUUID()}`, source, text: redacted, textPreview: boundedPreview(redacted, 300).preview, receivedAt: new Date().toISOString(), deliveredAt: null, state: 'queued' };
     task.queue.push(entry);
@@ -986,6 +997,9 @@ export class TaskManager {
     // Exhausted budget: what is queued stays queued. The turn that spent the
     // last of it was allowed to finish; the next one is simply not started.
     if (budgetStatus(run, Date.now())?.exhausted) return;
+    // Same for an end that is waiting on this turn: starting another one would
+    // be the opposite of what was asked.
+    if (run.endAfterTurn) return;
     const next = task.queue.find((entry) => entry.state === 'queued');
     if (!next) return;
     next.state = 'delivered';
@@ -1030,8 +1044,27 @@ export class TaskManager {
     if (source !== 'browser') this.touchCoordinator(task);
   }
 
-  async end(task: TaskState, source: ActionSource): Promise<void> {
+  /**
+   * Ends the session, now or once the running turn finishes.
+   *
+   * Ending now interrupts the turn, which is why it reports CANCELLED: that is
+   * the honest outcome of stopping work in the middle. `afterTurn` is the
+   * other thing a coordinator means by "we are done" — let it finish what it
+   * is doing and then stop — and it closes COMPLETED, because nothing was cut
+   * short. It is not an interrupt and never becomes one: if the turn runs for
+   * an hour, the end waits an hour.
+   */
+  async end(task: TaskState, source: ActionSource, afterTurn = false): Promise<{ ending: true; afterTurn: boolean }> {
     if (!task.run || !task.worker || task.run.finalized) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    if (afterTurn && task.phase !== 'idle') {
+      if (!task.run.endAfterTurn) {
+        task.run.endAfterTurn = { source, requestedAt: new Date().toISOString() };
+        await this.append(task, task.run.runId, 'end_after_turn_requested', { source, note: END_AFTER_TURN_NOTE });
+        this.changed(task);
+      }
+      if (source !== 'browser') this.touchCoordinator(task);
+      return { ending: true, afterTurn: true };
+    }
     this.sendToWorker(task, { t: 'end', source });
     if (source !== 'browser') this.touchCoordinator(task);
     const run = task.run;
@@ -1039,6 +1072,7 @@ export class TaskManager {
       if (task.run === run && !run.finalized) void this.finalize(task, run, 'CANCELLED', 'END_TIMEOUT', 'O worker não encerrou no prazo; a árvore de processos foi terminada.', 1, null);
     }, WORKER_END_GRACE_MS);
     task.endTimer.unref();
+    return { ending: true, afterTurn: false };
   }
 
   /**
@@ -1202,6 +1236,11 @@ export class TaskManager {
       telemetryFailures: 0,
       turns: 0,
       tokensObserved: 0,
+      toolTrail: [],
+      thrashingSeen: new Set(),
+      thrashing: null,
+      policy: null,
+      endAfterTurn: null,
       resumeMode: task.previousSessionId ? 'automatic' : 'new',
       simulated: false,
       declaredWorkspace: worktreePlan ? workspace : null,
@@ -1646,6 +1685,9 @@ export class TaskManager {
           if (usage) run.tokensObserved += usage.totalObservedTokens;
         }
         this.applyEvent(task, run, message.type, message.data, message.toolUseId);
+        // Only completed calls change the shape of the history, so the
+        // detector runs exactly where a call closes.
+        if (message.type === 'tool_result' || message.type === 'tool_blocked') await this.observeThrashing(task, run);
         if (message.type === 'permission_requested' || message.type === 'question_asked') this.changed(task);
         break;
       }
@@ -1689,6 +1731,15 @@ export class TaskManager {
         task.currentTool = null;
         await this.observeBudget(task, run);
         await this.observeBetweenTurns(task, run);
+        // An end that waited for this turn happens here, with the worker idle,
+        // so the session closes COMPLETED instead of being cancelled mid-turn.
+        if (run.endAfterTurn) {
+          const requested = run.endAfterTurn;
+          run.endAfterTurn = null;
+          await this.end(task, requested.source);
+          this.changed(task);
+          break;
+        }
         await this.deliverNext(task);
         this.changed(task);
         void this.refreshUsage(task);
@@ -1720,10 +1771,36 @@ export class TaskManager {
       case 'assistant_text':
         if (typeof data.model === 'string') run.observedModel = data.model;
         break;
-      case 'tool_start':
+      case 'tool_start': {
+        if (toolUseId && typeof data.name === 'string') {
+          run.toolTrail.push({
+            toolUseId,
+            sig: `${data.name}:${typeof data.inputHash === 'string' ? data.inputHash : ''}`,
+            name: data.name,
+            inputPreview: typeof data.inputPreview === 'string' ? data.inputPreview : '',
+            error: null,
+          });
+          if (run.toolTrail.length > TRAIL_LIMIT) run.toolTrail.splice(0, run.toolTrail.length - TRAIL_LIMIT);
+        }
         if (toolUseId && typeof data.name === 'string' && ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(data.name) && typeof data.inputPreview === 'string') {
           const match = /"(?:file_path|notebook_path)":"((?:[^"\\]|\\.)*)"/.exec(data.inputPreview);
           if (match) run.claudeAuthored.add(match[1]!.replace(/\\\\/g, '\\'));
+        }
+        break;
+      }
+      case 'tool_result':
+      case 'tool_blocked': {
+        // A blocked call never ran, which for a loop is the same evidence as a
+        // failure: the agent keeps asking for something it cannot have.
+        const entry = toolUseId ? run.toolTrail.find((item) => item.toolUseId === toolUseId) : undefined;
+        if (entry) entry.error = type === 'tool_blocked' || data.isError === true;
+        break;
+      }
+      case 'policy_changed':
+        if (typeof data.escalate === 'string' && TURN_POLICY_LEVELS.includes(data.escalate as TurnPolicyLevel)) {
+          run.policy = data.escalate === 'none'
+            ? null
+            : { escalate: data.escalate as TurnPolicyLevel, reason: typeof data.reason === 'string' ? data.reason : '', since: new Date().toISOString() };
         }
         break;
       case 'turn_completed':
@@ -2058,6 +2135,7 @@ export class TaskManager {
         lastActivityAt: task.lastActivityAt,
         oldestPendingRequestAt: oldestPendingAt(task),
         budgetRatio: budget?.ratio ?? null,
+        thrashing: run.thrashing !== null,
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2124,6 +2202,51 @@ export class TaskManager {
     task.alertsRaised.add('budget_exhausted');
     await this.append(task, run.runId, 'budget_exhausted', { ...budget, note: BUDGET_EXHAUSTED_NOTE });
     this.changed(task);
+  }
+
+  /**
+   * Names a loop once, with the evidence, and does nothing else.
+   *
+   * Nothing is throttled, denied or stopped here: an agent repeating itself
+   * may be stuck or may be converging, and only the coordinator can tell. What
+   * the runtime owes is that the shape is not invisible — the alert carries
+   * the tool, the input and the count so the next decision is an informed one.
+   */
+  private async observeThrashing(task: TaskState, run: RunState): Promise<void> {
+    const verdict = detectThrashing(run.toolTrail);
+    if (!verdict) return;
+    const { sig, ...report } = verdict;
+    const key = `${verdict.pattern}:${sig}`;
+    if (run.thrashingSeen.has(key)) return;
+    run.thrashingSeen.add(key);
+    run.thrashing = { ...report, at: new Date().toISOString() };
+    // Added before the append so the supervision tick, which reports the same
+    // alert, does not also write a second, vaguer event for it.
+    task.alertsRaised.add('thrashing');
+    await this.append(task, run.runId, 'alert', { alert: 'thrashing', action: 'none', ...report, note: THRASHING_NOTE });
+    this.changed(task);
+  }
+
+  /**
+   * Adds permission checks to a run that is already going.
+   *
+   * Between watching a loop and ending the session there has to be something
+   * that keeps the work alive, and this is it. It only ever asks for more
+   * decisions, so it applies immediately — mid-turn included, which is when a
+   * loop is actually running. The view reports the restriction only once the
+   * worker confirms it: a safety claim nobody applied is worse than none.
+   */
+  async setPolicy(task: TaskState, escalate: unknown, reason: unknown, source: ActionSource): Promise<{ requested: TurnPolicyLevel; applied: 'on_confirmation'; inForce: TurnPolicyLevel }> {
+    if (typeof escalate !== 'string' || !TURN_POLICY_LEVELS.includes(escalate as TurnPolicyLevel)) {
+      throw new HttpError(400, 'POLICY_INVALID', { message: `escalate deve ser ${TURN_POLICY_LEVELS.join(', ')}.` });
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new HttpError(400, 'POLICY_REASON_REQUIRED', { message: 'Informe por que a restrição está sendo aplicada; o motivo fica registrado.' });
+    }
+    if (!task.run || !task.worker || task.run.finalized || task.run.finalizing) throw new HttpError(409, 'NO_ACTIVE_RUN');
+    this.sendToWorker(task, { t: 'set_policy', escalate: escalate as TurnPolicyLevel, reason: reason.trim(), source });
+    if (source !== 'browser') this.touchCoordinator(task);
+    return { requested: escalate as TurnPolicyLevel, applied: 'on_confirmation', inForce: task.run.policy?.escalate ?? 'none' };
   }
 
   // ------------------------------------------------------------------ views
@@ -2197,8 +2320,12 @@ export class TaskManager {
             currentTool: full.currentRun.currentTool,
             turns: full.currentRun.turns,
             startedAt: full.currentRun.startedAt,
-            // A budget is the coordinator's decision to make, so it stays.
+            // A budget, a loop and a restriction are all things the
+            // coordinator decides on, so they survive the trim.
             budget: full.currentRun.budget,
+            thrashing: full.currentRun.thrashing,
+            policy: full.currentRun.policy,
+            endingAfterTurn: full.currentRun.endingAfterTurn,
           }
         : null,
       // Kept in full: a pending decision is the thing the coordinator has to
@@ -2218,6 +2345,7 @@ export class TaskManager {
       lastActivityAt: task.lastActivityAt,
       oldestPendingRequestAt: oldestPendingAt(task),
       budgetRatio: run ? (budgetStatus(run, now)?.ratio ?? null) : null,
+      thrashing: run?.thrashing != null,
       phase: run && run.finalizing && !run.finalized ? 'busy_model' : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)) || Boolean(run && run.finalizing && !run.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2272,6 +2400,9 @@ export class TaskManager {
         contractVersion: run.contract.version,
         resumeMode: run.resumeMode,
         budget: budgetStatus(run, now),
+        thrashing: run.thrashing,
+        policy: run.policy,
+        endingAfterTurn: run.endAfterTurn !== null,
       } : null,
       previousSessionId: task.previousSessionId,
       pendingRequests: [...task.pending.values()],
@@ -2358,6 +2489,10 @@ export class TaskManager {
 /** A plain object, for validating loosely typed request bodies. */
 /** When the oldest unanswered request arrived, for the decision alert. */
 const TURN_TERMINAL_EVENTS = new Set(['turn_completed', 'turn_interrupted', 'turn_failed']);
+
+const THRASHING_NOTE = 'A execução repete a mesma chamada ou acumula falhas. Nada foi encerrado nem restringido: avalie e, se for o caso, restrinja as ações desta execução (codeorquestra_set_policy) ou encerre ao fim do turno (codeorquestra_end com afterTurn).';
+
+const END_AFTER_TURN_NOTE = 'Encerramento pedido para quando o turno atual terminar. O turno não é interrompido e nenhuma orientação nova é entregue; a execução fecha como COMPLETED.';
 
 const BUDGET_EXHAUSTED_NOTE = 'Orçamento da execução esgotado: o turno em andamento termina normalmente, mas nenhum outro é entregue. Para continuar, encerre esta execução e inicie outra na mesma tarefa com limits maior e approvalRevision maior; a sessão anterior é retomada automaticamente.';
 

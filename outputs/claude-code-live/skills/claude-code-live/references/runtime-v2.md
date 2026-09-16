@@ -66,8 +66,9 @@ O adaptador stdio (`mcp-stdio.mjs`) se conecta ao broker ja em execucao — nunc
 | `codeorquestra_annotate` | anota um arquivo alterado; a anotacao vira orientacao na fila, entregue entre turnos |
 | `codeorquestra_answer` | responde permissao ou pergunta (`requestId` + `runId` exatos) |
 | `codeorquestra_interrupt` | aborta o turno atual; a sessao continua aberta |
-| `codeorquestra_end` | solicita o encerramento da sessao e reconcilia o worker e a arvore ainda atribuivel daquela tarefa |
+| `codeorquestra_end` | encerra a sessao; com `afterTurn`, espera o turno terminar sozinho |
 | `codeorquestra_set_model` | troca o modelo entre turnos, com motivo |
+| `codeorquestra_set_policy` | restringe o que a execucao faz sem perguntar, a partir da proxima chamada |
 | `codeorquestra_inventory` | inventaria personalizacoes do projeto e mostra o estado de confianca |
 | `codeorquestra_trust` | registra a aprovacao do usuario para as personalizacoes inventariadas |
 | `codeorquestra_usage_refresh` | atualiza limites, atividade e estimativa da tarefa pelo Codex App Server, somente leitura |
@@ -247,6 +248,54 @@ passados dois minutos entra `decision_pending`, que diz a outra coisa
 verdadeira: ninguem respondeu e nada avanca. O alerta **repete** enquanto
 continuar valendo, e some quando a decisao e respondida. Como todo alerta de
 supervisao, ele so avisa: nada e encerrado.
+
+## Freio em escada
+
+Uma execucao que entra em laco tem tres respostas possiveis, e **nenhuma delas
+e automatica**. O runtime observa, nomeia e impoe; quem decide e o coordenador.
+
+**1. Nomear o laco.** O broker guarda as ultimas 20 chamadas de ferramenta da
+execucao, com o nome e uma impressao digital da entrada, e reconhece duas
+formas: a **mesma chamada** repetida (3 vezes falhando, ou 5 vezes de qualquer
+jeito) e uma **sequencia de 5 falhas** seguidas. Ao reconhecer, entra o alerta
+`thrashing` no log duravel e em `currentRun.thrashing`, com a ferramenta, o
+trecho da chamada e a contagem — a evidencia, nao so o rotulo. Cada forma e
+dita **uma vez por execucao**. Ler o mesmo arquivo tres vezes com sucesso nao e
+laco e nao dispara nada. Como todo alerta, nada e encerrado, restringido ou
+atrasado por ele.
+
+**2. Restringir sem parar.** `codeorquestra_set_policy { escalate, reason }`
+acrescenta verificacoes de permissao a uma execucao em andamento:
+
+| `escalate` | O que passa a exigir decisao |
+|---|---|
+| `none` | nada alem do contrato (remove a restricao) |
+| `commands` | comandos de shell |
+| `writes` | comandos de shell **e** escritas de arquivo |
+| `all` | toda acao com efeito externo |
+
+`writes` inclui `commands` de proposito: um comando de shell e uma escrita sem
+limite, e travar arquivos deixando o shell aberto seria uma restricao so no
+nome. Ferramentas sem efeito externo (lista de tarefas, perguntas) nunca sao
+travadas — aprovar uma pergunta so perguntaria duas vezes.
+
+A restricao **so acrescenta decisoes**: um `allow` vira `escalate`
+(`POLICY_ESCALATE`), um `deny` continua `deny`, e nada aqui concede o que o
+contrato negou. Por isso ela vale **imediatamente, inclusive no meio do
+turno** — o hook `PreToolUse` e consultado a cada chamada, e o momento de
+apertar e justamente enquanto o laco acontece. O motivo e obrigatorio e fica
+registrado (`policy_changed`). A view mostra a restricao **so depois que o
+worker confirma**: uma garantia de seguranca que ninguem aplicou seria pior que
+nenhuma.
+
+**3. Encerrar sem interromper.** `codeorquestra_end { afterTurn: true }` espera
+o turno atual terminar sozinho e so entao encerra: o turno nao e interrompido,
+nenhuma orientacao nova e entregue (`409 ENDING`) e a execucao fecha
+`COMPLETED`. Sem `afterTurn`, o comportamento e o de sempre — o turno e
+interrompido e a execucao fecha `CANCELLED`, que e o nome honesto de parar
+trabalho pela metade. Um `afterTurn` pedido com a execucao ociosa encerra na
+hora. Ele nunca vira interrupcao: se o turno levar uma hora, o encerramento
+espera uma hora.
 
 ## Orcamento por execucao
 

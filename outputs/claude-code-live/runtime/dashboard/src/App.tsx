@@ -27,6 +27,13 @@ const TERMINAL_STATUSES = new Set(['COMPLETED', 'FAIL', 'BLOCKED', 'CANCELLED', 
 
 /** Outcome of a finished run. The row already says the session ended, so the
  *  badge carries the outcome instead of repeating the same word. */
+const POLICY_LABELS: Record<string, string> = {
+  none: 'nenhuma além do contrato',
+  commands: 'comandos exigem decisão',
+  writes: 'comandos e escritas exigem decisão',
+  all: 'toda ação com efeito exige decisão',
+};
+
 const OUTCOME_LABELS: Record<string, string> = {
   COMPLETED: 'Concluída',
   CANCELLED: 'Cancelada',
@@ -297,6 +304,9 @@ function TaskBadges({ task }: { task: TaskView }) {
         : null}
       {task.pendingRequests.length ? <span className="badge warn">{task.pendingRequests.length} decisão(ões)</span> : null}
       {task.currentRun?.budget?.exhausted ? <span className="badge error" data-testid="budget-exhausted">orçamento esgotado</span> : null}
+      {task.currentRun?.thrashing ? <span className="badge warn" data-testid="thrashing">laço?</span> : null}
+      {task.currentRun?.policy ? <span className="badge warn" data-testid="policy">restrita</span> : null}
+      {task.currentRun?.endingAfterTurn ? <span className="badge" data-testid="ending-after-turn">encerra após o turno</span> : null}
       {task.requiresReview ? <span className="badge error">revisão</span> : null}
     </span>
   );
@@ -362,6 +372,8 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
   const [visible, setVisible] = useState(PAGE_ROWS);
   const [composer, setComposer] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
+  const [policyLevel, setPolicyLevel] = useState('commands');
+  const [policyReason, setPolicyReason] = useState('');
   // Confirmation is bound to the exact task and run it was opened for.
   const [confirmEnd, setConfirmEnd] = useState<{ taskId: string; runId: string | null } | null>(null);
   const [pairing, setPairing] = useState<{ code: string; expiresAt: string } | null>(null);
@@ -465,12 +477,34 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
           <button type="button" className="ghost" disabled={!canAct || busy !== null} onClick={() => void act('interrupt', 'interrupt', {})}>Interromper turno</button>
           <button type="button" className="danger" disabled={!canAct || busy !== null} onClick={() => setConfirmEnd({ taskId: task.taskId, runId: run?.runId ?? null })}>Encerrar sessão</button>
         </div>
+        <div className="composer-actions" data-testid="policy-controls">
+          <label className="composer-label" htmlFor="policy-level">Restringir esta execução</label>
+          <select id="policy-level" aria-label="Restringir esta execução" value={policyLevel} onChange={(event) => setPolicyLevel(event.target.value)} disabled={!canAct}>
+            <option value="none">sem restrição (contrato)</option>
+            <option value="commands">comandos exigem decisão</option>
+            <option value="writes">comandos e escritas exigem decisão</option>
+            <option value="all">toda ação com efeito exige decisão</option>
+          </select>
+          <input
+            type="text"
+            aria-label="Motivo da restrição"
+            placeholder="Motivo (fica registrado)"
+            value={policyReason}
+            onChange={(event) => setPolicyReason(event.target.value)}
+            disabled={!canAct}
+          />
+          <button type="button" className="ghost" disabled={!canAct || busy !== null || !policyReason.trim()} onClick={async () => {
+            const ok = await act('policy', 'policy', { escalate: policyLevel, reason: policyReason });
+            if (ok) setPolicyReason('');
+          }}>Aplicar restrição</button>
+        </div>
       </form>
       {confirmEnd && confirmEnd.taskId === task.taskId ? (
         <div className="modal-backdrop">
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="end-title">
             <h2 id="end-title">Encerrar a sessão desta tarefa?</h2>
             <p>Tarefa <strong>{task.threadId}</strong>. O encerramento será solicitado ao worker e à árvore ainda atribuível. Processos órfãos em segundo plano não são uma garantia do sistema operacional; em caso incerto, o checkout fica em quarentena. O log e os arquivos alterados permanecem.</p>
+            <p className="muted small">Encerrar agora interrompe o turno em andamento e a execução fecha como cancelada. <strong>Encerrar após o turno</strong> espera o turno terminar sozinho e fecha como concluída; nenhuma orientação nova é entregue nesse meio-tempo.</p>
             <div className="composer-actions">
               <button
                 type="button"
@@ -485,6 +519,20 @@ function Room({ task, events, transient, now, onLoadHistory, onLoadOlder }: { ta
                   await act('end', 'end', {});
                 }}
               >Confirmar encerramento</button>
+              <button
+                type="button"
+                className="ghost"
+                data-testid="end-after-turn"
+                onClick={async () => {
+                  const target = confirmEnd;
+                  setConfirmEnd(null);
+                  if (!target || target.taskId !== task.taskId || target.runId !== (run?.runId ?? null)) {
+                    setActionError('A confirmação não corresponde mais à execução selecionada; nada foi encerrado.');
+                    return;
+                  }
+                  await act('end', 'end', { afterTurn: true });
+                }}
+              >Encerrar após o turno</button>
               <button type="button" className="ghost" onClick={() => setConfirmEnd(null)}>Cancelar</button>
             </div>
           </div>
@@ -661,6 +709,9 @@ function Inspector({ task, now }: { task: TaskView; now: number }) {
         <dt>Turnos</dt><dd>{run?.turns ?? 0}</dd>
         <dt>Falhas de telemetria</dt><dd>{run?.telemetryFailures ?? 0}</dd>
         <dt>Alertas</dt><dd className="wrap">{task.alerts.length ? task.alerts.join(', ') : 'nenhum (20 min sem atividade e 2 h decorridas só alertam)'}</dd>
+        <dt>Restrição</dt><dd className="wrap" data-testid="policy-line">{run?.policy ? `${POLICY_LABELS[run.policy.escalate]} — ${run.policy.reason}` : 'nenhuma além do contrato'}</dd>
+        {run?.thrashing ? <><dt>Laço</dt><dd className="wrap warn-text" data-testid="thrashing-line">{run.thrashing.pattern === 'error_storm' ? `${run.thrashing.count} chamadas seguidas falharam, a última em ${run.thrashing.tool}` : `${run.thrashing.tool} repetiu a mesma chamada ${run.thrashing.count} vezes`}; nada foi encerrado</dd></> : null}
+        {run?.endingAfterTurn ? <><dt>Encerramento</dt><dd className="warn-text">pedido para o fim deste turno; o turno não é interrompido</dd></> : null}
       </dl>
       <h2 className="section-title">Orçamento</h2>
       {run?.budget ? (

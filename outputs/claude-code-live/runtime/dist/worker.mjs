@@ -112,7 +112,7 @@ async function loadEngineAdapter(env = process.env, override) {
 }
 
 // src/worker/session.ts
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 // src/policy/action-classifier.ts
 import fs2 from "node:fs";
@@ -281,6 +281,7 @@ var MESSAGES = {
   DELEGATION_WITHOUT_CAPABILITY: "A delega\xE7\xE3o pediria capacidades que esta execu\xE7\xE3o n\xE3o concede; o subagente n\xE3o pode exceder o contrato.",
   BUILTIN_SAFE: "Ferramenta interna sem efeito externo.",
   READ_ONLY_PROFILE: "Perfil somente leitura: ferramentas de escrita e comandos n\xE3o est\xE3o dispon\xEDveis.",
+  POLICY_ESCALATE: "Restri\xE7\xE3o pedida pelo coordenador nesta execu\xE7\xE3o: esta a\xE7\xE3o, que seria permitida, passa a exigir decis\xE3o expl\xEDcita.",
   HARMLESS_COMMAND: "Comando inofensivo."
 };
 function result(decision, reason, details) {
@@ -677,7 +678,18 @@ function classifyDelegation(tool, input, context) {
   }
   return result("allow", "BUILTIN_SAFE", { agent });
 }
+function policyCovers(tool, escalate) {
+  if (escalate === "none" || HARMLESS_TOOLS.has(tool)) return false;
+  if (escalate === "all") return true;
+  if (SHELL_TOOLS.has(tool)) return true;
+  return escalate === "writes" && FILE_WRITE_TOOLS.has(tool);
+}
 function classifyToolAction(action, context) {
+  const decided = classifyByContract(action, context);
+  if (decided.decision !== "allow" || !policyCovers(action.tool, context.escalate ?? "none")) return decided;
+  return result("escalate", "POLICY_ESCALATE", { tool: action.tool, wouldHaveBeen: decided.reason });
+}
+function classifyByContract(action, context) {
   const { tool, input } = action;
   if (tool.startsWith("mcp__")) return classifyMcp(tool, context);
   if (DELEGATION_TOOLS.has(tool) || tool === "Skill") return classifyDelegation(tool, input, context);
@@ -1541,6 +1553,8 @@ var WorkerSession = class {
   client = null;
   phase = "starting";
   turnActive = false;
+  /** Extra escalation asked for mid-run; only ever adds permission checks. */
+  policy = "none";
   interruptPending = false;
   interruptSource = null;
   endRequested = false;
@@ -1608,7 +1622,8 @@ var WorkerSession = class {
       // A delegated agent runs under this same contract: it may not pick
       // another model, nor a weaker effort than the one this run authorizes.
       authorizedModels: [...AUTHORIZED_MODELS],
-      requiredEffort: c.effort
+      requiredEffort: c.effort,
+      escalate: this.policy
     };
   }
   async start() {
@@ -1763,6 +1778,9 @@ var WorkerSession = class {
       case "set_model":
         void this.setModel(message.model, message.reason, message.source);
         break;
+      case "set_policy":
+        this.setPolicy(message.escalate, message.reason, message.source);
+        break;
       case "exit":
         void this.client?.close(1e3).then(() => process.exit(0));
         setTimeout(() => process.exit(0), 2e3).unref();
@@ -1813,6 +1831,20 @@ var WorkerSession = class {
     }
     if (this.runEnded || this.pending.size > 0) return;
     this.setPhase(this.openTools.size ? "busy_tool" : "busy_model");
+  }
+  /**
+   * Tightens what this run may do without asking, while it is running.
+   *
+   * Every tool call consults the classifier through the PreToolUse hook, so a
+   * restriction takes effect on the NEXT call rather than the next turn. That
+   * is the point: the reason to restrict is usually something happening right
+   * now. It can only ask for more decisions, never grant one, so applying it
+   * mid-turn takes nothing away from the invariant that only an explicit
+   * interrupt aborts a turn.
+   */
+  setPolicy(escalate, reason, source) {
+    this.policy = escalate;
+    this.emit("policy_changed", { escalate, reason, source, duringTurn: this.turnActive });
   }
   async interrupt(source) {
     if (!this.client || !this.turnActive) return;
@@ -2115,7 +2147,7 @@ var WorkerSession = class {
           continue;
         }
         this.openTools.set(id, block.name);
-        this.emit("tool_start", { name: block.name, inputPreview: previewInput(input), parentToolUseId: typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null }, id);
+        this.emit("tool_start", { name: block.name, inputPreview: previewInput(input), inputHash: hashInput(input), parentToolUseId: typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null }, id);
         this.setPhase("busy_tool");
       }
     }
@@ -2205,6 +2237,17 @@ function safeText(value, limit) {
 }
 function previewInput(input) {
   return boundedPreview(redactSensitiveText(JSON.stringify(input ?? {}, null, 0)), 2048).preview;
+}
+function hashInput(input) {
+  return createHash("sha256").update(canonicalJson(input ?? {})).digest("hex").slice(0, 16);
+}
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 function redactAnswers(answers) {
   const output = {};

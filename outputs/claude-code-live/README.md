@@ -64,7 +64,9 @@ Na tarefa Codex, as ferramentas `codeorquestra_*` conversam com o broker local. 
 
 Durante a sessão, durável e multiturno: `codeorquestra_wait` acompanha os eventos e registra a presença do coordenador; `codeorquestra_message` e `codeorquestra_annotate` enfileiram orientação para o próximo turno; `codeorquestra_answer` responde permissões e perguntas; `codeorquestra_interrupt` aborta o turno (a sessão continua); `codeorquestra_end` encerra a sessão e reconcilia a árvore de processos ainda atribuível; `codeorquestra_set_model` troca o modelo entre turnos, com motivo; `codeorquestra_usage_refresh` atualiza o consumo por fonte, somente leitura.
 
-A supervisão só alerta (20 min sem atividade, 2 h decorridas, decisão pendente há mais de 2 min, orçamento em 80%); nada é encerrado sozinho. Um orçamento esgotado recusa o **próximo** turno sem abortar o atual. Só a interrupção explícita aborta um turno.
+A supervisão só alerta (20 min sem atividade, 2 h decorridas, decisão pendente há mais de 2 min, orçamento em 80%, possível laço nas ferramentas); nada é encerrado sozinho. Um orçamento esgotado recusa o **próximo** turno sem abortar o atual. Só a interrupção explícita aborta um turno.
+
+Diante de um laço, três respostas — todas decisão do coordenador, nenhuma automática: deixar seguir, **restringir** (`codeorquestra_set_policy`: comandos, escritas ou tudo passam a exigir decisão explícita, valendo já na próxima chamada, sem conceder nada que o contrato negou) ou **encerrar ao fim do turno** (`codeorquestra_end` com `afterTurn`, que espera o turno terminar sozinho e fecha como concluída).
 
 Cada execução preserva o log de eventos append-only e deriva `acompanhamento.txt`, `status.json` e `resultado.json`. `COMPLETED` indica término do transporte, não aceite técnico; `FAIL`, `CANCELLED` e `UNCERTAIN` nunca são sucesso. Um fim que ninguém pediu deixa a execução `UNCERTAIN` e exige revisão explícita antes de outra.
 

@@ -199,6 +199,9 @@ export const spawnClaudeProcess = (plan: CliLaunchPlan): ClaudeProcessHandle => 
   };
 
   const execute = async (name: string, input: Dict): Promise<{ text: string; isError: boolean }> => {
+    // Harness-only: a scripted failure, so a test can produce the shape of a
+    // command that keeps failing without depending on a real broken tool.
+    if (input.$error === true) return { text: `[fake] ${name} falhou (simulado)`, isError: true };
     if (name === 'Bash' && typeof input.command === 'string' && /^sleep\s+([\d.]+)/.test(input.command)) {
       const seconds = Number(/^sleep\s+([\d.]+)/.exec(input.command)![1]);
       await sleepInterruptible(seconds * 1000);

@@ -427,10 +427,11 @@ export class Broker {
           await this.tasks.interrupt(task, source);
           return sendJson(res, 202, { interrupted: true });
         case 'end':
-          await this.tasks.end(task, source);
-          return sendJson(res, 202, { ending: true });
+          return sendJson(res, 202, await this.tasks.end(task, source, body.afterTurn === true));
         case 'model':
           return sendJson(res, 200, await this.tasks.setModel(task, body.model, body.reason, source));
+        case 'policy':
+          return sendJson(res, 200, await this.tasks.setPolicy(task, body.escalate, body.reason, source));
         case 'heartbeat':
           if (identity.source === 'browser') throw new HttpError(403, 'LOCAL_ADMIN_REQUIRED');
           this.tasks.touchCoordinator(task);

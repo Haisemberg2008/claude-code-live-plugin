@@ -315,3 +315,49 @@ describe('filesystem containment with real reparse points', () => {
     assert.deepEqual(pick(classify('Write', { file_path: path.join(realWorkspace, 'src', 'externo', 'alvo.ts') }, ctx)), { decision: 'escalate', reason: 'OUTSIDE_SCOPE_PATH' });
   });
 });
+
+describe('a restriction the coordinator applies mid-run', () => {
+  const editInScope = { file_path: 'C:\\ws\\projeto\\src\\a.ts' };
+
+  test('turns an allowed action into a decision, one rung at a time', () => {
+    // Without a restriction, both are routine work the contract already grants.
+    assert.equal(classify('Bash', { command: 'npm test' }).decision, 'allow');
+    assert.equal(classify('Edit', editInScope).decision, 'allow');
+
+    // commands: the shell asks, files do not.
+    assert.deepEqual(pick(classify('Bash', { command: 'npm test' }, { escalate: 'commands' })), { decision: 'escalate', reason: 'POLICY_ESCALATE' });
+    assert.equal(classify('Edit', editInScope, { escalate: 'commands' }).decision, 'allow');
+
+    // writes: files ask too, and the shell still does — a command is an
+    // unbounded write, so gating files while leaving it open would be a lie.
+    assert.deepEqual(pick(classify('Edit', editInScope, { escalate: 'writes' })), { decision: 'escalate', reason: 'POLICY_ESCALATE' });
+    assert.deepEqual(pick(classify('Bash', { command: 'npm test' }, { escalate: 'writes' })), { decision: 'escalate', reason: 'POLICY_ESCALATE' });
+    assert.equal(classify('Read', editInScope, { escalate: 'writes' }).decision, 'allow');
+
+    // all: reading asks as well.
+    assert.deepEqual(pick(classify('Read', editInScope, { escalate: 'all' })), { decision: 'escalate', reason: 'POLICY_ESCALATE' });
+  });
+
+  test('never grants anything: a denial stays a denial at every rung', () => {
+    for (const escalate of ['none', 'commands', 'writes', 'all'] as const) {
+      assert.deepEqual(pick(classify('Bash', { command: 'git push origin main' }, { escalate })), { decision: 'deny', reason: 'RESERVED_OPERATION_PUSH' }, escalate);
+      assert.equal(classify('Write', { file_path: 'C:\\ws\\projeto\\.env' }, { escalate }).decision, 'deny', escalate);
+    }
+  });
+
+  test('tools with no external effect are never gated, so nobody is asked twice', () => {
+    for (const tool of ['TodoWrite', 'AskUserQuestion', 'ExitPlanMode']) {
+      assert.equal(classify(tool, {}, { escalate: 'all' }).decision, 'allow', tool);
+    }
+  });
+
+  test('an escalation the contract already required is left exactly as it was', () => {
+    const network = pick(classify('WebFetch', { url: 'https://example.com' }, { escalate: 'all' }));
+    assert.deepEqual(network, { decision: 'escalate', reason: 'EXTERNAL_NETWORK' }, 'the original reason survives; it is the one the coordinator needs');
+  });
+
+  test('the read-only profile is unaffected: it was already stricter', () => {
+    assert.deepEqual(pick(classify('Bash', { command: 'npm test' }, { profile: 'read', escalate: 'all' })), { decision: 'deny', reason: 'READ_ONLY_PROFILE' });
+    assert.equal(classify('Read', editInScope, { profile: 'read', escalate: 'commands' }).decision, 'allow');
+  });
+});

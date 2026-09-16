@@ -5,14 +5,14 @@
 // classifier under the contract's normalized capability gate, redacts public
 // text, and reports every public event to the broker (the single writer of
 // the durable log).
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { classifyToolAction, type ActionContext, type Decision } from '../policy/action-classifier.ts';
 import { boundedPreview, boundBlob } from '../events/preview.ts';
 import { redactSensitiveText, sanitizeHiddenContent, TextRedactionStream } from '../events/redaction.ts';
 import { CREDENTIAL_ENV_VARS, PROVIDER_ENV_VARS } from '../preflight/cli-resolver.ts';
 import { recordEngineExit, recordEngineProcess } from '../broker/process-tree.ts';
 import { AUTHORIZED_MODELS } from '../contract/job-contract.ts';
-import { BRAND, RUNTIME_VERSION, type ActionSource, type PendingRequestView, type WorkerPhase } from '../shared/types.ts';
+import { BRAND, RUNTIME_VERSION, type ActionSource, type PendingRequestView, type TurnPolicyLevel, type WorkerPhase } from '../shared/types.ts';
 import { planLaunch, type JsonObject, type PermissionAnswer } from '../engine/protocol.ts';
 import { SessionClient, type HookContext, type PermissionContext } from '../engine/session-client.ts';
 import type { EngineAdapter } from './engine-adapter.ts';
@@ -80,6 +80,8 @@ export class WorkerSession {
   private client: SessionClient | null = null;
   private phase: WorkerPhase = 'starting';
   private turnActive = false;
+  /** Extra escalation asked for mid-run; only ever adds permission checks. */
+  private policy: TurnPolicyLevel = 'none';
   private interruptPending = false;
   private interruptSource: ActionSource | null = null;
   private endRequested = false;
@@ -152,6 +154,7 @@ export class WorkerSession {
       // another model, nor a weaker effort than the one this run authorizes.
       authorizedModels: [...AUTHORIZED_MODELS],
       requiredEffort: c.effort,
+      escalate: this.policy,
     };
   }
 
@@ -330,6 +333,9 @@ export class WorkerSession {
       case 'set_model':
         void this.setModel(message.model, message.reason, message.source);
         break;
+      case 'set_policy':
+        this.setPolicy(message.escalate, message.reason, message.source);
+        break;
       case 'exit':
         void this.client?.close(1000).then(() => process.exit(0));
         setTimeout(() => process.exit(0), 2000).unref();
@@ -386,6 +392,21 @@ export class WorkerSession {
     }
     if (this.runEnded || this.pending.size > 0) return;
     this.setPhase(this.openTools.size ? 'busy_tool' : 'busy_model');
+  }
+
+  /**
+   * Tightens what this run may do without asking, while it is running.
+   *
+   * Every tool call consults the classifier through the PreToolUse hook, so a
+   * restriction takes effect on the NEXT call rather than the next turn. That
+   * is the point: the reason to restrict is usually something happening right
+   * now. It can only ask for more decisions, never grant one, so applying it
+   * mid-turn takes nothing away from the invariant that only an explicit
+   * interrupt aborts a turn.
+   */
+  private setPolicy(escalate: TurnPolicyLevel, reason: string, source: ActionSource): void {
+    this.policy = escalate;
+    this.emit('policy_changed', { escalate, reason, source, duringTurn: this.turnActive });
   }
 
   private async interrupt(source: ActionSource): Promise<void> {
@@ -720,7 +741,7 @@ export class WorkerSession {
           continue;
         }
         this.openTools.set(id, block.name);
-        this.emit('tool_start', { name: block.name, inputPreview: previewInput(input), parentToolUseId: typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : null }, id);
+        this.emit('tool_start', { name: block.name, inputPreview: previewInput(input), inputHash: hashInput(input), parentToolUseId: typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : null }, id);
         this.setPhase('busy_tool');
       }
     }
@@ -824,6 +845,25 @@ function safeText(value: string | null | undefined, limit: number): string | nul
 
 export function previewInput(input: JsonObject): string {
   return boundedPreview(redactSensitiveText(JSON.stringify(input ?? {}, null, 0)), 2048).preview;
+}
+
+/**
+ * A stable fingerprint of a tool's input, so "the same call again" is a fact
+ * instead of a guess from a truncated preview. Keys are sorted recursively, so
+ * two calls that differ only in key order are correctly the same call. The
+ * digest is only ever compared: it is never shown and never reversed.
+ */
+export function hashInput(input: JsonObject): string {
+  return createHash('sha256').update(canonicalJson(input ?? {})).digest('hex').slice(0, 16);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }
 
 function redactAnswers(answers: Record<string, string | string[]>): Record<string, string | string[]> {

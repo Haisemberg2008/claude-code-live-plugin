@@ -2,7 +2,7 @@
 // worker process (owner of one Claude Code session for one Codex task).
 import type { JobContract } from '../contract/job-contract.ts';
 import type { LaunchCustomizations } from '../trust/launch-customizations.ts';
-import type { ActionSource, PendingRequestView, TransientFrame, WorkerPhase } from '../shared/types.ts';
+import type { ActionSource, PendingRequestView, TransientFrame, TurnPolicyLevel, WorkerPhase } from '../shared/types.ts';
 
 export interface WorkerDescriptor {
   taskId: string;
@@ -47,4 +47,5 @@ export type BrokerToWorker =
   | { t: 'interrupt'; source: ActionSource }
   | { t: 'end'; source: ActionSource }
   | { t: 'set_model'; model: string; reason: string; source: ActionSource }
+  | { t: 'set_policy'; escalate: TurnPolicyLevel; reason: string; source: ActionSource }
   | { t: 'exit' };

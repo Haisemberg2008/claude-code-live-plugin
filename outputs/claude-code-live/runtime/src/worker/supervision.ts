@@ -47,6 +47,8 @@ export interface SupervisionInput {
   oldestPendingRequestAt: number | null;
   /** Highest used/limit across the run's declared limits; null when the job set none. */
   budgetRatio: number | null;
+  /** True once this run's tool history showed a loop. Reported, never acted on. */
+  thrashing: boolean;
   brokerRestartedDuringRun: boolean;
   terminal: boolean;
   thresholds?: SupervisionThresholds;
@@ -84,6 +86,10 @@ export function evaluateSupervision(input: SupervisionInput): SupervisionResult 
   // The budget alerts do not depend on waiting: a run blocked on a decision has
   // spent what it spent. Exhaustion is enforced by the broker refusing the next
   // turn; here it is only named, like every other alert.
+  // A loop is named as soon as the broker sees it in the tool history; like
+  // every other alert it only says what is true. Restricting the run, ending
+  // it after the turn, or letting it continue are all the coordinator's call.
+  if (input.thrashing) alerts.push('thrashing');
   if (input.budgetRatio !== null) {
     if (input.budgetRatio >= BUDGET_WARNING_RATIO) alerts.push('budget_warning');
     if (input.budgetRatio >= 1) alerts.push('budget_exhausted');
