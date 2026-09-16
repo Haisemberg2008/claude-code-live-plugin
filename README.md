@@ -310,3 +310,7 @@ Esta revisão altera intencionalmente o contrato:
 - `verify` passa a ser o modo para comandos sem edição.
 
 Crie um novo job com plano e matriz aprovados para migrar uma execução antiga.
+
+## Licença
+
+Apache License 2.0 — veja [`LICENSE`](LICENSE). O código pode ser usado, modificado e redistribuído nos termos dessa licença, que inclui concessão explícita de patentes. Ela **não** concede uso do nome CodeOrquestra, do logotipo nem da marca YOU Telecom (seção 6 da licença). CodeOrquestra não é um produto oficial nem representa parceria entre OpenAI e Anthropic; o Claude Code e o Codex continuam sujeitos aos termos dos seus fornecedores.

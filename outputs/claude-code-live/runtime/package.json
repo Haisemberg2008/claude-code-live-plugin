@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "CodeOrquestra runtime: broker, per-task worker, MCP stdio adapter, CLI and web dashboard that coordinate the user's own installed Claude Code CLI from Codex. Independent local integration; not an official OpenAI or Anthropic product. Legacy technical alias: claude-code-live.",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=22.18.0"
