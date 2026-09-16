@@ -330,6 +330,40 @@ Existe porque o teto de paralelismo e a quota da conta limitam a frota, nao uma
 execucao: um agente em laco queimava a semana inteira sem nenhuma recusa no
 caminho.
 
+## Contexto, ferramentas e historico
+
+Tres contas por execucao, todas visiveis no painel e em `currentRun`.
+
+**Contexto.** `currentRun.context` traz `lastTurnTokens` (entrada + cache lido +
+cache criado do ultimo turno concluido: exatamente o prompt que foi enviado),
+`windowTokens` e a razao entre os dois. E o **ultimo** turno, nao um acumulado:
+um medidor de contexto que so sobe seria um contador de gasto com o rotulo
+errado. Em 80% entra o alerta `context_high`, que avisa que a proxima
+compactacao esta chegando e nao encerra nada.
+
+O tamanho da janela **e uma presuncao**: o CLI informa quantos tokens entraram,
+nunca quantos caberiam. Os valores ficam em `src/shared/models.ts` e o painel
+escreve "janela presumida" na propria linha. Modelo que este build nao conhece
+nao ganha medidor nenhum, em vez de ganhar um chutado.
+
+**Ferramentas.** `currentRun.tools` conta chamadas, erros e bloqueios da
+execucao, com um detalhamento por ferramenta (chamadas, erros, bloqueios, tempo
+somado) e as ultimas 8 chamadas. Cada chamada conta **uma vez**: uma chamada
+bloqueada tambem volta do CLI como resultado com erro, e uma chamada e uma
+chamada por mais formas que seja relatada. So uma chamada cujo inicio foi
+observado e contada, entao nada recebe um tempo inventado. O resumo de polling
+leva so os tres numeros; o detalhamento e para quem esta olhando uma tela.
+
+**Historico com custo.** `GET /api/tasks/<id>/runs` (e `codeorquestra_list`)
+devolve, por execucao ja encerrada: desfecho e codigo de falha, inicio e fim,
+duracao, turnos, tokens observados com a qualidade da contagem
+(`reported`/`partial`/`unavailable`), chamadas e erros de ferramenta, os
+`limits` declarados e se o orcamento esgotou. Tudo lido do `status.json` da
+propria execucao, entao uma execucao de um broker anterior responde as mesmas
+perguntas — e um arquivo ilegivel responde `UNKNOWN` com nulos, nunca zeros:
+"nao sabemos" e "nao custou nada" sao respostas diferentes. Um turno que omitiu
+um contador torna o total `partial`; um campo ausente nunca vira zero.
+
 ## Custo da frota
 
 `GET /api/worktrees` (administrativa) passou a devolver tambem `fleet`: quais

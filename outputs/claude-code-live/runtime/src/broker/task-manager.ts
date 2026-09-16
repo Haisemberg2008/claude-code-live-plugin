@@ -14,7 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { ContractError, resolveJobContract, AUTHORIZED_MODELS, type JobContract } from '../contract/job-contract.ts';
-import { deriveCompatibilityFiles } from '../events/derive.ts';
+import { deriveCompatibilityFiles, type DerivedStatus } from '../events/derive.ts';
 import { EventLog } from '../events/event-log.ts';
 import { boundedPreview, previewPage } from '../events/preview.ts';
 import { redactSensitiveText } from '../events/redaction.ts';
@@ -30,9 +30,10 @@ import { TrustStore, type TrustCheck } from '../trust/trust-store.ts';
 import { evaluateSupervision, SUPERVISION, type SupervisionThresholds } from '../worker/supervision.ts';
 import type { BrokerToWorker, WorkerDescriptor, WorkerToBroker } from '../worker/protocol.ts';
 import { isHarness, envName } from '../shared/env.ts';
-import { TURN_POLICY_LEVELS, type ActionSource, type AuthorizedModel, type CodexUsageView, type EventRecord, type PendingRequestView, type QueueEntryView, type RunBudgetView, type RunStatus, type TaskView, type ThrashingReport, type TransientFrame, type TurnPolicyLevel, type TurnPolicyView, type WorkerPhase } from '../shared/types.ts';
+import { TURN_POLICY_LEVELS, type RunContextView, type RunToolsView, type ActionSource, type AuthorizedModel, type CodexUsageView, type EventRecord, type PendingRequestView, type QueueEntryView, type RunBudgetView, type RunStatus, type TaskView, type ThrashingReport, type TransientFrame, type TurnPolicyLevel, type TurnPolicyView, type WorkerPhase } from '../shared/types.ts';
 import { ClaudeUsageAccumulator, normalizeClaudeUsage } from '../usage/claude-usage.ts';
 import { detectThrashing, TRAIL_LIMIT, type ToolTrailEntry } from './thrashing.ts';
+import { contextWindowFor } from '../shared/models.ts';
 import { CodexUsageService, type CodexUsageReader, unavailableCodexUsage } from '../usage/codex-usage.ts';
 import { sha256, mintTaskHandle, verifyTaskHandle, taskIdForThread, THREAD_ID_PATTERN } from './identity.ts';
 import { HttpError } from './http.ts';
@@ -99,6 +100,10 @@ interface RunState {
   tokensObserved: number;
   /** Recent tool calls, oldest first, bounded. Read only by the loop detector. */
   toolTrail: ToolTrailEntry[];
+  /** Input tokens of the last finished turn: what the context held at that point. */
+  lastTurnContextTokens: number | null;
+  /** Running counts for the whole run, unlike the bounded trail above. */
+  tools: RunToolState;
   /** Loops already reported, so each distinct one is named once per run. */
   thrashingSeen: Set<string>;
   thrashing: ThrashingReport | null;
@@ -1237,6 +1242,8 @@ export class TaskManager {
       turns: 0,
       tokensObserved: 0,
       toolTrail: [],
+      lastTurnContextTokens: null,
+      tools: { calls: 0, errors: 0, blocked: 0, byTool: new Map(), open: new Map(), recent: [] },
       thrashingSeen: new Set(),
       thrashing: null,
       policy: null,
@@ -1342,6 +1349,7 @@ export class TaskManager {
         ...(worktreePlan ? { declaredWorkspace: workspace, worktree: { path: worktreePlan.path, branch: worktreePlan.branch, baseRef: worktreePlan.baseRef, repoKey: worktreePlan.repository.repoKey, provisionedBy: 'broker', policyEnabledAt: worktreePlan.policy.enabledAt } } : {}),
         profile: contract.profile,
         contractVersion: contract.version,
+        limits: contract.limits,
         coordination: contract.coordination,
         scope: contract.scope,
         capabilities: contract.capabilities,
@@ -1682,7 +1690,12 @@ export class TaskManager {
           // observed at turn_done, which always follows, so the recorded
           // numbers count this turn as finished rather than half-finished.
           const usage = normalizeClaudeUsage(message.data.usage);
-          if (usage) run.tokensObserved += usage.totalObservedTokens;
+          if (usage) {
+            run.tokensObserved += usage.totalObservedTokens;
+            // Input + cache read + cache creation is the prompt that was sent,
+            // which is what the context held when this turn ran.
+            run.lastTurnContextTokens = usage.totalInputTokens;
+          }
         }
         this.applyEvent(task, run, message.type, message.data, message.toolUseId);
         // Only completed calls change the shape of the history, so the
@@ -1772,6 +1785,11 @@ export class TaskManager {
         if (typeof data.model === 'string') run.observedModel = data.model;
         break;
       case 'tool_start': {
+        if (typeof data.name === 'string') {
+          run.tools.calls += 1;
+          toolUsage(run, data.name).calls += 1;
+          if (toolUseId) run.tools.open.set(toolUseId, { name: data.name, at: Date.now() });
+        }
         if (toolUseId && typeof data.name === 'string') {
           run.toolTrail.push({
             toolUseId,
@@ -1793,7 +1811,27 @@ export class TaskManager {
         // A blocked call never ran, which for a loop is the same evidence as a
         // failure: the agent keeps asking for something it cannot have.
         const entry = toolUseId ? run.toolTrail.find((item) => item.toolUseId === toolUseId) : undefined;
-        if (entry) entry.error = type === 'tool_blocked' || data.isError === true;
+        const failed = type === 'tool_blocked' || data.isError === true;
+        if (entry) entry.error = failed;
+        // Counted once per call, and only for a call we saw start: a blocked
+        // call is echoed back by the CLI as a failed result too, and one call
+        // is one call however many ways it is reported.
+        const open = toolUseId ? run.tools.open.get(toolUseId) : undefined;
+        if (open && toolUseId) {
+          run.tools.open.delete(toolUseId);
+          const usage = toolUsage(run, open.name);
+          if (type === 'tool_blocked') {
+            run.tools.blocked += 1;
+            usage.blocked += 1;
+          } else if (failed) {
+            run.tools.errors += 1;
+            usage.errors += 1;
+          }
+          const ms = Math.max(0, Date.now() - open.at);
+          usage.totalMs += ms;
+          run.tools.recent.push({ name: open.name, ok: !failed, ms, at: new Date().toISOString() });
+          if (run.tools.recent.length > RECENT_TOOL_CALLS) run.tools.recent.splice(0, run.tools.recent.length - RECENT_TOOL_CALLS);
+        }
         break;
       }
       case 'policy_changed':
@@ -2136,6 +2174,7 @@ export class TaskManager {
         oldestPendingRequestAt: oldestPendingAt(task),
         budgetRatio: budget?.ratio ?? null,
         thrashing: run.thrashing !== null,
+        contextRatio: contextStatus(run)?.ratio ?? null,
         phase: task.phase,
         processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)),
         coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2326,6 +2365,10 @@ export class TaskManager {
             thrashing: full.currentRun.thrashing,
             policy: full.currentRun.policy,
             endingAfterTurn: full.currentRun.endingAfterTurn,
+            context: full.currentRun.context,
+            // Counts only: the per-tool breakdown is for someone looking at a
+            // screen, not for a coordinator's poll loop.
+            tools: { calls: full.currentRun.tools.calls, errors: full.currentRun.tools.errors, blocked: full.currentRun.tools.blocked },
           }
         : null,
       // Kept in full: a pending decision is the thing the coordinator has to
@@ -2346,6 +2389,7 @@ export class TaskManager {
       oldestPendingRequestAt: oldestPendingAt(task),
       budgetRatio: run ? (budgetStatus(run, now)?.ratio ?? null) : null,
       thrashing: run?.thrashing != null,
+      contextRatio: run ? (contextStatus(run)?.ratio ?? null) : null,
       phase: run && run.finalizing && !run.finalized ? 'busy_model' : task.phase,
       processAlive: Boolean(task.worker && task.worker.pid && isAlive(task.worker.pid)) || Boolean(run && run.finalizing && !run.finalized),
       coordinatorLastSeenAt: task.coordinatorLastSeenAt,
@@ -2403,6 +2447,8 @@ export class TaskManager {
         thrashing: run.thrashing,
         policy: run.policy,
         endingAfterTurn: run.endAfterTurn !== null,
+        context: contextStatus(run),
+        tools: toolsView(run),
       } : null,
       previousSessionId: task.previousSessionId,
       pendingRequests: [...task.pending.values()],
@@ -2434,7 +2480,15 @@ export class TaskManager {
     return [...this.tasks.values()].filter((task) => !scope || task.record.taskId === scope).map((task) => this.view(task));
   }
 
-  async runsOf(task: TaskState): Promise<Array<{ runId: string; status: string; startedAt: string | null; endedAt: string | null }>> {
+  /**
+   * The run history, with what each run cost.
+   *
+   * Read from each run's own status.json rather than from memory, so a run
+   * from a previous broker answers the same questions as the one that just
+   * ended. A file that cannot be read reports UNKNOWN and nulls instead of
+   * zeros: "we do not know" and "it cost nothing" are different answers.
+   */
+  async runsOf(task: TaskState): Promise<RunHistoryEntry[]> {
     const dir = path.join(task.dir, 'runs');
     let entries: string[] = [];
     try {
@@ -2442,10 +2496,30 @@ export class TaskManager {
     } catch {
       return [];
     }
-    const runs: Array<{ runId: string; status: string; startedAt: string | null; endedAt: string | null }> = [];
+    const runs: RunHistoryEntry[] = [];
     for (const runId of entries.sort()) {
-      const status = await readJsonShared<{ status?: string; startedAt?: string; endedAt?: string }>(path.join(dir, runId, 'status.json'));
-      runs.push({ runId, status: status.status === 'ok' ? status.value.status ?? 'UNKNOWN' : 'UNKNOWN', startedAt: status.status === 'ok' ? status.value.startedAt ?? null : null, endedAt: status.status === 'ok' ? status.value.endedAt ?? null : null });
+      const status = await readJsonShared<DerivedStatus>(path.join(dir, runId, 'status.json'));
+      if (status.status === 'ok') {
+        const value = status.value;
+        const usage = value.claudeUsage;
+        runs.push({
+          runId,
+          status: value.status ?? 'UNKNOWN',
+          failureCode: value.failureCode ?? null,
+          startedAt: value.startedAt ?? null,
+          endedAt: value.endedAt ?? null,
+          elapsedSeconds: typeof value.elapsedSeconds === 'number' ? value.elapsedSeconds : null,
+          turns: typeof value.turns === 'number' ? value.turns : null,
+          tokens: usage && typeof usage.totalObservedTokens === 'number' ? usage.totalObservedTokens : null,
+          usageQuality: usage?.quality ?? 'unavailable',
+          toolCalls: Array.isArray(value.toolCalls) ? value.toolCalls.length : null,
+          toolErrors: typeof value.toolErrors === 'number' ? value.toolErrors : null,
+          limits: value.limits ?? null,
+          budgetExhausted: value.budgetExhausted === true,
+        });
+        continue;
+      }
+      runs.push({ runId, status: 'UNKNOWN', failureCode: null, startedAt: null, endedAt: null, elapsedSeconds: null, turns: null, tokens: null, usageQuality: 'unavailable', toolCalls: null, toolErrors: null, limits: null, budgetExhausted: false });
     }
     return runs;
   }
@@ -2513,6 +2587,68 @@ function budgetStatus(run: RunState, now: number): RunBudgetView | null {
     if (dimension) ratio = Math.max(ratio, dimension.used / dimension.limit);
   }
   return { tokens, turns, runtimeSeconds, ratio, exhausted: ratio >= 1 };
+}
+
+/** One finished (or unreadable) run, as the history reports it. */
+export interface RunHistoryEntry {
+  runId: string;
+  status: string;
+  failureCode: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  elapsedSeconds: number | null;
+  turns: number | null;
+  tokens: number | null;
+  usageQuality: 'reported' | 'partial' | 'unavailable';
+  toolCalls: number | null;
+  toolErrors: number | null;
+  limits: DerivedStatus['limits'];
+  budgetExhausted: boolean;
+}
+
+/** The most recent calls kept for the panel; older ones live in the log. */
+const RECENT_TOOL_CALLS = 8;
+
+interface RunToolState {
+  calls: number;
+  errors: number;
+  blocked: number;
+  byTool: Map<string, { calls: number; errors: number; blocked: number; totalMs: number }>;
+  /** Calls that started and have not reported back, so a duration can be taken. */
+  open: Map<string, { name: string; at: number }>;
+  recent: Array<{ name: string; ok: boolean | null; ms: number | null; at: string }>;
+}
+
+function toolUsage(run: RunState, name: string): { calls: number; errors: number; blocked: number; totalMs: number } {
+  const existing = run.tools.byTool.get(name);
+  if (existing) return existing;
+  const created = { calls: 0, errors: 0, blocked: 0, totalMs: 0 };
+  run.tools.byTool.set(name, created);
+  return created;
+}
+
+function toolsView(run: RunState): RunToolsView {
+  return {
+    calls: run.tools.calls,
+    errors: run.tools.errors,
+    blocked: run.tools.blocked,
+    byTool: [...run.tools.byTool.entries()]
+      .map(([name, usage]) => ({ name, ...usage }))
+      .sort((a, b) => b.calls - a.calls || a.name.localeCompare(b.name)),
+    recent: [...run.tools.recent],
+  };
+}
+
+/**
+ * Pure: how full the context was on the last finished turn.
+ *
+ * Null before the first turn reports usage, and null for a model whose window
+ * this build does not know — an absent gauge is better than a made-up one.
+ */
+function contextStatus(run: RunState): RunContextView | null {
+  const windowTokens = contextWindowFor(run.observedModel ?? run.requestedModel);
+  if (windowTokens === null || run.lastTurnContextTokens === null) return null;
+  return { lastTurnTokens: run.lastTurnContextTokens, windowTokens, ratio: run.lastTurnContextTokens / windowTokens };
 }
 
 function oldestPendingAt(task: TaskState): number | null {

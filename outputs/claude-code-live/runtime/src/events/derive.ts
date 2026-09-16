@@ -5,6 +5,7 @@
 // it. Text deltas are never counted twice: only completed assistant messages
 // appear in the transcript.
 import type { EventRecord, RunStatus } from '../shared/types.ts';
+import { normalizeClaudeUsage } from '../usage/claude-usage.ts';
 
 export const SUPERVISED_TIMEOUT_POLICY = { mode: 'supervised', inactivityAlertSeconds: 1200, elapsedAlertSeconds: 7200, killTimers: false } as const;
 
@@ -49,7 +50,31 @@ export interface DerivedStatus extends Record<string, unknown> {
   modelReason: string | null;
   endedAt: string | null;
   alerts: string[];
+  /**
+   * What this run reported spending, summed from its own turns. A run
+   * directory has to answer "what did this cost" on its own, without the
+   * broker that produced it still being alive to ask.
+   */
+  claudeUsage: DerivedClaudeUsage;
+  /** The budget the job declared, exactly as contracted; null when it set none. */
+  limits: { maxTurns: number | null; maxTokens: number | null; maxRuntimeSeconds: number | null } | null;
+  /** True when this run was refused a further turn because its budget ran out. */
+  budgetExhausted: boolean;
 }
+
+export interface DerivedClaudeUsage {
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  totalInputTokens: number;
+  totalObservedTokens: number;
+  /** `partial` when any turn omitted a counter; a missing field is never a zero. */
+  quality: 'reported' | 'partial' | 'unavailable';
+}
+
+const TURN_TERMINAL_EVENTS = new Set(['turn_completed', 'turn_interrupted', 'turn_failed']);
 
 export interface DerivedFiles {
   status: DerivedStatus;
@@ -106,7 +131,11 @@ export function deriveCompatibilityFiles(events: EventRecord[], options: { now?:
     modelReason: null,
     endedAt: null,
     alerts: [],
+    claudeUsage: { turns: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, totalInputTokens: 0, totalObservedTokens: 0, quality: 'unavailable' },
+    limits: null,
+    budgetExhausted: false,
   };
+  let usagePartial = false;
   const lines: string[] = [];
   const openTools = new Map<string, string>();
   let terminal = false;
@@ -120,6 +149,24 @@ export function deriveCompatibilityFiles(events: EventRecord[], options: { now?:
     }
     const data = event.data;
     status.lastActivityAt = event.ts;
+    if (TURN_TERMINAL_EVENTS.has(event.type)) {
+      const usage = normalizeClaudeUsage(data.usage);
+      if (usage) {
+        const totals = status.claudeUsage;
+        totals.turns += 1;
+        totals.inputTokens += usage.inputTokens ?? 0;
+        totals.outputTokens += usage.outputTokens ?? 0;
+        totals.cachedInputTokens += usage.cachedInputTokens ?? 0;
+        totals.cacheWriteInputTokens += usage.cacheWriteInputTokens ?? 0;
+        totals.totalInputTokens += usage.totalInputTokens;
+        totals.totalObservedTokens += usage.totalObservedTokens;
+        usagePartial ||= usage.quality === 'partial';
+      } else {
+        // A turn that reported nothing at all still means the total is not a
+        // complete account of what the run cost.
+        usagePartial = true;
+      }
+    }
     switch (event.type) {
       case 'run_started': {
         runId = event.runId;
@@ -138,6 +185,7 @@ export function deriveCompatibilityFiles(events: EventRecord[], options: { now?:
         status.contractVersion = (data.contractVersion as number) ?? null;
         status.resumeMode = (data.resumeMode as string) ?? 'new';
         status.allowedCommands = Array.isArray(data.allowedCommands) ? (data.allowedCommands as unknown[]) : [];
+        status.limits = data.limits && typeof data.limits === 'object' ? (data.limits as DerivedStatus['limits']) : null;
         status.status = 'STARTING';
         lines.push('CODEORQUESTRA - ACOMPANHAMENTO AO VIVO');
         lines.push(`Tarefa Codex: ${status.codexThreadId ?? 'desconhecida'} | Execução: ${event.runId}`);
@@ -224,6 +272,11 @@ export function deriveCompatibilityFiles(events: EventRecord[], options: { now?:
         status.currentTool = null;
         break;
       }
+      case 'budget_exhausted': {
+        status.budgetExhausted = true;
+        lines.push('[Orçamento] Esgotado: o turno em andamento termina, nenhum outro é entregue.');
+        break;
+      }
       case 'alert': {
         const alert = String(data.alert ?? '');
         if (!status.alerts.includes(alert)) status.alerts.push(alert);
@@ -279,6 +332,7 @@ export function deriveCompatibilityFiles(events: EventRecord[], options: { now?:
       status.requiresReview = true;
     }
   }
+  status.claudeUsage.quality = status.claudeUsage.turns === 0 ? 'unavailable' : usagePartial ? 'partial' : 'reported';
   const end = status.endedAt ?? now;
   status.elapsedSeconds = seconds(status.startedAt, end);
   status.runtimeSeconds = seconds(sessionStartedAt, end);

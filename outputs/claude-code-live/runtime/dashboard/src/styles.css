@@ -226,3 +226,9 @@ input.note { background: var(--bg); color: var(--text); border: 1px solid var(--
   font-size: 20px; font-weight: 600; letter-spacing: .12em;
   padding: 2px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface);
 }
+
+/* Compact tables in the inspector: tool counts and run history. */
+.mini-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 4px 0 12px; }
+.mini-table th { text-align: left; font-weight: 600; color: var(--muted); padding: 3px 6px 3px 0; border-bottom: 1px solid var(--border); }
+.mini-table td { padding: 3px 6px 3px 0; border-bottom: 1px solid var(--border); }
+.mini-table td:not(:first-child), .mini-table th:not(:first-child) { text-align: right; }

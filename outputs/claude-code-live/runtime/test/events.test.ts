@@ -349,6 +349,67 @@ describe('redaction and previews', () => {
 });
 
 describe('deriveCompatibilityFiles', () => {
+  test('sums what the run reported spending, and says when the account is incomplete', async () => {
+    const file = path.join(temp.root, 'derive-usage', 'events.jsonl');
+    const log = await EventLog.open(file);
+    const base = { ...ids };
+    const limits = { maxTurns: null, maxTokens: 100, maxRuntimeSeconds: null };
+    await log.append({ type: 'run_started', ...base, data: { startedAt: '2026-09-12T10:00:00.000Z', requestedModel: 'claude-fable-5-1', effort: 'xhigh', contractVersion: 2, limits } });
+    await log.append({ type: 'turn_completed', ...base, data: { turn: 1, usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 } } });
+    await log.append({ type: 'turn_completed', ...base, data: { turn: 2, usage: { input_tokens: 20, output_tokens: 6, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 } } });
+    await log.append({ type: 'run_ended', ...base, data: { status: 'COMPLETED', endedAt: '2026-09-12T10:05:00.000Z', exitCode: 0 } });
+    const derived = deriveCompatibilityFiles(await log.readFrom(0));
+    await log.close();
+
+    assert.deepEqual(derived.status.claudeUsage, {
+      turns: 2,
+      inputTokens: 30,
+      outputTokens: 10,
+      cachedInputTokens: 6,
+      cacheWriteInputTokens: 2,
+      totalInputTokens: 38,
+      totalObservedTokens: 48,
+      quality: 'reported',
+    });
+    // The declared budget travels with the run, so the file answers "against
+    // what?" without the broker that produced it.
+    assert.deepEqual(derived.status.limits, limits);
+    assert.equal(derived.status.budgetExhausted, false);
+  });
+
+  test('a turn that omitted a counter makes the total partial, never a smaller number', async () => {
+    const file = path.join(temp.root, 'derive-partial', 'events.jsonl');
+    const log = await EventLog.open(file);
+    const base = { ...ids };
+    await log.append({ type: 'run_started', ...base, data: { startedAt: '2026-09-12T10:00:00.000Z', contractVersion: 2 } });
+    await log.append({ type: 'turn_completed', ...base, data: { turn: 1, usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 } } });
+    await log.append({ type: 'turn_failed', ...base, data: { turn: 2, usage: { input_tokens: 7 } } });
+    await log.append({ type: 'turn_interrupted', ...base, data: { turn: 3, usage: null } });
+    await log.append({ type: 'budget_exhausted', ...base, data: { tokens: { used: 28, limit: 20 }, exhausted: true } });
+    const derived = deriveCompatibilityFiles(await log.readFrom(0));
+    await log.close();
+
+    assert.equal(derived.status.claudeUsage.turns, 2, 'a turn that reported nothing is not a turn with zero usage');
+    assert.equal(derived.status.claudeUsage.inputTokens, 17);
+    assert.equal(derived.status.claudeUsage.outputTokens, 4);
+    assert.equal(derived.status.claudeUsage.quality, 'partial');
+    assert.equal(derived.status.budgetExhausted, true);
+    assert.equal(derived.status.limits, null);
+    assert.match(derived.acompanhamento, /\[Orçamento\] Esgotado/);
+  });
+
+  test('a run whose turns never reported usage says unavailable rather than zero', async () => {
+    const file = path.join(temp.root, 'derive-unavailable', 'events.jsonl');
+    const log = await EventLog.open(file);
+    const base = { ...ids };
+    await log.append({ type: 'run_started', ...base, data: { startedAt: '2026-09-12T10:00:00.000Z', contractVersion: 2 } });
+    await log.append({ type: 'turn_completed', ...base, data: { turn: 1, usage: null } });
+    const derived = deriveCompatibilityFiles(await log.readFrom(0));
+    await log.close();
+    assert.equal(derived.status.claudeUsage.quality, 'unavailable');
+    assert.equal(derived.status.claudeUsage.totalObservedTokens, 0);
+  });
+
   test('derives status/result/acompanhamento without double-counting text', async () => {
     const file = path.join(temp.root, 'derive', 'events.jsonl');
     const log = await EventLog.open(file);

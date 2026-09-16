@@ -48,6 +48,26 @@ export async function getEventsBefore(taskId: string, beforeSeq: number, limit =
   return parse<EventPageResponse>(await fetch(`/api/tasks/${encodeURIComponent(taskId)}/events?before=${beforeSeq}&limit=${limit}&waitMs=0`, { credentials: 'same-origin' }));
 }
 
+export interface RunHistoryEntry {
+  runId: string;
+  status: string;
+  failureCode: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  elapsedSeconds: number | null;
+  turns: number | null;
+  tokens: number | null;
+  usageQuality: 'reported' | 'partial' | 'unavailable';
+  toolCalls: number | null;
+  toolErrors: number | null;
+  budgetExhausted: boolean;
+}
+
+/** Every run this task has had, read from each run's own files. */
+export async function getRuns(taskId: string): Promise<RunHistoryEntry[]> {
+  return parse<RunHistoryEntry[]>(await fetch(`/api/tasks/${encodeURIComponent(taskId)}/runs`, { credentials: 'same-origin' }));
+}
+
 export async function postAction(taskId: string, action: string, body: Record<string, unknown>): Promise<unknown> {
   return parse<unknown>(await fetch(`/api/tasks/${encodeURIComponent(taskId)}/${action}`, { method: 'POST', credentials: 'same-origin', headers: ACTION_HEADERS, body: JSON.stringify(body) }));
 }

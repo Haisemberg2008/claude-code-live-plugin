@@ -68,6 +68,8 @@ A supervisão só alerta (20 min sem atividade, 2 h decorridas, decisão pendent
 
 Diante de um laço, três respostas — todas decisão do coordenador, nenhuma automática: deixar seguir, **restringir** (`codeorquestra_set_policy`: comandos, escritas ou tudo passam a exigir decisão explícita, valendo já na próxima chamada, sem conceder nada que o contrato negou) ou **encerrar ao fim do turno** (`codeorquestra_end` com `afterTurn`, que espera o turno terminar sozinho e fecha como concluída).
 
+O inspetor também presta contas da execução: quanto do contexto o último turno ocupou (a janela é presumida e a tela diz isso), quantas chamadas de ferramenta houve com erros e bloqueios por ferramenta, e o histórico da tarefa com o custo de cada execução encerrada — o mesmo que `codeorquestra_list` devolve ao Codex.
+
 Cada execução preserva o log de eventos append-only e deriva `acompanhamento.txt`, `status.json` e `resultado.json`. `COMPLETED` indica término do transporte, não aceite técnico; `FAIL`, `CANCELLED` e `UNCERTAIN` nunca são sucesso. Um fim que ninguém pediu deixa a execução `UNCERTAIN` e exige revisão explícita antes de outra.
 
 ## Retomar

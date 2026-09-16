@@ -28,6 +28,9 @@ export const COORDINATOR_ABSENT_LABEL = 'aguardando coordenador';
  */
 export const BUDGET_WARNING_RATIO = 0.8;
 
+/** How full the presumed context window has to be before it is worth saying. */
+export const CONTEXT_HIGH_RATIO = 0.8;
+
 export interface SupervisionThresholds {
   inactivityAlertMs: number;
   elapsedAlertMs: number;
@@ -49,6 +52,8 @@ export interface SupervisionInput {
   budgetRatio: number | null;
   /** True once this run's tool history showed a loop. Reported, never acted on. */
   thrashing: boolean;
+  /** Last turn's prompt over the presumed context window; null before the first turn. */
+  contextRatio: number | null;
   brokerRestartedDuringRun: boolean;
   terminal: boolean;
   thresholds?: SupervisionThresholds;
@@ -90,6 +95,10 @@ export function evaluateSupervision(input: SupervisionInput): SupervisionResult 
   // every other alert it only says what is true. Restricting the run, ending
   // it after the turn, or letting it continue are all the coordinator's call.
   if (input.thrashing) alerts.push('thrashing');
+  // A full context is not a failure, it is a warning that the next turn will
+  // be compacted and something will be forgotten. Said early enough to plan
+  // for, never acted on.
+  if (input.contextRatio !== null && input.contextRatio >= CONTEXT_HIGH_RATIO) alerts.push('context_high');
   if (input.budgetRatio !== null) {
     if (input.budgetRatio >= BUDGET_WARNING_RATIO) alerts.push('budget_warning');
     if (input.budgetRatio >= 1) alerts.push('budget_exhausted');
