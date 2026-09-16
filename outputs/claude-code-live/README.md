@@ -203,3 +203,7 @@ O estado inicial é gravado antes da consulta de uso. Falhas de preparação dei
 ## Migração
 
 Jobs sem `coordination` são rejeitados. `allowedCommands` agora usa objetos `{ rule, responsibility }`, e resultados anteriores sem contrato completo não podem ser retomados. Crie um novo job com plano e matriz aprovados.
+
+## Licença
+
+Apache License 2.0 — veja [`LICENSE`](../../LICENSE) na raiz do repositório. Nome, logotipo e marca não estão licenciados (seção 6).
