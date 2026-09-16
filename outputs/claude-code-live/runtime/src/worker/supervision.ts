@@ -21,6 +21,13 @@ export const SUPERVISION = {
 
 export const COORDINATOR_ABSENT_LABEL = 'aguardando coordenador';
 
+/**
+ * A ratio, not a duration, so it lives outside the millisecond thresholds. At
+ * 80% of any declared limit the run is still allowed to go on; the alert exists
+ * so that exhaustion is never the first thing anyone hears about the budget.
+ */
+export const BUDGET_WARNING_RATIO = 0.8;
+
 export interface SupervisionThresholds {
   inactivityAlertMs: number;
   elapsedAlertMs: number;
@@ -38,6 +45,8 @@ export interface SupervisionInput {
   pendingRequests: number;
   /** When the oldest unanswered request arrived; null when none is pending. */
   oldestPendingRequestAt: number | null;
+  /** Highest used/limit across the run's declared limits; null when the job set none. */
+  budgetRatio: number | null;
   brokerRestartedDuringRun: boolean;
   terminal: boolean;
   thresholds?: SupervisionThresholds;
@@ -72,6 +81,13 @@ export function evaluateSupervision(input: SupervisionInput): SupervisionResult 
   // still correctly stays silent while waiting, because waiting is not idling.
   if (waiting && input.oldestPendingRequestAt !== null && input.now - input.oldestPendingRequestAt >= thresholds.decisionPendingMs) alerts.push('decision_pending');
   if (input.now - input.runStartedAt >= thresholds.elapsedAlertMs) alerts.push('elapsed_2h');
+  // The budget alerts do not depend on waiting: a run blocked on a decision has
+  // spent what it spent. Exhaustion is enforced by the broker refusing the next
+  // turn; here it is only named, like every other alert.
+  if (input.budgetRatio !== null) {
+    if (input.budgetRatio >= BUDGET_WARNING_RATIO) alerts.push('budget_warning');
+    if (input.budgetRatio >= 1) alerts.push('budget_exhausted');
+  }
   const state: TaskState = waiting && input.phase !== 'waiting_permission' && input.phase !== 'waiting_question' ? 'waiting_permission' : input.phase;
   return { state, alerts, action: 'none', coordinatorPresence, coordinatorLabel, requiresReview: false };
 }

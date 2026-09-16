@@ -11,7 +11,7 @@ Duas gerações convivem neste pacote:
 | | Runner legado (v1) | Runtime v2 |
 |---|---|---|
 | Onde | `skills/claude-code-live/scripts/*.ps1` | `runtime/` (Node 22+, TypeScript) |
-| Contrato | job v1 (`mode`, `allowedCommands`, `timeoutPolicy`) | job v2 (`contractVersion: 2`, `profile`, `capabilities` derivadas) |
+| Contrato | job v1 (`mode`, `allowedCommands`, `timeoutPolicy`) | job v2 (`contractVersion: 2`, `profile`, `capabilities` derivadas, `limits` opcional por execução) |
 | Interação | uma execução, painel de console, sem prompts | sessão durável multiturno, fila de orientações, permissões e perguntas ao vivo, painel web |
 | Superfícies | PowerShell | broker HTTP em loopback + MCP stdio + CLI + painel |
 

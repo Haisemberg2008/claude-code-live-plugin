@@ -59,8 +59,8 @@ async function register(threadId: string): Promise<{ taskId: string; taskHandle:
   return response.body as { taskId: string; taskHandle: string };
 }
 
-async function startRun(taskId: string, taskHandle: string, prompt: string): Promise<string> {
-  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: jobV2(workspace, { prompt, scope: { summary: 's', paths: ['src/'] } }), observation: { mode: 'voz' } }) });
+async function startRun(taskId: string, taskHandle: string, prompt: string, overrides: Record<string, unknown> = {}): Promise<string> {
+  const response = await broker.api(`/api/tasks/${taskId}/runs`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, job: jobV2(workspace, { prompt, scope: { summary: 's', paths: ['src/'] }, ...overrides }), observation: { mode: 'voz' } }) });
   assert.equal(response.status, 202, response.text);
   return (response.body as { runId: string }).runId;
 }
@@ -400,6 +400,36 @@ describe('dashboard', () => {
     await item.waitFor({ timeout: 15000 });
     await item.getByText('Encerrada').waitFor({ timeout: 15000 });
     assert.equal(await taskState(taskId), 'terminal', 'an idle registered task has no run yet');
+  });
+
+  test('a run with a budget shows used/limit in the inspector and, once exhausted, says so on the row', async (t) => {
+    if (unavailable) { t.skip(unavailable); return; }
+    const { taskId, taskHandle } = await register('thread-ui-orcamento');
+    // The fake reports 27 observed tokens per turn; two turns exhaust 40.
+    await startRun(taskId, taskHandle, script(['say: primeiro']), { limits: { maxTokens: 40, maxTurns: 10 } });
+    const item = page.locator('[data-testid="task-item"]').filter({ hasText: 'thread-ui-orcamento' });
+    await item.waitFor({ timeout: 15000 });
+    await item.click();
+    const inspector = page.getByRole('complementary', { name: 'Inspetor' });
+    await inspector.getByRole('heading', { name: 'Orçamento' }).waitFor();
+    const budget = inspector.locator('[data-testid="budget"]');
+    await budget.getByText('Tokens').waitFor();
+    await budget.getByText('27 / 40', { exact: true }).waitFor({ timeout: 15000 });
+    await budget.getByText('Turnos').waitFor();
+    await budget.getByText('1 / 10', { exact: true }).waitFor({ timeout: 15000 });
+    assert.equal(await item.getByTestId('budget-exhausted').count(), 0, 'not exhausted after one turn');
+    await waitFor(async () => ((await taskState(taskId)) === 'idle' ? true : undefined), { timeoutMs: 20000, description: 'budget task idle' });
+
+    const second = await broker.api(`/api/tasks/${taskId}/message`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ taskHandle, text: 'say: segundo' }) });
+    assert.equal(second.status, 202, second.text);
+    await page.getByRole('main').getByText('segundo', { exact: true }).waitFor({ timeout: 15000 });
+    await budget.getByText('54 / 40', { exact: true }).waitFor({ timeout: 15000 });
+    await item.getByTestId('budget-exhausted').getByText('orçamento esgotado').waitFor({ timeout: 15000 });
+    await page.getByRole('main').getByText(/^Orçamento esgotado: tokens 54\/40, turnos 2\/10\./).waitFor({ timeout: 15000 });
+    // Exhaustion refuses the next turn; it does not end the run or kill this one.
+    await waitFor(async () => ((await taskState(taskId)) === 'idle' ? true : undefined), { timeoutMs: 20000, description: 'still idle, not terminal' });
+    await endTask(taskId);
+    await item.getByTestId('run-outcome').getByText('Concluída').waitFor({ timeout: 15000 });
   });
 
   test('every browser request stayed on the broker origin and no dialog fired', async (t) => {

@@ -201,6 +201,26 @@ export interface RunView {
   profile: string;
   contractVersion: 1 | 2;
   resumeMode: 'new' | 'automatic' | 'explicit';
+  /** Null when the job declared no limits. */
+  budget: RunBudgetView | null;
+}
+
+export interface BudgetDimensionView {
+  used: number;
+  limit: number;
+}
+
+/**
+ * How much of its declared budget a run has spent. Each dimension is null when
+ * the job did not limit it; `ratio` is the highest used/limit among the ones it
+ * did. Exhaustion refuses the NEXT turn — it never aborts the one in flight.
+ */
+export interface RunBudgetView {
+  tokens: BudgetDimensionView | null;
+  turns: BudgetDimensionView | null;
+  runtimeSeconds: BudgetDimensionView | null;
+  ratio: number;
+  exhausted: boolean;
 }
 
 export interface TaskView {

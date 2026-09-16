@@ -106,6 +106,7 @@ Uma execucao v2 exige um canal de acompanhamento **declarado**, e o broker verif
 - `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura). Os perfis legados `diagnostic` e `restricted` pertencem ao v1 e sao recusados aqui.
 - As capacidades **derivam** do contrato: `phase: "planning"` ou `profile: "read"` nao concedem edicao nem comandos; `implementation: "claude"` concede edicao; `testing: "claude"` concede testes.
 - `auth.allowApiBilling` e opcional e so deve ser usado quando o usuario autorizar explicitamente um caminho que pode gerar cobranca por API.
+- `limits` e opcional e fixa um orcamento por execucao (tokens, turnos, segundos); veja "Orcamento por execucao".
 - Claude nunca pode receber `commit`, `push` ou `deploy`.
 
 ## Estados e o que eles significam
@@ -245,6 +246,38 @@ passados dois minutos entra `decision_pending`, que diz a outra coisa
 verdadeira: ninguem respondeu e nada avanca. O alerta **repete** enquanto
 continuar valendo, e some quando a decisao e respondida. Como todo alerta de
 supervisao, ele so avisa: nada e encerrado.
+
+## Orcamento por execucao
+
+`limits` e opcional no job v2 e fixa um teto para **esta** execucao, em qualquer
+combinacao das tres dimensoes:
+
+```json
+"limits": { "maxTokens": 200000, "maxTurns": 20, "maxRuntimeSeconds": 3600 }
+```
+
+- `maxTokens` conta o que os turnos reportaram: entrada + cache lido + cache
+  criado + saida. `maxTurns` conta turnos concluidos; `maxRuntimeSeconds`, o
+  tempo desde o inicio da execucao. Campo ausente ou `null` nao limita; valor
+  presente precisa ser inteiro positivo, senao `LIMITS_INVALID`.
+- Em 80% de qualquer limite entra o alerta `budget_warning`. Ao atingir 100%,
+  `budget_exhausted` vai para o log duravel e para a view; `currentRun.budget`
+  mostra usado/limite por dimensao.
+- Esgotar **nao aborta nada**: o turno em andamento termina normalmente, porque
+  so a interrupcao explicita aborta um turno. O que muda e que o proximo turno
+  nao e entregue — `codeorquestra_message` e `codeorquestra_annotate`
+  respondem `409 BUDGET_EXHAUSTED`, e o que ja estava na fila fica na fila,
+  entregue quando houver orcamento de novo (na proxima execucao da tarefa).
+- Para continuar, encerre a execucao e inicie outra na mesma tarefa com
+  `limits` maior e `approvalRevision` maior; a sessao anterior e retomada
+  automaticamente. Subir o orcamento e uma re-aprovacao, e passa pelo
+  mecanismo de re-aprovacao que ja existe.
+- O runner legado (v1) so conhece `timeoutPolicy`; `limits` num job v1 e
+  recusado com `V2_FIELD_IN_LEGACY`, nunca ignorado.
+
+Existe porque o teto de paralelismo e a quota da conta limitam a frota, nao uma
+execucao: um agente em laco queimava a semana inteira sem nenhuma recusa no
+caminho.
 
 ## Custo da frota
 

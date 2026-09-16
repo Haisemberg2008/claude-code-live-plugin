@@ -130,6 +130,9 @@ export function buildRows(events: EventRecord[], queue: QueueEntryView[]): Row[]
       case 'alert':
         rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'warn', text: `Alerta de supervisão: ${String(data.alert ?? '?')} (sem encerramento automático).` });
         break;
+      case 'budget_exhausted':
+        rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'error', text: `Orçamento esgotado: ${budgetSummary(data)}. O turno em andamento termina; nenhum outro é entregue.` });
+        break;
       case 'telemetry_write_failed':
         rows.push({ kind: 'system', key, gseq, ts: event.ts, tone: 'warn', text: `Falha de observabilidade ao gravar ${String(data.file ?? '?')} (${String(data.code ?? '?')}); a execução continua.` });
         break;
@@ -156,4 +159,17 @@ export function buildRows(events: EventRecord[], queue: QueueEntryView[]): Row[]
     }
   }
   return rows;
+}
+
+/** "tokens 54/40, turnos 2/5": only the dimensions the job actually limited. */
+function budgetSummary(data: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [field, name] of [['tokens', 'tokens'], ['turns', 'turnos'], ['runtimeSeconds', 'segundos']] as const) {
+    const dimension = data[field];
+    if (dimension && typeof dimension === 'object') {
+      const { used, limit } = dimension as { used?: unknown; limit?: unknown };
+      if (typeof used === 'number' && typeof limit === 'number') parts.push(`${name} ${used}/${limit}`);
+    }
+  }
+  return parts.length ? parts.join(', ') : 'limite atingido';
 }

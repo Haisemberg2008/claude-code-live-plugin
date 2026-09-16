@@ -86,7 +86,11 @@ export interface JobContract {
     strictMcpConfig: true;
   };
   capabilities: { edit: boolean; test: boolean; commands: 'classified' | 'exact-list' | 'none' };
-  limits: { maxTurns: null; maxTokens: null; maxRuntimeSeconds: null };
+  /**
+   * Per-run budget, all three optional. A null is "no limit", which is what
+   * every job resolved to before the field was implemented.
+   */
+  limits: { maxTurns: number | null; maxTokens: number | null; maxRuntimeSeconds: number | null };
   auth: { allowApiBilling: boolean };
   resumeFrom: string | null;
   codexThreadId: string | null;
@@ -263,6 +267,35 @@ function resolveAuth(job: Dict): { allowApiBilling: boolean } {
   return { allowApiBilling: allow === true };
 }
 
+const LIMIT_FIELDS = ['maxTurns', 'maxTokens', 'maxRuntimeSeconds'] as const;
+
+/**
+ * A budget for one run. Absent means unlimited, so no contract version bump:
+ * a job that never mentions `limits` resolves exactly as it always did.
+ *
+ * The same rigour as `auth`: a limit that is present but malformed is refused,
+ * never rounded or defaulted, because "I set a budget" and "I set no budget"
+ * must not be one typo apart.
+ */
+function resolveLimits(job: Dict): JobContract['limits'] {
+  const raw = own(job, 'limits');
+  const limits: JobContract['limits'] = { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null };
+  if (raw === undefined || raw === null) return limits;
+  if (!isDict(raw)) throw new ContractError('LIMITS_INVALID', 'limits deve ser um objeto.');
+  for (const key of Object.keys(raw)) {
+    if (!(LIMIT_FIELDS as readonly string[]).includes(key)) throw new ContractError('LIMITS_INVALID', `limits contém o campo inesperado ${key}.`);
+  }
+  for (const field of LIMIT_FIELDS) {
+    const value = own(raw, field);
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+      throw new ContractError('LIMITS_INVALID', `limits.${field} deve ser um inteiro positivo (ou ausente para não limitar).`);
+    }
+    limits[field] = value;
+  }
+  return limits;
+}
+
 const REF_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/;
 
 /**
@@ -351,6 +384,7 @@ function resolveV2(job: Dict): JobContract {
   const execution = resolveExecution(job, coordination, profileRaw);
   const codexThreadId = resolveThreadId(own(job, 'codexThreadId'));
   const auth = resolveAuth(job);
+  const limits = resolveLimits(job);
   const resumeFrom = stringField(own(job, 'resumeFrom'));
   const readOnly = profileRaw === 'read' || coordination.phase === 'planning';
   const capabilities = readOnly
@@ -373,7 +407,7 @@ function resolveV2(job: Dict): JobContract {
     execution,
     launch: { permissionMode: 'default', safeMode: false, permissionPromptsDisabled: false, restricted: false, strictMcpConfig: true },
     capabilities,
-    limits: { maxTurns: null, maxTokens: null, maxRuntimeSeconds: null },
+    limits,
     auth,
     resumeFrom,
     codexThreadId,
@@ -429,6 +463,11 @@ function resolveLegacy(job: Dict): JobContract {
   // the run happens in the declared checkout.
   if (Object.prototype.hasOwnProperty.call(job, 'execution')) {
     throw new ContractError('V2_FIELD_IN_LEGACY', 'O campo execution pertence ao contrato v2 (contractVersion: 2); o runner legado executa sempre no checkout declarado.');
+  }
+  // Same reason for the budget: the legacy runner only knows timeoutPolicy, so
+  // a `limits` it cannot enforce must never look accepted.
+  if (Object.prototype.hasOwnProperty.call(job, 'limits')) {
+    throw new ContractError('V2_FIELD_IN_LEGACY', 'O campo limits pertence ao contrato v2 (contractVersion: 2); o runner legado só conhece timeoutPolicy.');
   }
   const workspace = resolveWorkspace(own(job, 'workspace'));
   const { prompt, promptFile } = resolvePrompt(job);
