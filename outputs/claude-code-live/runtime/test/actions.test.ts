@@ -315,12 +315,3 @@ describe('filesystem containment with real reparse points', () => {
     assert.deepEqual(pick(classify('Write', { file_path: path.join(realWorkspace, 'src', 'externo', 'alvo.ts') }, ctx)), { decision: 'escalate', reason: 'OUTSIDE_SCOPE_PATH' });
   });
 });
-
-describe('legacy profile classification', () => {
-  test('legacy restricted jobs keep the exact allowlist semantics', () => {
-    const legacy: Partial<ActionContext> = { profile: 'restricted', legacyMode: 'verify', legacyAllowedCommands: ['Bash(npm test)'] };
-    assert.deepEqual(pick(classify('Bash', { command: 'npm test' }, legacy)), { decision: 'allow', reason: 'EXACT_ALLOWLIST' });
-    assert.deepEqual(pick(classify('Bash', { command: 'npm test -- --watch' }, legacy)), { decision: 'deny', reason: 'NOT_IN_ALLOWLIST' });
-    assert.deepEqual(pick(classify('Edit', { file_path: 'C:\\ws\\projeto\\src\\a.ts' }, legacy)), { decision: 'deny', reason: 'TOOL_NOT_IN_MODE' });
-  });
-});

@@ -1,5 +1,5 @@
-// Sanitized /usage parser (port of the legacy PowerShell parser with the same
-// literal semantics) plus the advisory 3% recommendation.
+// Sanitized /usage parser (ported from the retired v1 PowerShell runner with
+// the same literal semantics) plus the advisory 3% recommendation.
 import type { AuthorizedModel } from '../shared/types.ts';
 
 export class UsageError extends Error {

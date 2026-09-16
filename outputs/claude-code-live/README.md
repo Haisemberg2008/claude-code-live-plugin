@@ -2,20 +2,11 @@
 
 ![Arquitetura do CodeOrquestra: Codex Terra e Sol coordenam sessões isoladas do Claude Fable e Opus por MCP local, painel ao vivo e revisão independente](assets/codeorquestra-architecture-v2.png)
 
-**Codex com Opus e Fable.** CodeOrquestra é a marca visível desta integração local independente para coordenar o Claude Code que você já instalou, local ou em nuvem. Modelos Codex, como Terra e Sol, podem usar sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões mínimas, acompanhamento e retomada controlados. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
+**Codex com Opus e Fable.** CodeOrquestra é a marca visível desta integração local independente para coordenar o Claude Code que você já instalou, local ou em nuvem. Modelos Codex, como Terra e Sol, usam sua capacidade de planejamento, supervisão e revisão para gerenciar sessões separadas do Claude Opus e Fable, sempre com responsáveis explícitos, permissões decididas ao vivo, acompanhamento e retomada controlados. Os modelos disponíveis dependem da configuração da conta e podem mudar. Não é um produto oficial nem representa parceria entre OpenAI e Anthropic.
 
-Identificador técnico: `codeorquestra`. O alias legado `claude-code-live` continua documentado e em uso nos nomes de skill, diretórios de estado e arquivos derivados, preservando instalações, comandos, caminhos, automações e sessões existentes.
+Identificador técnico: `codeorquestra`. O alias `claude-code-live` continua em uso nos nomes de skill, diretórios de estado e arquivos derivados, preservando instalações, caminhos, automações e sessões existentes.
 
-Duas gerações convivem neste pacote:
-
-| | Runner legado (v1) | Runtime v2 |
-|---|---|---|
-| Onde | `skills/claude-code-live/scripts/*.ps1` | `runtime/` (Node 22+, TypeScript) |
-| Contrato | job v1 (`mode`, `allowedCommands`, `timeoutPolicy`) | job v2 (`contractVersion: 2`, `profile`, `capabilities` derivadas, `limits` opcional por execução) |
-| Interação | uma execução, painel de console, sem prompts | sessão durável multiturno, fila de orientações, permissões e perguntas ao vivo, painel web |
-| Superfícies | PowerShell | broker HTTP em loopback + MCP stdio + CLI + painel |
-
-O v1 continua suportado sem alterações de escopo. O restante deste documento descreve o v1; o v2 está em [`runtime/README.md`](runtime/README.md).
+Este pacote contém uma única geração: o runtime em [`runtime/`](runtime/README.md) (Node 22+, TypeScript), com broker HTTP em loopback, um worker por tarefa Codex, adaptador MCP stdio (`codeorquestra_*`), CLI e painel web. O runner PowerShell (v1) foi aposentado em setembro de 2026; veja [Migração do v1](#migração-do-v1).
 
 ## Fluxo obrigatório
 
@@ -27,147 +18,82 @@ Antes de implementação ou mutação, o Codex:
 4. aguarda aprovação explícita;
 5. executa apenas as etapas atribuídas ao Claude e revisa os resultados independentemente.
 
-Claude nunca pode receber `commit`, `push` ou `deploy`. `deploy` também representa publicação e outras mutações externas. Mudanças de plano, escopo ou responsável exigem nova aprovação.
-
-## Modos
-
-| Modo | Ferramentas | Finalidade |
-|---|---|---|
-| `chat` | Nenhuma | Conversa sem acesso ao projeto |
-| `read` | `Read`, `Glob`, `Grep` | Planejamento e inspeção |
-| `verify` | Leitura e Bash exato | Testes sem `Write` ou `Edit` |
-| `local` | Leitura, `Write`, `Edit` e Bash exato | Implementação atribuída ao Claude |
-
-Todos usam `dontAsk`, `--permission-prompts none` e allowlist. O perfil `restricted` é preferido para alterações; `diagnostic` existe para diagnóstico ou ambientes limpos. Nenhum perfil é sandbox completo do sistema operacional.
+Claude nunca pode receber `commit`, `push` ou `deploy`; o contrato recusa a atribuição. `deploy` também representa publicação e outras mutações externas. Mudanças de plano, escopo ou responsável exigem nova aprovação e `approvalRevision` maior.
 
 ## Contrato do job
 
 ```json
 {
+  "contractVersion": 2,
   "workspace": "C:\\projeto-autorizado",
-  "promptFile": "C:\\execucoes\\prompt.md",
-  "mode": "verify",
-  "profile": "restricted",
+  "prompt": "Implemente o recurso aprovado dentro do escopo.",
+  "profile": "development",
+  "model": { "requested": "claude-fable-5-1", "reason": "Tarefa longa de implementação." },
+  "effort": "xhigh",
   "coordination": {
     "phase": "execution",
-    "scopeId": "validar-correcao",
+    "scopeId": "corrigir-validacao",
     "approvalRevision": 1,
-    "planSummary": "Executar os testes aprovados sem editar arquivos.",
+    "planSummary": "Implementar a correção aprovada e rodar os testes.",
     "planApproved": true,
     "responsibilities": {
-      "planning": "codex",
-      "inspection": "claude",
-      "implementation": "codex",
-      "testing": "claude",
-      "review": "codex",
-      "commit": "not_applicable",
-      "push": "not_applicable",
-      "deploy": "not_applicable"
+      "planning": "codex", "inspection": "claude", "implementation": "claude", "testing": "claude",
+      "review": "codex", "commit": "codex", "push": "codex", "deploy": "not_applicable"
     }
   },
-  "allowedCommands": [
-    {
-      "rule": "Bash(pwsh -NoProfile -File tests.ps1)",
-      "responsibility": "testing"
-    }
-  ],
-  "timeoutPolicy": {
-    "mode": "adaptive",
-    "renewEverySeconds": 1800,
-    "idleAfterSeconds": 1200,
-    "hardStopAfterSeconds": 7200
-  }
+  "scope": { "summary": "módulo de validação", "paths": ["src/validacao/"] },
+  "limits": { "maxTokens": 200000, "maxTurns": 20 }
 }
 ```
 
-- `planning` aceita apenas `chat` ou `read` e ainda não exige plano final aprovado.
-- `execution` exige resumo, aprovação e matriz completa.
-- `local` exige que `implementation` pertença ao Claude.
-- `verify` aceita comandos somente de `inspection` ou `testing`.
-- `local` aceita comandos somente de `inspection`, `implementation` ou `testing`.
-- Cada comando exige que Claude seja o ator da responsabilidade indicada.
-- Regras que revelem commit, push, criação ou merge de PR, deploy ou publicação são bloqueadas.
+- `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura).
+- As capacidades **derivam** do contrato, não de uma allowlist: `phase: planning` ou `profile: read` não concedem edição nem comandos; `implementation: claude` concede edição; `testing: claude` concede testes. O classificador de ações decide sobre o caminho resolvido; o que ele não decide sozinho vira um pedido de permissão visível ao coordenador.
+- `model.requested` exige o identificador exato (`claude-fable-5-1` ou `claude-opus-5`) e `model.reason`; `effort` é sempre `xhigh`. Divergência entre modelo solicitado e observado, ou rebaixamento de esforço relatado pelo CLI, encerra a execução de forma visível.
+- `execution: { "mode": "worktree" }` pede uma árvore isolada para trabalho em paralelo; `limits` fixa um orçamento por execução; `auth.allowApiBilling` só com autorização explícita do usuário. Todos opcionais.
 
-Scripts permitidos ainda precisam ser inspecionados. A trava textual não substitui revisão do conteúdo executado.
-
-Se `timeoutPolicy` for omitido, esses mesmos valores adaptativos são usados por padrão. Cada evento JSON válido renova a evidência de atividade; 20 minutos sem eventos encerram por `inactivity`, e 2 horas encerram por `hard_limit` mesmo com atividade. A preparação não consome esse relógio. Para compatibilidade, `timeoutSeconds` ainda define um limite fixo positivo, mas não pode ser combinado com `timeoutPolicy`. Um `TIMEOUT` preserva sessão, arquivos e logs para revisão; nunca inicia outra execução automaticamente.
-
-## Seleção opcional por quota
-
-Jobs sem `modelPolicy` continuam usando o modelo fixo de `model` (ou Fable por padrão). Para permitir a troca automática antes de iniciar ou retomar:
-
-```json
-"modelPolicy": {
-  "mode": "quota-aware",
-  "primary": "fable",
-  "alternate": "opus",
-  "switchAtRemainingPercent": 3
-}
-```
-
-Não combine `model` e `modelPolicy`. O limite padrão é `3` e aceita inteiros de `1` a `20`. Fable é mantido acima do limite; Opus é usado quando apenas o restante efetivo do Fable chega ao limite; sessão ou semana geral baixas bloqueiam a execução. Falha ou formato inesperado em `/usage` também bloqueia um job quota-aware antes de iniciar o Claude.
-
-A decisão é refeita a cada início/retomada e volta ao Fable após a renovação. O painel, `status.json` e `resultado.json` mostram somente política, percentuais sanitizados, modelo solicitado/selecionado e motivo. Alterar a política em uma retomada exige `approvalRevision` maior. O recurso não usa `--fallback-model`, pois esse fallback cobre indisponibilidade/sobrecarga, não quota.
-
-## Executar localmente
+## Executar
 
 ![Fluxo Painel Primeiro: registrar a tarefa, abrir ou reutilizar uma única aba, confirmar o painel, iniciar Claude, acompanhar ao vivo e revisar a entrega](assets/codeorquestra-panel-first.png)
 
-```powershell
-pwsh -NoProfile -File '<plugin>\skills\claude-code-live\scripts\start-live.ps1' `
-  -JobFile '<job.json>' `
-  -RunDirectory '<pasta-nova>'
-```
+Na tarefa Codex, as ferramentas `codeorquestra_*` conversam com o broker local. A ordem é verificada pelo broker:
 
-No runner legado, o contrato é validado antes de preparar o painel e o processo; o handshake de prontidão do painel precisa terminar antes de o processo Claude começar. No runtime v2 o broker recusa iniciar sem canal de acompanhamento declarado: com `observation.mode: "painel"` (o padrão) ele verifica que existe assinante do fluxo de eventos daquela tarefa e responde `OBSERVATION_REQUIRED` quando não há; com `observation.mode: "voz"` o coordenador assume explicitamente o acompanhamento narrado, e a escolha fica registrada em `run_started`. A contagem prova que **um canal está anexado**, não que alguém está olhando: uma aba em segundo plano conta. O painel mostra modo, perfil, modelo, fase, escopo, revisão, resumo, responsáveis, renovações do tempo adaptativo e consumo separado por fonte.
+1. **Identidade** — `codeorquestra task register` no terminal, ou `codeorquestra_pair` com o código curto exibido pelo painel, devolve o `taskHandle` da tarefa. Ele é a capacidade que autoriza todas as outras ferramentas; um novo registro rotaciona o anterior.
+2. **Confiança** — `codeorquestra_inventory` lista o que o CLI carregaria (`CLAUDE.md`, `AGENTS.md`, hooks, skills, MCPs); o usuário aprova por `codeorquestra_trust`. Enquanto algo estiver pendente, nenhuma fonte de configuração é carregada.
+3. **Canal de acompanhamento** — com `observation.mode: "painel"` (padrão), gere o link de uso único com `codeorquestra_dashboard_url` e abra ou reutilize uma única aba; sem assinante do fluxo de eventos, o início é recusado com `OBSERVATION_REQUIRED`. Com `observation.mode: "voz"`, o coordenador assume o acompanhamento narrado e a escolha fica registrada.
+4. **Início** — `codeorquestra_start` com o job. Execuções da mesma tarefa serializam; uma trava de escrita por checkout atravessa tarefas; perfis somente leitura coexistem com um escritor.
 
-O medidor híbrido do runtime v2 mostra tokens Claude reportados pelo CLI (inclusive leitura e criação de cache), estimativa da tarefa Codex quando disponível, limites Codex e atividade da conta. Dados ausentes aparecem como `parcial` ou `indisponível`; estimativas permanecem identificadas e nunca são somadas ao Claude como custo. O acesso ao Codex é somente leitura por uma conexão local com o App Server, sem abrir arquivos de autenticação, iniciar inferência ou resgatar créditos. Atualize pelo painel ou por `codeorquestra_usage_refresh`; uma falha nesse medidor não interfere no trabalho Claude.
+Durante a sessão, durável e multiturno: `codeorquestra_wait` acompanha os eventos e registra a presença do coordenador; `codeorquestra_message` e `codeorquestra_annotate` enfileiram orientação para o próximo turno; `codeorquestra_answer` responde permissões e perguntas; `codeorquestra_interrupt` aborta o turno (a sessão continua); `codeorquestra_end` encerra a sessão e reconcilia a árvore de processos ainda atribuível; `codeorquestra_set_model` troca o modelo entre turnos, com motivo; `codeorquestra_usage_refresh` atualiza o consumo por fonte, somente leitura.
 
-Cada tarefa Codex usa `CODEX_THREAD_ID` para manter diretório, painel, mutex e sessão Claude próprios. Jobs da mesma tarefa são serializados; tarefas diferentes podem executar ao mesmo tempo. A leitura de quota permanece globalmente serializada. Fora do Codex, `codexThreadId` fornece uma identidade estável opcional; sem identidade, cada chamada recebe uma chave isolada de uso único.
+A supervisão só alerta (20 min sem atividade, 2 h decorridas, decisão pendente há mais de 2 min, orçamento em 80%); nada é encerrado sozinho. Um orçamento esgotado recusa o **próximo** turno sem abortar o atual. Só a interrupção explícita aborta um turno.
 
-Antes de toda execução v2 no modo `painel`, o Codex gera o link limitado da tarefa e abre ou reutiliza uma única aba; o broker só aceita iniciar depois que essa aba está de fato assinando os eventos. Sem canal declarado nem assinante, a execução é recusada em vez de começar em silêncio. Uma segunda estratégia de abertura não é disparada enquanto a primeira estiver pendente, evitando abas duplicadas.
-
-Cada execução preserva `acompanhamento.txt`, `status.json` e `resultado.json`. Pressione `Q` para interromper; `X` fecha apenas o painel. `COMPLETED` indica término do CLI, não aceite técnico.
+Cada execução preserva o log de eventos append-only e deriva `acompanhamento.txt`, `status.json` e `resultado.json`. `COMPLETED` indica término do transporte, não aceite técnico; `FAIL`, `CANCELLED` e `UNCERTAIN` nunca são sucesso. Um fim que ninguém pediu deixa a execução `UNCERTAIN` e exige revisão explícita antes de outra.
 
 ## Retomar
 
-O plugin retoma automaticamente a última sessão da mesma tarefa apenas quando toda a configuração aprovada continua idêntica. Mudança de workspace, escopo, revisão, responsáveis, modo, perfil, effort, modelo ou comandos autorizados inicia uma sessão nova. A lista de comandos e responsabilidades é normalizada e ordenada no resultado.
-
-Use `resumeFrom` para retomada explícita no mesmo workspace. Uma sessão vinculada a outra tarefa Codex é rejeitada. Mudança de comandos ou resultado legado sem `allowedCommands` exige revisão maior na retomada explícita. Sem esse campo, a retomada automática é desabilitada.
-
-- Sem mudança, mantenha `scopeId`, `approvalRevision`, plano e matriz.
-- Qualquer mudança exige nova aprovação e revisão maior.
-- Resultados antigos sem coordenação completa não podem ser retomados.
-- Reinspecione o estado; a retomada não desfaz edições.
+Na mesma tarefa Codex, a execução seguinte retoma automaticamente a última sessão Claude; a fila de orientações que ficou pendente é entregue quando houver turno. Retomar não desfaz edições nem repete ferramentas: reinspecione o estado e diga no prompt seguinte o que falta. Qualquer mudança aprovada exige `approvalRevision` maior.
 
 ## Nuvem
 
-O mesmo plano e matriz são obrigatórios. Envie somente as etapas atribuídas ao Claude. O runner local não controla o backend remoto, então o Codex preserva as restrições no prompt e na revisão.
-
-Não use nuvem para transportar credenciais, `.env`, PII, perfis reais ou payloads sensíveis. Sessão em nuvem e tarefa local em segundo plano são fluxos distintos.
+O mesmo plano e matriz são obrigatórios. Envie somente as etapas atribuídas ao Claude. O runtime local não controla o backend remoto, então o Codex preserva as restrições no prompt e na revisão. Não use nuvem para transportar credenciais, `.env`, PII, perfis reais ou payloads sensíveis. Detalhes em [`references/cloud.md`](skills/claude-code-live/references/cloud.md).
 
 ## Segurança
 
 A skill não autoriza instalação, acesso a banco ou provedor, novos ambientes, diretórios adicionais, commit, push, PR, publicação ou deploy. Nunca inclua tokens, senhas, cookies, chaves, `.env`, dados reais de clientes ou payloads brutos em prompts, jobs ou logs.
 
-Safe mode, perfis e allowlists reduzem acesso, mas não substituem revisão nem isolamento de sistema operacional.
+O runtime falha fechado: credenciais de API no ambiente recusam a execução sem `auth.allowApiBilling`; personalizações do projeto só entram depois de aprovadas; o broker escuta só em loopback, com segredo por usuário e link de painel de uso único. Escopo, classificador e trust são camadas de política da aplicação, não sandbox de sistema operacional. Detalhes em [`references/security.md`](skills/claude-code-live/references/security.md).
 
 ## Conteúdo
 
-- `.codex-plugin/plugin.json`: manifesto (`displayName` CodeOrquestra; `name` permanece `claude-code-live` como alias legado).
+- `.codex-plugin/plugin.json`: manifesto (`displayName` CodeOrquestra; `name` permanece `claude-code-live` como alias).
 - `.mcp.json`: registra no Codex o adaptador MCP `codeorquestra` empacotado no runtime.
-- `skills/claude-code-live/SKILL.md`: contrato principal.
-- `skills/claude-code-live/references/`: guias local (v1), nuvem, segurança e `runtime-v2.md` (sessão durável, broker local e ferramentas MCP).
-- `skills/claude-code-live/scripts/`: executor, painel, contrato e consulta de uso (v1).
-- `skills/claude-code-live/tests/`: testes automatizados do v1.
-- `runtime/`: runtime v2 (broker, worker por tarefa, MCP stdio, CLI e painel web) — ver `runtime/README.md`.
+- `skills/claude-code-live/SKILL.md`: contrato principal que o Codex lê.
+- `skills/claude-code-live/references/`: `runtime-v2.md` (comandos, ferramentas, estados, travas, worktrees, pareamento, orçamento), `security.md` e `cloud.md`.
+- `runtime/`: broker, worker por tarefa, MCP stdio, CLI e painel web — ver [`runtime/README.md`](runtime/README.md).
 - `assets/`: ícone, visão de arquitetura e fluxo visual de painel primeiro.
-- `scripts/validate.ps1`: validação estrutural.
-- `scripts/smoke-test.ps1`: validação completa sem iniciar sessão Claude.
 
 ## Como o Claude Code é acionado
 
-Em ambas as gerações, o Claude Code **não é empacotado aqui**: o pacote resolve e controla a instalação que já existe na máquina. O v2 vai além e conversa diretamente com o processo do CLI instalado pelo protocolo `stream-json` documentado, sem importar nem redistribuir o Agent SDK. Se a build instalada não anunciar as flags de que o runtime depende, a execução não inicia e o motivo é reportado; nenhum CLI alternativo é usado como substituto.
+O Claude Code **não é empacotado aqui**: o runtime resolve e controla a instalação que já existe na máquina, com a autenticação que você já usa, e conversa diretamente com o processo do CLI pelo protocolo `stream-json` documentado, sem importar nem redistribuir o Agent SDK. Se a build instalada não anunciar as flags de que o runtime depende, a execução não inicia e o motivo é reportado; nenhum CLI alternativo é usado como substituto e nenhum caminho de cobrança por API é ativado automaticamente.
 
 ## Instalar
 
@@ -189,20 +115,28 @@ Valide a fonte, atualize o cachebuster com o helper de `plugin-creator`, reinsta
 
 ## Validar
 
-```powershell
-pwsh -NoProfile -File '<plugin>\scripts\validate.ps1'
-pwsh -NoProfile -File '<plugin>\scripts\smoke-test.ps1'
+```bash
+cd runtime && npm ci --ignore-scripts && npm run verify
 ```
 
-O smoke test não autentica nem inicia sessão Claude. Um CLI simulado verifica concorrência, cancelamento isolado, retomada, falhas de preparação, renovação adaptativa, inatividade, teto absoluto e limite fixo legado. O leitor incremental é testado com UTF-8 dividido entre escritas, truncamento e troca de log. Testes reais de permissões, interrupção, retomada ou nuvem exigem projeto descartável e autorização específica.
+`verify` faz typecheck, build, a suíte do broker com um CLI simulado (identidade, trust, travas, permissões, interrupção, encerramento, recuperação, orçamento, worktrees) e os testes de navegador do painel. Nada disso autentica nem inicia uma sessão Claude real. O mesmo fluxo roda no GitHub Actions, que também recusa `dist/` desatualizado. Para diagnóstico da instalação, `node runtime/dist/codeorquestra.mjs doctor` faz apenas sondagens somente leitura.
 
-O estado inicial é gravado antes da consulta de uso. Falhas de preparação deixam estado terminal com `failureStage` sanitizado e preservam a última sessão confirmada. `startedAt` alimenta o tempo decorrido no título do painel; `usageCheckedAt` data a tentativa de consulta inicial. Os limites são reavaliados em cada início/retomada, sem troca no meio da execução. O painel identifica a tarefa e lê somente os novos bytes do log.
+## Migração do v1
 
-`TestAdapter` é um script local confiável, exclusivo do harness; não pode ser fornecido pelo job. `TestStateRoot` e `NoPanel` requerem adaptador explícito. Os testes usam estado temporário e não consultam a conta Claude.
+O runner PowerShell (`start-live.ps1`, job com `mode`/`allowedCommands`/`timeoutPolicy`) foi removido. Um job no formato antigo é recusado com `CONTRACT_VERSION_REQUIRED`; campos v1 num job v2 são recusados com `LEGACY_FIELD_IN_V2`, e a mensagem nomeia o equivalente:
 
-## Migração
+| v1 | v2 |
+|---|---|
+| `mode: chat`/`read` | `profile: read` ou `phase: planning` |
+| `mode: verify`/`local` | `profile: development`; edição e testes derivam de `implementation`/`testing: claude` |
+| `profile: diagnostic`/`restricted` | `profile: development` ou `read` |
+| `allowedCommands` | não há allowlist: classificador por caminho resolvido + permissões decididas ao vivo |
+| `model: "fable"` / `modelPolicy` | `model: { requested: "claude-fable-5-1", reason }` + `codeorquestra_set_model` entre turnos |
+| `timeoutPolicy` / `timeoutSeconds` | `limits.maxRuntimeSeconds` (alerta e recusa o próximo turno; nunca encerra) |
+| `resumeFrom` (resultado.json) | retomada automática na mesma tarefa |
+| painel de console, `stop.request`, `Q` | painel web, `codeorquestra_interrupt` / `codeorquestra_end` |
 
-Jobs sem `coordination` são rejeitados. `allowedCommands` agora usa objetos `{ rule, responsibility }`, e resultados anteriores sem contrato completo não podem ser retomados. Crie um novo job com plano e matriz aprovados.
+Os arquivos por execução (`status.json`, `resultado.json`, `acompanhamento.txt`) mantêm as mesmas chaves. O mutex de `/usage` mantém o nome do v1 para que uma instalação antiga que ainda o execute nunca consulte a conta ao mesmo tempo.
 
 ## Licença
 

@@ -1,10 +1,10 @@
 // v2 job contract: versioned, keeps coordination fields and all eight owners,
-// authorizes only the two working models at effort xhigh, and represents the
-// legacy (v1) job shape faithfully without broadening or silently migrating it.
+// authorizes only the two working models at effort xhigh, and refuses the
+// retired v1 job shape with a migration hint instead of reinterpreting it.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveJobContract, CONTRACT_VERSION, AUTHORIZED_MODELS, REQUIRED_EFFORT } from '../src/contract/job-contract.ts';
-import { jobV2, legacyJob, responsibilities, coordination, FABLE, OPUS } from './helpers/fixtures.ts';
+import { jobV2, responsibilities, coordination, FABLE, OPUS } from './helpers/fixtures.ts';
 import { assertThrowsCode } from './helpers/assert-code.ts';
 
 const workspace = 'C:\\projeto-aprovado';
@@ -35,7 +35,6 @@ describe('v2 development job', () => {
     // A job that never mentions `execution` keeps running in its declared
     // checkout. This is the whole backward-compatibility story for the field.
     assert.deepEqual(contract.execution, { mode: 'checkout', worktree: null });
-    assert.equal(contract.legacy, null);
   });
 
   test('opus is accepted with a reason and effort defaults to xhigh when omitted', () => {
@@ -134,13 +133,23 @@ describe('v2 development job', () => {
     assert.equal(explicit.auth.allowApiBilling, true);
   });
 
-  test('v2 read profile stays read-only and rejects legacy fields', () => {
+  test('v2 read profile stays read-only and rejects retired v1 fields, naming what replaced them', () => {
     const readOnly = resolveJobContract(jobV2(workspace, { profile: 'read' }));
     assert.deepEqual(readOnly.capabilities, { edit: false, test: false, commands: 'none' });
-    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { mode: 'local' })), 'LEGACY_FIELD_IN_V2');
-    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { allowedCommands: [] })), 'LEGACY_FIELD_IN_V2');
-    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { timeoutSeconds: 10 })), 'LEGACY_FIELD_IN_V2');
+    for (const [field, value, hint] of [
+      ['mode', 'local', /profile/],
+      ['allowedCommands', [], /classificador/],
+      ['modelPolicy', { mode: 'quota-aware' }, /codeorquestra_set_model/],
+      ['timeoutPolicy', { mode: 'adaptive' }, /maxRuntimeSeconds/],
+      ['timeoutSeconds', 10, /maxRuntimeSeconds/],
+    ] as const) {
+      let thrown: unknown;
+      try { resolveJobContract(jobV2(workspace, { [field]: value })); } catch (error) { thrown = error; }
+      assert.equal((thrown as { code?: string }).code, 'LEGACY_FIELD_IN_V2', field);
+      assert.match((thrown as Error).message, hint, field);
+    }
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { profile: 'diagnostic' })), 'PROFILE_INVALID');
+    assertThrowsCode(() => resolveJobContract(jobV2(workspace, { profile: 'restricted' })), 'PROFILE_INVALID');
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { contractVersion: 3 })), 'CONTRACT_VERSION_UNSUPPORTED');
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { contractVersion: '2' })), 'CONTRACT_VERSION_UNSUPPORTED');
   });
@@ -229,95 +238,32 @@ describe('v2 execution target', () => {
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxTokens: 5000, maxCost: 5 } })), 'LIMITS_INVALID');
   });
 
-  test('limits belong to v2 only and are refused in a legacy job instead of ignored', () => {
-    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    job.limits = { maxTokens: 5000 };
-    assertThrowsCode(() => resolveJobContract(job), 'V2_FIELD_IN_LEGACY');
-  });
-
-  test('execution belongs to v2 only and is refused in a legacy job instead of ignored', () => {
-    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    job.execution = { mode: 'worktree' };
-    assertThrowsCode(() => resolveJobContract(job), 'V2_FIELD_IN_LEGACY');
-  });
 });
 
-describe('legacy v1 job preservation', () => {
-  test('a legacy verify job resolves as version 1 with its original configuration preserved', () => {
-    const contract = resolveJobContract(legacyJob(workspace, 'C:\\execucoes\\prompt.md'));
-    assert.equal(contract.version, 1);
-    assert.equal(contract.legacy?.mode, 'verify');
-    assert.equal(contract.legacy?.executor, 'legacy-runner');
-    assert.equal(contract.profile, 'restricted');
-    assert.deepEqual(contract.capabilities, { edit: false, test: true, commands: 'exact-list' });
-    assert.deepEqual(contract.launch, {
-      permissionMode: 'dontAsk',
-      safeMode: true,
-      permissionPromptsDisabled: true,
-      restricted: true,
-      strictMcpConfig: true,
-    });
-    assert.deepEqual(contract.legacy?.allowedCommands, [{ rule: 'Bash(pwsh -NoProfile -File tests.ps1)', responsibility: 'testing' }]);
-    assert.equal(contract.model.requested, 'fable', 'the legacy alias is preserved as configured');
-    assert.equal(contract.model.resolved, 'claude-fable-5-1');
-    assert.equal(contract.effort, 'high', 'the legacy default effort is preserved, not migrated');
-    assert.deepEqual(contract.legacy?.timeoutPolicy, { mode: 'adaptive', renewEverySeconds: 1800, idleAfterSeconds: 1200, hardStopAfterSeconds: 7200 });
+describe('the retired v1 contract', () => {
+  const v1Job = (): Record<string, unknown> => ({
+    workspace,
+    promptFile: 'C:\\execucoes\\prompt.md',
+    mode: 'verify',
+    profile: 'restricted',
+    coordination: coordination({ responsibilities: responsibilities({ implementation: 'codex' }) }),
+    allowedCommands: [{ rule: 'Bash(pwsh -NoProfile -File tests.ps1)', responsibility: 'testing' }],
   });
 
-  test('legacy explicit effort, model, fixed timeout and adaptive policy are preserved verbatim', () => {
-    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    job.effort = 'medium';
-    job.model = 'sonnet';
-    job.timeoutSeconds = 10;
-    const contract = resolveJobContract(job);
-    assert.equal(contract.effort, 'medium');
-    assert.equal(contract.model.requested, 'sonnet');
-    assert.equal(contract.model.resolved, null, 'an unauthorized legacy model stays visible for consultation and unresolved for v2');
-    assert.deepEqual(contract.legacy?.timeoutPolicy, { mode: 'fixed', timeoutSeconds: 10 });
-    const adaptive = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    adaptive.timeoutPolicy = { mode: 'adaptive', renewEverySeconds: 60, idleAfterSeconds: 30, hardStopAfterSeconds: 180 };
-    assert.deepEqual(resolveJobContract(adaptive).legacy?.timeoutPolicy, { mode: 'adaptive', renewEverySeconds: 60, idleAfterSeconds: 30, hardStopAfterSeconds: 180 });
+  test('a job without contractVersion is refused with the way forward, never reinterpreted', () => {
+    let thrown: unknown;
+    try { resolveJobContract(v1Job()); } catch (error) { thrown = error; }
+    assert.equal((thrown as { code?: string }).code, 'CONTRACT_VERSION_REQUIRED');
+    assert.match((thrown as Error).message, /contractVersion: 2/);
+    assert.match((thrown as Error).message, /runtime-v2\.md/);
+    // The same for an otherwise valid v2 body that merely forgot the version:
+    // silence here would quietly change what the job means.
+    const { contractVersion: _dropped, ...unversioned } = jobV2(workspace);
+    assertThrowsCode(() => resolveJobContract(unversioned), 'CONTRACT_VERSION_REQUIRED');
+    assertThrowsCode(() => resolveJobContract({ ...v1Job(), contractVersion: null }), 'CONTRACT_VERSION_REQUIRED');
   });
 
-  test('legacy timeout settings are validated like the legacy runner, never dropped', () => {
-    const conflict = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    conflict.timeoutSeconds = 90;
-    conflict.timeoutPolicy = { mode: 'adaptive' };
-    assertThrowsCode(() => resolveJobContract(conflict), 'LEGACY_TIMEOUT_CONFLICT');
-    for (const policy of [{ mode: 'bad' }, { mode: 'adaptive', renewEverySeconds: 0 }, { mode: 'adaptive', idleAfterSeconds: '30' }, { mode: 'adaptive', hardStopAfterSeconds: 10, renewEverySeconds: 20 }, { mode: 'adaptive', extra: 1 }]) {
-      const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-      job.timeoutPolicy = policy;
-      assertThrowsCode(() => resolveJobContract(job), 'LEGACY_TIMEOUT_INVALID', JSON.stringify(policy));
-    }
-    const negative = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    negative.timeoutSeconds = -1;
-    assertThrowsCode(() => resolveJobContract(negative), 'LEGACY_TIMEOUT_INVALID');
-    const invalidEffort = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    invalidEffort.effort = 'turbo';
-    assertThrowsCode(() => resolveJobContract(invalidEffort), 'EFFORT_INVALID');
-  });
-
-  test('legacy model lookups never resolve inherited property names', () => {
-    for (const name of ['constructor', 'toString', '__proto__', 'valueOf']) {
-      const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-      job.model = name;
-      const contract = resolveJobContract(job);
-      assert.equal(contract.model.requested, name);
-      assert.equal(contract.model.resolved, null, name);
-    }
-  });
-
-  test('legacy jobs cannot use the v2 development profile', () => {
-    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    job.profile = 'development';
-    assertThrowsCode(() => resolveJobContract(job), 'PROFILE_REQUIRES_V2');
-  });
-
-  test('legacy wildcard and critical command rules remain rejected', () => {
-    const job = legacyJob(workspace, 'C:\\execucoes\\prompt.md');
-    job.allowedCommands = [{ rule: 'Bash(git push:*)', responsibility: 'testing' }];
-    assertThrowsCode(() => resolveJobContract(job), 'LEGACY_RULE_INVALID');
-    job.allowedCommands = [{ rule: 'Bash(git push origin HEAD)', responsibility: 'testing' }];
-    assertThrowsCode(() => resolveJobContract(job), 'LEGACY_RULE_CRITICAL');
+  test('contractVersion 1 is unsupported rather than mapped onto v2', () => {
+    assertThrowsCode(() => resolveJobContract({ ...v1Job(), contractVersion: 1 }), 'CONTRACT_VERSION_UNSUPPORTED');
   });
 });

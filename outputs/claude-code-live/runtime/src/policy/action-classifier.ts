@@ -26,7 +26,7 @@ export interface ActionCapabilities {
 }
 
 export interface ActionContext {
-  profile: 'development' | 'read' | 'restricted' | 'diagnostic';
+  profile: 'development' | 'read';
   workspace: string;
   scopePaths: string[];
   wholeWorkspace?: boolean;
@@ -42,8 +42,6 @@ export interface ActionContext {
   authorizedModels?: string[];
   /** Effort this run was authorized with; a delegation may not weaken it. */
   requiredEffort?: string;
-  legacyMode?: 'chat' | 'read' | 'verify' | 'local';
-  legacyAllowedCommands?: string[];
 }
 
 export interface ActionResult {
@@ -239,9 +237,6 @@ const MESSAGES: Record<string, string> = {
   DELEGATION_EFFORT_OVERRIDE: 'A delegação tentou usar outro esforço; o subagente executa com o mesmo esforço aprovado para esta execução (Extra/xhigh).',
   DELEGATION_WITHOUT_CAPABILITY: 'A delegação pediria capacidades que esta execução não concede; o subagente não pode exceder o contrato.',
   BUILTIN_SAFE: 'Ferramenta interna sem efeito externo.',
-  EXACT_ALLOWLIST: 'Comando exatamente igual a uma regra aprovada do job legado.',
-  NOT_IN_ALLOWLIST: 'Comando fora da allowlist exata do job legado.',
-  TOOL_NOT_IN_MODE: 'Ferramenta indisponível no modo legado do job.',
   READ_ONLY_PROFILE: 'Perfil somente leitura: ferramentas de escrita e comandos não estão disponíveis.',
   HARMLESS_COMMAND: 'Comando inofensivo.',
 };
@@ -735,28 +730,8 @@ function classifyDelegation(tool: string, input: Record<string, unknown>, contex
   return result('allow', 'BUILTIN_SAFE', { agent });
 }
 
-function classifyLegacy(action: ToolAction, context: ActionContext): ActionResult {
-  const mode = context.legacyMode ?? 'read';
-  const toolsByMode: Record<string, Set<string>> = {
-    chat: new Set(),
-    read: new Set(['Read', 'Glob', 'Grep']),
-    verify: new Set(['Read', 'Glob', 'Grep', 'Bash']),
-    local: new Set(['Read', 'Glob', 'Grep', 'Bash', 'Write', 'Edit']),
-  };
-  const allowedTools = toolsByMode[mode] ?? new Set();
-  if (!allowedTools.has(action.tool)) return result('deny', 'TOOL_NOT_IN_MODE', { tool: action.tool, mode });
-  if (action.tool === 'Bash') {
-    const command = typeof action.input.command === 'string' ? action.input.command : '';
-    for (const token of tokens(command)) if (isSensitivePath(token)) return result('deny', 'SENSITIVE_FILE');
-    const rule = `Bash(${command})`;
-    return (context.legacyAllowedCommands ?? []).includes(rule) ? result('allow', 'EXACT_ALLOWLIST') : result('deny', 'NOT_IN_ALLOWLIST', { command });
-  }
-  return classifyFileAction(action.tool, action.input, { ...context, wholeWorkspace: true, capabilities: { edit: mode === 'local', test: true, commands: 'exact-list' } });
-}
-
 export function classifyToolAction(action: ToolAction, context: ActionContext): ActionResult {
   const { tool, input } = action;
-  if (context.profile === 'restricted' || context.profile === 'diagnostic') return classifyLegacy(action, context);
   if (tool.startsWith('mcp__')) return classifyMcp(tool, context);
   if (DELEGATION_TOOLS.has(tool) || tool === 'Skill') return classifyDelegation(tool, input, context);
   if (context.profile === 'read') {

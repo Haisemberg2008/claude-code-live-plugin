@@ -1,6 +1,8 @@
-// The legacy runner serializes /usage queries with a Windows named mutex. v2
-// reuses the same name through a PowerShell holder process so v1 and v2
-// never overlap; other platforms fall back to an exclusive lock file.
+// /usage queries are serialized machine-wide with a Windows named mutex. The
+// name is the one the retired v1 runner used, kept on purpose: an older
+// installed copy of the plugin may still run v1, and the account's quota is
+// the same whichever runtime asks. Other platforms fall back to an exclusive
+// lock file.
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -69,7 +71,7 @@ function reportPwshFallback(): void {
   pwshFallbackReported = true;
   process.stderr.write(
     'CodeOrquestra: PowerShell 7 (pwsh) não está instalado; o mutex de quota passa a usar arquivo de trava. '
-    + 'Isso ainda exclui outros brokers v2. A exclusão mútua com o runner legado v1 não se aplica aqui, porque o v1 também é executado por pwsh.\n',
+    + 'Isso ainda exclui outros brokers. A exclusão mútua com uma instalação antiga do runner v1 não se aplica aqui, porque aquele runner também dependia do pwsh.\n',
   );
 }
 
@@ -119,7 +121,7 @@ function acquireWindows(name: string, waitMs: number, attemptedAt: string): Prom
         });
       } else if (stdout.includes('TIMEOUT')) {
         clearTimeout(timer);
-        fail(new QuotaLockError('QUOTA_LOCK_TIMEOUT', 'Tempo esgotado aguardando o mutex global de quota (v1 ou outra consulta v2 em andamento).', attemptedAt));
+        fail(new QuotaLockError('QUOTA_LOCK_TIMEOUT', 'Tempo esgotado aguardando o mutex global de quota (outra consulta em andamento).', attemptedAt));
       }
     });
     void exited.then(() => {
@@ -166,18 +168,19 @@ function isAlive(pid: number): boolean {
 /**
  * Runs `fn` while holding a cross-process named mutex.
  *
- * Windows uses a kernel mutex through a PowerShell holder, so the name is
- * shared with the legacy runner; other platforms fall back to an exclusive lock
- * file. Callers under different names never wait on each other.
+ * Windows uses a kernel mutex through a PowerShell holder, under the name an
+ * older installed v1 runner would also take; other platforms fall back to an
+ * exclusive lock file. Callers under different names never wait on each other.
  */
 export async function withNamedMutex<T>(name: string, fn: () => Promise<T>, options: { waitMs?: number; transport?: 'auto' | 'file' } = {}): Promise<MutexOutcome<T>> {
   const waitMs = options.waitMs ?? 30000;
   const attemptedAt = new Date().toISOString();
   const started = Date.now();
-  // 'auto' uses the Windows kernel mutex, which exists so v1 and v2 can share
-  // the /usage name across processes — and which costs a hard dependency on
-  // PowerShell 7, absent from a stock Windows install. A lock with no v1
-  // counterpart should ask for 'file' and work everywhere.
+  // 'auto' uses the Windows kernel mutex, which exists so the /usage name can
+  // be shared with an older installed v1 runner across processes — and which
+  // costs a hard dependency on PowerShell 7, absent from a stock Windows
+  // install. A lock with no such counterpart should ask for 'file' and work
+  // everywhere.
   const useKernelMutex = process.platform === 'win32' && (options.transport ?? 'auto') === 'auto';
   const run = async (): Promise<MutexOutcome<T>> => {
     let holder: Holder;
@@ -185,10 +188,10 @@ export async function withNamedMutex<T>(name: string, fn: () => Promise<T>, opti
       try {
         holder = await acquireWindows(name, waitMs, attemptedAt);
       } catch (error) {
-        // Without pwsh the kernel mutex is unreachable — and so is the legacy
-        // runner, which is itself invoked as `pwsh -File start-live.ps1`. The
-        // property this name protects is mutual exclusion with v1; if v1
-        // cannot run at all, there is nothing to be excluded from, so the file
+        // Without pwsh the kernel mutex is unreachable — and so is any older
+        // installed v1 runner, which was itself invoked as `pwsh -File
+        // start-live.ps1`. The property this name protects is mutual exclusion
+        // with it; if it cannot run at all, there is nothing to be excluded from, so the file
         // lock (which still excludes other v2 brokers) is sufficient rather
         // than a silent downgrade. Anything else here still fails.
         if (!isMissingInterpreter(error)) throw error;
@@ -217,7 +220,7 @@ export async function withNamedMutex<T>(name: string, fn: () => Promise<T>, opti
   return next;
 }
 
-/** The /usage mutex, shared by name with the legacy runner. */
+/** The machine-wide /usage mutex; the name is the one the retired v1 runner used. */
 export async function withGlobalQuotaMutex<T>(fn: () => Promise<T>, options: { waitMs?: number; name?: string } = {}): Promise<MutexOutcome<T>> {
   return withNamedMutex(options.name ?? QUOTA_MUTEX_NAME, fn, options.waitMs === undefined ? {} : { waitMs: options.waitMs });
 }

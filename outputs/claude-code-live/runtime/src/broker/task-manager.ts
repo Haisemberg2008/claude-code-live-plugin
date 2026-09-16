@@ -1135,7 +1135,6 @@ export class TaskManager {
       if (error instanceof ContractError) throw new HttpError(400, 'CONTRACT_INVALID', { code: error.code, message: error.message });
       throw error;
     }
-    if (contract.version !== 2) throw new HttpError(409, 'LEGACY_CONTRACT_USE_LEGACY_RUNNER', { message: 'Jobs v1 executam somente pelo runner legado (start-live.ps1); o runtime v2 aceita contractVersion 2.' });
     this.assertObserved(task, observation);
     // Admission stops the moment shutdown begins, before any reservation.
     if (this.stopping) throw new HttpError(503, 'BROKER_SHUTTING_DOWN', { message: 'O broker está encerrando; nenhuma execução nova é aceita.' });

@@ -34,7 +34,7 @@ export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type WorkerPhase = 'starting' | 'busy_model' | 'busy_tool' | 'waiting_permission' | 'waiting_question' | 'idle' | 'terminal';
 /** Task states as seen by the broker (worker phase plus liveness). */
 export type TaskState = WorkerPhase | 'disconnected' | 'uncertain';
-/** TIMEOUT only exists in legacy (v1) history; v2 never produces it. */
+/** TIMEOUT only appears in run directories written by the retired v1 runner; v2 never produces it. */
 export type RunStatus = 'STARTING' | 'RUNNING' | 'COMPLETED' | 'FAIL' | 'BLOCKED' | 'CANCELLED' | 'UNCERTAIN' | 'TIMEOUT';
 export type ActionSource = 'browser' | 'local-secret' | 'mcp' | 'system' | 'worker';
 export type CoordinatorPresence = 'present' | 'absent';
@@ -199,7 +199,7 @@ export interface RunView {
   elapsedSeconds: number;
   turns: number;
   profile: string;
-  contractVersion: 1 | 2;
+  contractVersion: 2;
   resumeMode: 'new' | 'automatic' | 'explicit';
   /** Null when the job declared no limits. */
   budget: RunBudgetView | null;

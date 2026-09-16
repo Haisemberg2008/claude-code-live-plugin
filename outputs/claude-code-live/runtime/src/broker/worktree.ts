@@ -199,8 +199,8 @@ export async function resolveRepository(workspace: string): Promise<Repository> 
  * Serializes every mutation of one repository's shared admin directory.
  *
  * Uses the lock-file transport on every platform. The Windows kernel mutex
- * exists so v1 and v2 can share the /usage name across processes; a repository
- * lock has no v1 counterpart, and the kernel path costs a hard dependency on
+ * exists so the /usage name can be shared with an older installed v1 runner; a
+ * repository lock has no such counterpart, and the kernel path costs a hard dependency on
  * PowerShell 7, which a stock Windows install does not have. Provisioning a
  * worktree must not require installing pwsh.
  */

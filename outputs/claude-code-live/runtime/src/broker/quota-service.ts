@@ -1,6 +1,6 @@
-// Advisory quota observation: runs the CLI's /usage under the global mutex
-// shared with the legacy runner, parses the sanitized text, and records the
-// attempt and the observation timestamps. Failure is visible and never blocks.
+// Advisory quota observation: runs the CLI's /usage under the machine-wide
+// mutex, parses the sanitized text, and records the attempt and the
+// observation timestamps. Failure is visible and never blocks.
 import { withGlobalQuotaMutex } from '../quota/global-mutex.ts';
 import { evaluateQuotaRecommendation, parseUsageText, type UsageSnapshot } from '../quota/usage-parser.ts';
 import { queryUsageText } from '../preflight/cli-probe.ts';

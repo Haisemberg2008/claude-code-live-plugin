@@ -73,7 +73,7 @@ runtime/
   tsconfig.dashboard.json painel React
   esbuild.config.mjs      bundle backend: codeorquestra.mjs, worker.mjs, mcp-stdio.mjs, build-info.json
   vite.config.mts         bundle do painel (root dashboard/, saída dist/dashboard)
-  src/contract/           contrato de job versionado (v2 e legado v1)
+  src/contract/           contrato de job v2 (o formato v1 e recusado com orientacao de migracao)
   src/engine/             protocolo stream-json, transporte de processo e cliente de sessão do CLI instalado
   src/policy/             classificação de ações (capacidades, escopo, alvos resolvidos, delegação)
   src/trust/              inventário de personalizações, armazenamento de confiança e opções de lançamento

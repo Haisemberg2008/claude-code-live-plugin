@@ -280,9 +280,6 @@ var MESSAGES = {
   DELEGATION_EFFORT_OVERRIDE: "A delega\xE7\xE3o tentou usar outro esfor\xE7o; o subagente executa com o mesmo esfor\xE7o aprovado para esta execu\xE7\xE3o (Extra/xhigh).",
   DELEGATION_WITHOUT_CAPABILITY: "A delega\xE7\xE3o pediria capacidades que esta execu\xE7\xE3o n\xE3o concede; o subagente n\xE3o pode exceder o contrato.",
   BUILTIN_SAFE: "Ferramenta interna sem efeito externo.",
-  EXACT_ALLOWLIST: "Comando exatamente igual a uma regra aprovada do job legado.",
-  NOT_IN_ALLOWLIST: "Comando fora da allowlist exata do job legado.",
-  TOOL_NOT_IN_MODE: "Ferramenta indispon\xEDvel no modo legado do job.",
   READ_ONLY_PROFILE: "Perfil somente leitura: ferramentas de escrita e comandos n\xE3o est\xE3o dispon\xEDveis.",
   HARMLESS_COMMAND: "Comando inofensivo."
 };
@@ -680,27 +677,8 @@ function classifyDelegation(tool, input, context) {
   }
   return result("allow", "BUILTIN_SAFE", { agent });
 }
-function classifyLegacy(action, context) {
-  const mode = context.legacyMode ?? "read";
-  const toolsByMode = {
-    chat: /* @__PURE__ */ new Set(),
-    read: /* @__PURE__ */ new Set(["Read", "Glob", "Grep"]),
-    verify: /* @__PURE__ */ new Set(["Read", "Glob", "Grep", "Bash"]),
-    local: /* @__PURE__ */ new Set(["Read", "Glob", "Grep", "Bash", "Write", "Edit"])
-  };
-  const allowedTools = toolsByMode[mode] ?? /* @__PURE__ */ new Set();
-  if (!allowedTools.has(action.tool)) return result("deny", "TOOL_NOT_IN_MODE", { tool: action.tool, mode });
-  if (action.tool === "Bash") {
-    const command = typeof action.input.command === "string" ? action.input.command : "";
-    for (const token2 of tokens(command)) if (isSensitivePath(token2)) return result("deny", "SENSITIVE_FILE");
-    const rule = `Bash(${command})`;
-    return (context.legacyAllowedCommands ?? []).includes(rule) ? result("allow", "EXACT_ALLOWLIST") : result("deny", "NOT_IN_ALLOWLIST", { command });
-  }
-  return classifyFileAction(action.tool, action.input, { ...context, wholeWorkspace: true, capabilities: { edit: mode === "local", test: true, commands: "exact-list" } });
-}
 function classifyToolAction(action, context) {
   const { tool, input } = action;
-  if (context.profile === "restricted" || context.profile === "diagnostic") return classifyLegacy(action, context);
   if (tool.startsWith("mcp__")) return classifyMcp(tool, context);
   if (DELEGATION_TOOLS.has(tool) || tool === "Skill") return classifyDelegation(tool, input, context);
   if (context.profile === "read") {
@@ -1630,8 +1608,7 @@ var WorkerSession = class {
       // A delegated agent runs under this same contract: it may not pick
       // another model, nor a weaker effort than the one this run authorizes.
       authorizedModels: [...AUTHORIZED_MODELS],
-      requiredEffort: c.effort,
-      ...c.legacy ? { legacyMode: c.legacy.mode, legacyAllowedCommands: c.legacy.allowedCommands.map((command) => command.rule) } : {}
+      requiredEffort: c.effort
     };
   }
   async start() {

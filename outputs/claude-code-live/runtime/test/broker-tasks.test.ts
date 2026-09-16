@@ -320,7 +320,7 @@ describe('trust gating and run with exact model, Extra effort and a durable sess
     await approveTrust(taskId, workspaceA);
   });
 
-  test('the worker launches the CLI process with literal flags, records requested versus observed model and derives the legacy files on end', async () => {
+  test('the worker launches the CLI process with literal flags, records requested versus observed model and derives the run files on end', async () => {
     const { taskId, taskHandle } = await register('thread-run');
     await approveTrust(taskId, workspaceA);
     const { runId } = await startRun(taskId, taskHandle, devJob(workspaceA, script(['say: Olá mundo', 'thinking: oculto', toolDirective('Read', { file_path: path.join(workspaceA, 'CLAUDE.md') })])));

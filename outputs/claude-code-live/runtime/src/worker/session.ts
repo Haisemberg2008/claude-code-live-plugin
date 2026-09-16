@@ -152,7 +152,6 @@ export class WorkerSession {
       // another model, nor a weaker effort than the one this run authorizes.
       authorizedModels: [...AUTHORIZED_MODELS],
       requiredEffort: c.effort,
-      ...(c.legacy ? { legacyMode: c.legacy.mode, legacyAllowedCommands: c.legacy.allowedCommands.map((command) => command.rule) } : {}),
     };
   }
 

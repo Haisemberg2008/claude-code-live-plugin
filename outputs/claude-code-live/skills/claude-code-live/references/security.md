@@ -20,13 +20,13 @@ Sanitizacao reduz exposicao, mas nao deve ser descrita como redacao automatica i
 
 ## Capacidades e limites
 
-O modo local permite acesso somente conforme `mode`, perfil e allowlist do job. Mesmo assim, `diagnostic` nao e um sandbox de SO. O modo em nuvem opera no ambiente remoto disponivel para a sessao e nao deve receber arquivos locais por conveniencia. Em ambos, recursos de navegador, plugins, MCPs, agentes hospedados, diretorios extras e comandos de mutacao permanecem fora do caminho padrao.
+No runtime local, o acesso segue o perfil, o escopo e as capacidades que o contrato deriva da matriz, com o classificador de acoes decidindo por caminho resolvido. Nada disso e um sandbox de SO. O modo em nuvem opera no ambiente remoto disponivel para a sessao e nao deve receber arquivos locais por conveniencia. Em ambos, recursos de navegador, plugins, MCPs, agentes hospedados, diretorios extras e comandos de mutacao permanecem fora do caminho padrao.
 
 Em uso por API, defina teto de gasto somente com autorizacao do usuario. Em uso por assinatura, apenas informe a janela/limite exibido pelo produto; nao tente contornar limites nem abra varias sessoes para isso.
 
-## Autenticacao e cobranca (runtime v2)
+## Autenticacao e cobranca
 
-O runtime v2 nunca ativa cobranca por API sozinho. Antes de lancar, ele avalia o caminho de autenticacao que a execucao usaria e **falha fechado**:
+O runtime nunca ativa cobranca por API sozinho. Antes de lancar, ele avalia o caminho de autenticacao que a execucao usaria e **falha fechado**:
 
 - credenciais de API ou variaveis de provedor de nuvem presentes no ambiente (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_FOUNDRY_*`, `ANTHROPIC_AWS_API_KEY`, `CLAUDE_CODE_USE_BEDROCK|VERTEX|FOUNDRY|MANTLE`, `ANTHROPIC_BASE_URL`) recusam a execucao com `AUTH_API_BILLING_NOT_AUTHORIZED`, a menos que o job autorize `auth.allowApiBilling` explicitamente. Sem essa autorizacao, essas variaveis sao **removidas** do ambiente do processo filho;
 - uma sondagem inconclusiva nao vale como prova de assinatura: o resultado e `AUTH_STATUS_UNKNOWN` e a execucao nao inicia;
@@ -36,7 +36,7 @@ A avaliacao e refeita a cada execucao; apenas a evidencia da sondagem do CLI e r
 
 O medidor Codex e uma integracao separada e somente leitura: abre uma unica conexao local `stdio` com `codex app-server` e chama exclusivamente `account/rateLimits/read` e `account/usage/read`. Ele nao abre `auth.json` nem outro arquivo de autenticacao, nao chama login/logout, nao inicia inferencia e nao consome reset de limite. A resposta bruta nao e persistida; apenas numeros de tokens/percentuais, modelo/esforco informados, qualidade e horario entram em `llmUsage`. Campos de creditos e valores financeiros sao descartados. Falha ou incompatibilidade deixa o medidor indisponivel sem bloquear Claude.
 
-## Confianca em personalizacoes (runtime v2)
+## Confianca em personalizacoes
 
 Antes de qualquer execucao, o runtime **inventaria** o que o CLI carregaria: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` (ancestrais, projeto e subpastas), regras, `settings.json`/`settings.local.json`, hooks e os scripts locais que eles apontam, agentes, skills e servidores MCP. Cada item e identificado por hash do proprio conteudo.
 
@@ -55,7 +55,7 @@ A classificacao de acoes decide sobre o caminho **resolvido** (symlink/junction 
 
 Isso e uma camada de politica da aplicacao, nao um sandbox de sistema operacional. Filtros de texto nao impedem tudo; a decisao final de risco continua sendo do coordenador humano, que revisa o diff e os artefatos.
 
-## Redacao em texto transmitido (runtime v2)
+## Redacao em texto transmitido
 
 Segredos podem chegar partidos entre pedacos do transporte. O runtime acumula o texto e so publica um prefixo seguro: qualquer cauda que ainda possa virar uma credencial reconhecida fica retida, e uma janela curta adicional e retida porque as primeiras letras de uma credencial (`sk`, `https`, `client_sec`) sao indistinguiveis de texto comum. O texto publicado so cresce; nada ja exibido e reinterpretado depois.
 
@@ -63,7 +63,7 @@ Isso reduz exposicao e **nao e garantia**: um valor que nao corresponde a nenhum
 
 Raciocinio interno e assinaturas (`thinking`, `redacted_thinking`, `signature`) sao removidos em qualquer posicao da mensagem antes de qualquer persistencia ou exibicao, e o log duravel rejeita qualquer forma oculta remanescente.
 
-## Superficie HTTP local (runtime v2)
+## Superficie HTTP local
 
 O broker escuta apenas em 127.0.0.1, com segredo por usuario em arquivo (nunca impresso no anuncio) e link de painel de **uso unico e com validade**, que vira um cookie `HttpOnly; SameSite=Strict`. Todas as APIs, inclusive de leitura, exigem autenticacao; acoes do navegador exigem cabecalho anti-CSRF, `Origin` correspondente e `Host` de loopback; nao ha CORS curinga; a CSP e estrita e apenas uma lista fixa de ativos estaticos e servida.
 

@@ -1,5 +1,6 @@
-// Quota: the sanitized /usage parser is reused with the same literal results
-// as v1, the GLOBAL v1 mutex serializes v1/v2 queries, 3% is only a
+// Quota: the sanitized /usage parser keeps the literal results of the v1
+// parser it was ported from, the machine-wide mutex keeps the v1 name so an
+// older installed copy never queries concurrently, 3% is only a
 // recommendation, and telemetry failure never blocks fixed authorized work.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,7 +14,7 @@ const pwsh = process.platform === 'win32' && (await isPwshAvailable());
 const mutexSkip = !pwsh && (process.platform === 'win32' ? 'pwsh is required for the named mutex' : 'Windows named mutex');
 
 describe('parseUsageText', () => {
-  test('matches the legacy parser literally', () => {
+  test('matches the v1 parser it was ported from, literally', () => {
     const usage = parseUsageText(USAGE_SAMPLE, '2026-09-12T10:00:00.000Z');
     assert.deepEqual(usage, {
       session: { usedPercent: 10, remainingPercent: 90, resets: 'Sep 6, 9:19pm (America/Sao_Paulo)' },
@@ -70,12 +71,12 @@ describe('evaluateQuotaRecommendation', () => {
   });
 });
 
-describe('global quota mutex shared with v1', () => {
-  test('uses the exact v1 mutex name', () => {
+describe('machine-wide quota mutex', () => {
+  test('keeps the v1 mutex name, so an older installed copy still running v1 never queries concurrently', () => {
     assert.equal(QUOTA_MUTEX_NAME, 'Local\\ClaudeLiveQuota');
   });
 
-  test('waits for a v1 holder, times out within the bound and succeeds after release', { skip: mutexSkip }, async () => {
+  test('waits for another holder, times out within the bound and succeeds after release', { skip: mutexSkip }, async () => {
     const holder = await holdNamedMutex(QUOTA_MUTEX_NAME);
     try {
       const error = await assertRejectsCode(withGlobalQuotaMutex(async () => 'never', { waitMs: 300 }), 'QUOTA_LOCK_TIMEOUT') as { attemptedAt?: string };
