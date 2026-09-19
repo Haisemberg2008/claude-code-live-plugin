@@ -28,7 +28,7 @@ Claude nunca pode receber `commit`, `push` ou `deploy`; o contrato recusa a atri
   "workspace": "C:\\projeto-autorizado",
   "prompt": "Implemente o recurso aprovado dentro do escopo.",
   "profile": "development",
-  "model": { "requested": "claude-fable-5-1", "reason": "Tarefa longa de implementação." },
+  "model": { "requested": "claude-opus-5", "reason": "Política do usuário: Opus 5 UltraCode." },
   "effort": "xhigh",
   "coordination": {
     "phase": "execution",
@@ -48,7 +48,7 @@ Claude nunca pode receber `commit`, `push` ou `deploy`; o contrato recusa a atri
 
 - `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura).
 - As capacidades **derivam** do contrato, não de uma allowlist: `phase: planning` ou `profile: read` não concedem edição nem comandos; `implementation: claude` concede edição; `testing: claude` concede testes. O classificador de ações decide sobre o caminho resolvido; o que ele não decide sozinho vira um pedido de permissão visível ao coordenador.
-- `model.requested` exige o identificador exato (`claude-fable-5-1` ou `claude-opus-5`) e `model.reason`; `effort` é sempre `xhigh`. Divergência entre modelo solicitado e observado, ou rebaixamento de esforço relatado pelo CLI, encerra a execução de forma visível.
+- A política padrão é **Opus 5 + UltraCode (Extra/xhigh)**: `model.requested` usa `claude-opus-5` e `effort` usa `xhigh`. Fable permanece compatível, mas só é selecionado quando o usuário pedir explicitamente naquela tarefa. Divergência entre modelo solicitado e observado, ou rebaixamento de esforço relatado pelo CLI, encerra a execução de forma visível.
 - `execution: { "mode": "worktree" }` pede uma árvore isolada para trabalho em paralelo; `limits` fixa um orçamento por execução; `auth.allowApiBilling` só com autorização explícita do usuário. Todos opcionais.
 
 ## Executar

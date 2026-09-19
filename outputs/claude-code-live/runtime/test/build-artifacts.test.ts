@@ -42,6 +42,16 @@ before(async () => {
 after(async () => { await temp.cleanup(); });
 
 describe('backend bundle', () => {
+  test('the packaged coordination policy defaults every new job to Opus 5 UltraCode', async () => {
+    const pluginRoot = path.resolve(runtimeRoot, '..');
+    const skill = await readFile(path.join(pluginRoot, 'skills', 'claude-code-live', 'SKILL.md'), 'utf8');
+    const readme = await readFile(path.join(pluginRoot, 'README.md'), 'utf8');
+    assert.match(skill, /Opus 5 \+ UltraCode \(Extra\/xhigh\)/);
+    assert.match(skill, /Fable.*(?:so|somente).*pedido explicito/i);
+    assert.match(readme, /"requested": "claude-opus-5"/);
+    assert.match(readme, /UltraCode \(Extra\/xhigh\)/);
+  });
+
   test('the plugin declares the bundled MCP adapter for Codex', async () => {
     const config = JSON.parse(await readFile(path.resolve(runtimeRoot, '..', '.mcp.json'), 'utf8')) as {
       mcpServers?: Record<string, { cwd?: string; command?: string; args?: string[] }>;

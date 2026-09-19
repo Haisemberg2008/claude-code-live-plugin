@@ -25,7 +25,7 @@ O prompt de codificacao nativo do CLI e preservado; o contexto de coordenacao en
 
 ## Modelo e esforco
 
-Somente `claude-fable-5-1` e `claude-opus-5` sao autorizados, sempre com esforco `xhigh` (Extra). O runtime registra separadamente o **modelo solicitado** e o **modelo observado** em cada mensagem do assistente; divergencia encerra a execucao de forma visivel em vez de continuar com outro modelo.
+Somente `claude-fable-5-1` e `claude-opus-5` sao autorizados, sempre com esforco `xhigh` (Extra). A politica padrao do usuario solicita `claude-opus-5`, apresentada como **Opus 5 + UltraCode (Extra/xhigh)**; Fable exige pedido explicito para a tarefa. O runtime registra separadamente o **modelo solicitado** e o **modelo observado** em cada mensagem do assistente; divergencia encerra a execucao de forma visivel em vez de continuar com outro modelo.
 
 O esforco e reportado como "configurado": o CLI ecoa o valor no `init`, mas nao existe confirmacao de servidor, e o painel diz exatamente isso. Um rebaixamento relatado pelo CLI (`EFFORT_DOWNGRADED_BY_CLI`) para a execucao em vez de trabalhar em silencio com menos esforco.
 
@@ -88,7 +88,7 @@ Uma execucao v2 exige um canal de acompanhamento **declarado**, e o broker verif
   "workspace": "C:\\projeto-autorizado",
   "prompt": "Implemente o recurso aprovado dentro do escopo.",
   "profile": "development",
-  "model": { "requested": "claude-fable-5-1", "reason": "Tarefa longa de implementacao." },
+  "model": { "requested": "claude-opus-5", "reason": "Politica do usuario: Opus 5 UltraCode." },
   "effort": "xhigh",
   "coordination": {
     "phase": "execution",

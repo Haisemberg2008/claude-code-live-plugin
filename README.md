@@ -21,7 +21,7 @@ Nada do Claude Code é empacotado aqui: o CodeOrquestra controla a instalação 
 - Mostra tudo num painel web local e num log de eventos append-only; nunca inventa progresso nem expõe raciocínio interno.
 - Permite trabalho em paralelo em worktrees isolados, com trava de escrita por árvore e teto de execuções por repositório.
 - Fixa, quando pedido, um orçamento por execução (tokens, turnos, tempo) que recusa o próximo turno sem abortar o atual.
-- Permite trocar entre Fable e Opus entre turnos, com motivo registrado, à vista do consumo por fonte.
+- Mantém Opus 5 como padrão e só permite selecionar Fable entre turnos mediante pedido explícito do usuário, sempre com motivo registrado e à vista do consumo por fonte.
 - Mantém commit, push, PR, deploy, publicação e outras mutações externas fora do Claude.
 - Obriga o Codex a revisar artefatos e testes; término do processo não equivale a aceite.
 
@@ -61,6 +61,8 @@ Claude nunca pode ser responsável por `commit`, `push` ou `deploy`. Essas linha
 ## Contrato do job
 
 Um job é um objeto JSON `contractVersion: 2` com `workspace`, `prompt` (ou `promptFile`), `profile` (`development` ou `read`), `model` (`requested` exato e `reason`), `effort: "xhigh"`, `coordination` (fase, escopo, revisão, plano, matriz) e `scope` (resumo e caminhos). Opcionais: `execution` (worktree), `limits` (orçamento), `auth.allowApiBilling` (cobrança por API, só com autorização explícita). O exemplo completo e a semântica de cada campo estão no [README do pacote](outputs/claude-code-live/README.md#contrato-do-job).
+
+A política padrão definida pelo usuário é **Opus 5 + UltraCode (Extra/xhigh)**. Toda nova execução solicita `claude-opus-5` com `xhigh`; Fable só é usado mediante pedido explícito para aquela tarefa. Telemetria de capacidade nunca troca o modelo nem reduz o esforço silenciosamente.
 
 ## Execução e acompanhamento local
 

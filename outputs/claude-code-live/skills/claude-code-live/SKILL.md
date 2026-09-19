@@ -9,6 +9,8 @@ CodeOrquestra e a marca visivel desta integracao local independente para o Codex
 
 Use o CLI instalado e a autenticacao existente: nada do Claude Code e empacotado nem substituido aqui, e nenhum SDK de fornecedor e importado em tempo de execucao. A skill coordena sessoes locais (pelo runtime desta skill) e sessoes na nuvem (pelo proprio CLI); escolha o destino por tarefa, nao por preferencia fixa. Nao transforme isso em automacao recorrente. O Codex coordena, orienta, decide e revisa; o encerramento do processo nunca prova que a tarefa foi aprovada.
 
+Politica padrao definida pelo usuario: toda nova execucao usa **Opus 5 + UltraCode (Extra/xhigh)**, com `model.requested: "claude-opus-5"` e `effort: "xhigh"`. "UltraCode" e o nome desta integracao para o perfil de programacao com esforco Extra; nao e um identificador oficial do provedor. Fable permanece compativel com historicos e contratos existentes, mas so pode ser escolhido para uma nova execucao mediante pedido explicito do usuario naquela tarefa. Capacidade baixa ou telemetria indisponivel nunca troca o modelo nem reduz o esforco automaticamente.
+
 Este documento e o contrato principal. Os detalhes do runtime (comandos, ferramentas MCP, estados, travas, worktrees, pareamento, orcamento) estao em `references/runtime-v2.md`; dados, confianca em personalizacoes, autenticacao e superficie HTTP em `references/security.md`; sessoes na nuvem em `references/cloud.md`. O runner PowerShell (v1) foi aposentado: um job no formato antigo (sem `contractVersion`, com `mode`, `allowedCommands` ou `timeoutPolicy`) e recusado com a orientacao de migracao, nunca reinterpretado.
 
 ## Escolher o destino
@@ -38,7 +40,7 @@ Campos do job:
 - `workspace`: caminho absoluto da pasta de trabalho autorizada.
 - `prompt` ou `promptFile`: texto ou caminho absoluto, sem segredos ou PII.
 - `profile`: `development` (ferramentas nativas completas dentro do escopo aprovado) ou `read` (somente leitura).
-- `model`: `{ "requested": "claude-fable-5-1" | "claude-opus-5", "reason": "<motivo>" }`; o identificador exato e obrigatorio e o motivo fica registrado. O runtime registra separadamente o modelo solicitado e o observado; divergencia encerra a execucao de forma visivel.
+- `model`: por padrao `{ "requested": "claude-opus-5", "reason": "Politica do usuario: Opus 5 UltraCode." }`; `claude-fable-5-1` permanece aceito apenas quando o usuario o pedir explicitamente naquela tarefa. O identificador exato e obrigatorio e o motivo fica registrado. O runtime registra separadamente o modelo solicitado e o observado; divergencia encerra a execucao de forma visivel.
 - `effort`: `xhigh`, o unico autorizado; um rebaixamento relatado pelo CLI para a execucao em vez de trabalhar em silencio com menos.
 - `coordination`: `phase`, `scopeId`, `approvalRevision`, `planSummary`, `planApproved` e `responsibilities` para as oito etapas.
 - `scope`: `summary` e `paths` (ou `wholeWorkspace: true`), obrigatorio na execucao; escrita fora do escopo escala ao coordenador.
@@ -67,7 +69,7 @@ Durante o trabalho, a sessao e duravel e multiturno:
 - `codeorquestra_answer` responde permissao ou pergunta do Claude com `requestId` e `runId` exatos. Esperar uma decisao nao e inatividade, mas depois de dois minutos o alerta `decision_pending` repete ate alguem responder.
 - `codeorquestra_interrupt` aborta **o turno**; a sessao continua aberta. `codeorquestra_end` encerra a sessao e reconcilia o worker e a arvore de processos ainda atribuivel. So a interrupcao explicita aborta um turno. Com `codeorquestra_end { afterTurn: true }` o encerramento espera o turno terminar sozinho e a execucao fecha `COMPLETED` em vez de `CANCELLED`; e o que usar quando a decisao e "pode terminar o que esta fazendo e parar".
 - `codeorquestra_set_policy { escalate, reason }` restringe o que a execucao faz sem perguntar, valendo ja na proxima chamada de ferramenta (inclusive no meio do turno). Use ao ver o alerta `thrashing`, que traz a ferramenta, a chamada e a contagem: restringir mantem o trabalho vivo, ao contrario de encerrar. Ela so acrescenta decisoes — nunca concede o que o contrato negou. `none` remove a restricao.
-- `codeorquestra_set_model` troca o modelo entre turnos, com motivo; no meio de um turno e recusado.
+- `codeorquestra_set_model` troca o modelo entre turnos, com motivo; no meio de um turno e recusado. A politica padrao nao autoriza trocar de Opus para Fable sem um pedido explicito do usuario.
 - `codeorquestra_list` devolve o historico da tarefa com o custo de cada execucao encerrada: desfecho, turnos, tokens observados (com a qualidade da contagem), duracao, chamadas e erros de ferramenta e se o orcamento esgotou. E a resposta para "quanto isso custou ate agora" sem reler o log.
 - `codeorquestra_usage_refresh` atualiza o bloco **Consumo por fonte**, somente leitura. Ele separa tokens Claude reportados, estimativa da tarefa Codex, limites e atividade Codex; nunca some provedores nem trate estimativa como medicao. Uma falha nele nao autoriza reduzir esforco, trocar modelo ou interromper Claude. Percentuais sao limites de uso da assinatura, nao saldo em dinheiro.
 
