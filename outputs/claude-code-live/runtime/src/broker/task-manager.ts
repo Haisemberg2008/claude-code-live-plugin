@@ -64,6 +64,7 @@ interface WorktreePlan {
   path: string;
   branch: string;
   baseRef: string | null;
+  fleetReservationId: string;
 }
 
 interface RunState {
@@ -87,6 +88,8 @@ interface RunState {
   observedModel: string | null;
   effortObservedByCli: string | null;
   sessionId: string | null;
+  /** Compatibility identity of the declared contract, before worktree rewriting. */
+  resumeFingerprint: string;
   workerPid: number | null;
   workerStartedAt: string | null;
   failureStage: string | null;
@@ -179,6 +182,7 @@ export interface TaskState {
   uncertain: boolean;
   disconnected: boolean;
   previousSessionId: string | null;
+  previousSessionFingerprint: string | null;
   quota: ReturnType<QuotaService['view']> | null;
   claudeUsage: ClaudeUsageAccumulator;
   codexUsage: CodexUsageView;
@@ -233,6 +237,8 @@ export class TaskManager {
   private stopping = false;
   /** Preparations in flight; shutdown awaits them before sweeping workers. */
   private readonly preparations = new Set<Promise<void>>();
+  /** Admission slots held while asynchronous worktree planning is still running. */
+  private readonly fleetReservations = new Map<string, Map<string, string>>();
 
   /** True once shutdown began: no further run may be admitted. */
   get isStopping(): boolean {
@@ -511,7 +517,7 @@ export class TaskManager {
     let claudeUsage = persistedUsage.status === 'ok' ? ClaudeUsageAccumulator.fromJSON(persistedUsage.value) : null;
     if (!claudeUsage) claudeUsage = ClaudeUsageAccumulator.fromEvents(await log.readFrom(0));
     const queue = await this.loadQueue(dir);
-    const pointer = await readJsonShared<{ sessionId?: string }>(path.join(dir, 'session.json'));
+    const pointer = await readJsonShared<{ sessionId?: string; resumeFingerprint?: string }>(path.join(dir, 'session.json'));
     const task: TaskState = {
       record,
       dir,
@@ -533,6 +539,7 @@ export class TaskManager {
       uncertain: record.requiresReview,
       disconnected: false,
       previousSessionId: pointer.status === 'ok' && typeof pointer.value.sessionId === 'string' ? pointer.value.sessionId : null,
+      previousSessionFingerprint: pointer.status === 'ok' && typeof pointer.value.resumeFingerprint === 'string' ? pointer.value.resumeFingerprint : null,
       quota: null,
       claudeUsage,
       codexUsage: unavailableCodexUsage(),
@@ -1201,9 +1208,13 @@ export class TaskManager {
     }
 
     // --- synchronous critical section: no await until the reservation exists.
-    if (task.run && !task.run.finalized) throw new HttpError(409, 'RUN_IN_PROGRESS', { runId: task.run.runId });
+    if (task.run && !task.run.finalized) {
+      this.releaseFleetReservation(worktreePlan);
+      throw new HttpError(409, 'RUN_IN_PROGRESS', { runId: task.run.runId });
+    }
     const holder = this.locks.get(workspaceKey);
     if (contract.capabilities.edit && holder && holder.holderTaskId !== task.record.taskId) {
+      this.releaseFleetReservation(worktreePlan);
       throw new HttpError(409, holder.quarantined ? 'WORKSPACE_LOCK_QUARANTINED' : 'WORKSPACE_WRITER_LOCKED', { holderTaskId: holder.holderTaskId, holderRunId: holder.holderRunId, acquiredAt: holder.acquiredAt, ...(holder.quarantined ? { note: holder.quarantineNote } : {}) });
     }
     // A quarantined lock means a process of the previous run may still be able
@@ -1211,6 +1222,7 @@ export class TaskManager {
     // ownership is released only by the explicit action that first re-checks
     // for survivors.
     if (holder?.quarantined && holder.holderTaskId === task.record.taskId) {
+      this.releaseFleetReservation(worktreePlan);
       throw new HttpError(409, 'WORKSPACE_LOCK_QUARANTINED', {
         holderRunId: holder.holderRunId,
         note: holder.quarantineNote,
@@ -1220,6 +1232,8 @@ export class TaskManager {
     const runId = `run-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     const runToken = randomUUID();
     const runDir = path.join(task.dir, 'runs', runId);
+    const resumeFingerprint = contractResumeFingerprint(contract);
+    const resumeSessionId = task.previousSessionFingerprint === resumeFingerprint ? task.previousSessionId : null;
     const run: RunState = {
       runId,
       runToken,
@@ -1233,7 +1247,8 @@ export class TaskManager {
       modelReason: contract.model.reason,
       observedModel: null,
       effortObservedByCli: null,
-      sessionId: task.previousSessionId,
+      sessionId: resumeSessionId,
+      resumeFingerprint,
       workerPid: null,
       workerStartedAt: null,
       failureStage: null,
@@ -1248,7 +1263,7 @@ export class TaskManager {
       thrashing: null,
       policy: null,
       endAfterTurn: null,
-      resumeMode: task.previousSessionId ? 'automatic' : 'new',
+      resumeMode: resumeSessionId ? 'automatic' : 'new',
       simulated: false,
       declaredWorkspace: worktreePlan ? workspace : null,
       worktree: worktreePlan,
@@ -1278,6 +1293,7 @@ export class TaskManager {
     task.pending.clear();
     task.workerReady = false;
     task.record.workspace = workspace;
+    this.releaseFleetReservation(worktreePlan);
     // --- end of critical section.
 
     try {
@@ -1431,25 +1447,43 @@ export class TaskManager {
       && other.run
       && !other.run.finalized
       && other.run.worktree?.repository.repoKey === repository.repoKey);
-    if (active.length >= policy.maxParallelRuns) {
+    const reservations = this.fleetReservations.get(repository.repoKey) ?? new Map<string, string>();
+    this.fleetReservations.set(repository.repoKey, reservations);
+    if (active.length + reservations.size >= policy.maxParallelRuns) {
       throw new HttpError(429, 'FLEET_CAPACITY_REACHED', {
         limit: policy.maxParallelRuns,
-        holders: active.map((other) => ({ taskId: other.record.taskId, threadId: other.record.threadId, runId: other.run?.runId ?? null })),
-        message: `Já existem ${active.length} execução(ões) em worktree neste repositório, o limite aprovado. Aguarde uma terminar ou ajuste maxParallelRuns na política.`,
+        holders: [
+          ...active.map((other) => ({ taskId: other.record.taskId, threadId: other.record.threadId, runId: other.run?.runId ?? null })),
+          ...[...reservations.values()].map((taskId) => ({ taskId, threadId: this.tasks.get(taskId)?.record.threadId ?? null, runId: null })),
+        ],
+        message: `Já existem ${active.length + reservations.size} execução(ões) admitidas ou em preparação neste repositório, o limite aprovado. Aguarde uma terminar ou ajuste maxParallelRuns na política.`,
       });
     }
+    const fleetReservationId = randomUUID();
+    reservations.set(fleetReservationId, task.record.taskId);
     const root = policy.worktreeRoot ?? this.stateRoot;
     const location = worktreePathFor(root, repository.repoKey, task.record.taskId);
     try {
       assertUsablePathLength(location.path);
     } catch (error) {
+      reservations.delete(fleetReservationId);
+      if (reservations.size === 0) this.fleetReservations.delete(repository.repoKey);
       throw new HttpError(400, (error as { code?: string }).code ?? 'WORKTREE_PATH_TOO_LONG', { message: (error as Error).message });
     }
     // Uncommitted work is never deleted, so retention is what fills a disk.
     // Refusing with a number beats discovering it when the volume is full.
-    const retained = await listOrphans(root, () => false);
+    let retained;
+    try {
+      retained = await listOrphans(root, () => false);
+    } catch (error) {
+      reservations.delete(fleetReservationId);
+      if (reservations.size === 0) this.fleetReservations.delete(repository.repoKey);
+      throw error;
+    }
     const mine = retained.filter((entry) => entry.repoKey === repository.repoKey && canonicalize(entry.path) !== canonicalizePlanned(location.path));
     if (mine.length >= policy.maxRetainedWorktrees) {
+      reservations.delete(fleetReservationId);
+      if (reservations.size === 0) this.fleetReservations.delete(repository.repoKey);
       throw new HttpError(409, 'WORKTREE_RETENTION_LIMIT', {
         limit: policy.maxRetainedWorktrees,
         retained: mine.map((entry) => ({ path: entry.path, dirtyFiles: entry.dirtyFiles.length })),
@@ -1462,7 +1496,15 @@ export class TaskManager {
       path: location.path,
       branch: contract.execution.worktree?.branch ?? `codeorquestra/${task.record.taskId.slice(0, 16)}`,
       baseRef: contract.execution.worktree?.baseRef ?? null,
+      fleetReservationId,
     };
+  }
+
+  private releaseFleetReservation(plan: WorktreePlan | null): void {
+    if (!plan) return;
+    const reservations = this.fleetReservations.get(plan.repository.repoKey);
+    reservations?.delete(plan.fleetReservationId);
+    if (reservations?.size === 0) this.fleetReservations.delete(plan.repository.repoKey);
   }
 
   /**
@@ -1954,7 +1996,8 @@ export class TaskManager {
       }
       if (run.sessionId && run.sessionConfirmed) {
         task.previousSessionId = run.sessionId;
-        await writeFileAtomic(path.join(task.dir, 'session.json'), JSON.stringify({ sessionId: run.sessionId, runId: run.runId, updatedAt: endedAt, resultFile: path.join(runDir, 'resultado.json') }, null, 2));
+        task.previousSessionFingerprint = run.resumeFingerprint;
+        await writeFileAtomic(path.join(task.dir, 'session.json'), JSON.stringify({ sessionId: run.sessionId, resumeFingerprint: task.previousSessionFingerprint, runId: run.runId, updatedAt: endedAt, resultFile: path.join(runDir, 'resultado.json') }, null, 2));
       }
       await this.writeCurrentRunBestEffort(task, { runId: run.runId, runToken: run.runToken, status, workerPid: null, workerStartedAt: run.workerStartedAt, startedAt: run.startedAt, workspace: run.contract.workspace, writerLockKey: null, runDir });
       // Produce compatibility artefacts from a private terminal projection.
@@ -2568,7 +2611,24 @@ const THRASHING_NOTE = 'A execução repete a mesma chamada ou acumula falhas. N
 
 const END_AFTER_TURN_NOTE = 'Encerramento pedido para quando o turno atual terminar. O turno não é interrompido e nenhuma orientação nova é entregue; a execução fecha como COMPLETED.';
 
-const BUDGET_EXHAUSTED_NOTE = 'Orçamento da execução esgotado: o turno em andamento termina normalmente, mas nenhum outro é entregue. Para continuar, encerre esta execução e inicie outra na mesma tarefa com limits maior e approvalRevision maior; a sessão anterior é retomada automaticamente.';
+const BUDGET_EXHAUSTED_NOTE = 'Orçamento da execução esgotado: o turno em andamento termina normalmente, mas nenhum outro é entregue. Para continuar, encerre esta execução e inicie outra com limits maior e approvalRevision maior; a mudança de revisão abre uma sessão nova.';
+
+function contractResumeFingerprint(contract: JobContract): string {
+  return sha256(JSON.stringify({
+    workspace: canonicalizePlanned(contract.workspace),
+    profile: contract.profile,
+    model: contract.model.requested,
+    effort: contract.effort,
+    phase: contract.coordination.phase,
+    scopeId: contract.coordination.scopeId,
+    approvalRevision: contract.coordination.approvalRevision,
+    planSummary: contract.coordination.planSummary,
+    responsibilities: contract.coordination.responsibilities,
+    scope: contract.scope,
+    execution: contract.execution,
+    auth: contract.auth,
+  }));
+}
 
 /**
  * Pure: what the run spent against what the job allowed. Null when the job set

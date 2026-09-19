@@ -395,6 +395,7 @@ export class Broker {
         return sendJson(res, 200, { inventory: inventory.toJSON(), trust });
       }
       if (action === 'diff' && method === 'GET') {
+        this.bindHandle(identity, task, body, url);
         const file = url.searchParams.get('file');
         if (!file) throw new HttpError(400, 'FILE_REQUIRED');
         return sendJson(res, 200, await this.tasks.fileDiff(task, file));

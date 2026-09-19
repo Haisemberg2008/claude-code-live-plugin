@@ -74,7 +74,7 @@ O painel mostra o feed público cronológico, o inspetor (modelo, esforço, exec
 
 ## Retomada
 
-Na mesma tarefa Codex, a execução seguinte retoma automaticamente a última sessão Claude e entrega o que ficou na fila. Retomar não desfaz edições nem repete ferramentas: reinspecione o estado primeiro. Qualquer mudança aprovada exige `approvalRevision` maior; um fim de sessão que ninguém pediu deixa a execução `UNCERTAIN` e exige revisão explícita antes de outra.
+Na mesma tarefa Codex, a execução seguinte retoma a última sessão Claude somente quando workspace, perfil, modelo, esforço, plano, revisão, responsáveis, escopo, destino e política de autenticação continuam compatíveis. Mudança material cria uma sessão nova, sem importar contexto anterior. Retomar não desfaz edições nem repete ferramentas: reinspecione o estado primeiro. Um fim de sessão que ninguém pediu deixa a execução `UNCERTAIN` e exige revisão explícita antes de outra.
 
 ## Sessões na nuvem
 

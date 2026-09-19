@@ -155,8 +155,9 @@ describe('a token budget', () => {
     const sessionId = ended.previousSessionId;
     assert.ok(sessionId, 'a sessão sobrevive ao orçamento');
 
-    // Raising the budget is a new run under a new approval, in the same task,
-    // which resumes the same session on its own. The guidance that stayed
+    // Raising the budget is a new run under a new approval, in the same task.
+    // A changed approval revision deliberately starts a fresh Claude session;
+    // the guidance that stayed
     // queued was accepted, not lost: it is delivered as soon as there is
     // budget again, right after the new prompt.
     const reopenedRunId = await startRun(taskId, taskHandle, workspace, script(['say: cinco']), {
@@ -164,8 +165,8 @@ describe('a token budget', () => {
       coordination: coordination({ approvalRevision: 2 }),
     });
     const reopened = await idleAfterTurns(taskId, 2);
-    assert.equal(reopened.currentRun?.sessionId, sessionId);
-    assert.equal(reopened.currentRun?.resumeMode, 'automatic');
+    assert.notEqual(reopened.currentRun?.sessionId, sessionId);
+    assert.equal(reopened.currentRun?.resumeMode, 'new');
     assert.ok((await events(taskId)).some((event) => event.runId === reopenedRunId && event.type === 'assistant_text' && event.data.text === 'três'), 'a orientação que ficou na fila foi entregue na nova execução');
     assert.deepEqual(reopened.queue.map((entry) => entry.state), ['delivered', 'delivered']);
     assert.deepEqual(reopened.currentRun?.budget?.tokens, { used: 2 * TOKENS_PER_TURN, limit: 200 });

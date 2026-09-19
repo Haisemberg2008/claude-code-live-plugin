@@ -387,10 +387,19 @@ function checkReadTarget(context, candidate, outside) {
   }
   return null;
 }
-function checkWriteTarget(target, context) {
+function checkWriteTarget(target, context, shellExpression = false) {
   const capabilities = capabilitiesOf(context);
   if (!capabilities.edit) {
     return context.responsibilities.implementation === "claude" ? result("deny", "CAPABILITY_EDIT_NOT_GRANTED", { path: target }) : result("deny", "NOT_ASSIGNED_IMPLEMENTATION", { path: target });
+  }
+  if (shellExpression) {
+    const filesystemDrive = /^[A-Za-z]:[\\/]/.test(target);
+    const providerPath = target.includes("::") || /^[A-Za-z][A-Za-z0-9_.-]*:/.test(target) && !filesystemDrive;
+    const literalPart = filesystemDrive ? target.slice(2) : target;
+    const dynamicSyntax = /[^A-Za-z0-9._/\\ +\-]/.test(literalPart);
+    if (target.startsWith("~") || providerPath || dynamicSyntax) {
+      return result("escalate", "DYNAMIC_WRITE_TARGET", { path: target });
+    }
   }
   if (isSensitivePath(target)) return result("deny", "SENSITIVE_FILE", { path: target });
   const resolved = resolveWorkspacePath(context.workspace, target);
@@ -420,7 +429,7 @@ function classifyFileAction(tool, input, context) {
   return result("allow", "IN_WORKSPACE_READ");
 }
 function splitSegments(command) {
-  return command.split(/\r?\n|&&|\|\||;|\|/).map((segment) => segment.trim()).filter((segment) => segment.length > 0);
+  return command.split(/\r?\n|&&|\|\||;|\||(?<![&<>])&(?!&)/).map((segment) => segment.trim()).filter((segment) => segment.length > 0);
 }
 function stripEnvAssignments(segment) {
   return segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, "");
@@ -513,6 +522,16 @@ function optionWriteTargets(segmentTokens) {
     }
   };
   switch (command) {
+    case "touch":
+    case "mkdir":
+    case "md":
+    case "new-item":
+    case "ni":
+    case "chmod":
+    case "attrib":
+    case "icacls":
+      targets.push(...positionals(segmentTokens));
+      break;
     case "sort":
       valueAfter(["-o", "--output"]);
       break;
@@ -590,7 +609,7 @@ function classifyCommandSegment(segment, context, whole) {
   }
   const writes = [...redirect.outputs, ...optionWriteTargets(segmentTokens)];
   for (const target of writes) {
-    const problem = checkWriteTarget(target, context);
+    const problem = checkWriteTarget(target, context, true);
     if (problem) return problem;
   }
   for (const candidate of pathArguments(segmentTokens)) {
@@ -612,6 +631,7 @@ function classifyCommandSegment(segment, context, whole) {
   if (PROCESS_KILL_BROAD.test(base)) return result("escalate", "PROCESS_KILL_BROAD");
   if (PROCESS_KILL.test(base)) return result("escalate", "PROCESS_KILL");
   if (GIT_STATE_RULES.test(base)) return result("escalate", "GIT_STATE_CHANGE");
+  if (/^(git\s+apply|patch)\b/i.test(base)) return result("escalate", "UNCLASSIFIED_COMMAND", { command: stripped });
   let category = null;
   if (INSPECTION_RULES.some((rule) => rule.test(base))) {
     if (!canRead(context.responsibilities)) return result("deny", "NOT_ASSIGNED_INSPECTION");

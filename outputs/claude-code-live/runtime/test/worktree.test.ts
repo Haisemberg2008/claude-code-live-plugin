@@ -124,6 +124,15 @@ describe('provisioning', () => {
     await access(path.join(target, 'src', 'novo.ts'));
   });
 
+  test('never reuses a clean worktree under a different declared branch', async () => {
+    const target = worktreePathFor(stateRoot, repository.repoKey, 'task-branch-mismatch').path;
+    await ensureWorktree({ repository, target, branch: 'codeorquestra/first', baseRef: 'main' });
+    await assert.rejects(
+      ensureWorktree({ repository, target, branch: 'codeorquestra/second', baseRef: 'main' }),
+      (error: unknown) => (error as { code?: string }).code === 'WORKTREE_BRANCH_MISMATCH',
+    );
+  });
+
   test('a directory that is not this repository is never adopted', async () => {
     const target = worktreePathFor(stateRoot, repository.repoKey, 'task-occupied-0001').path;
     await mkdir(target, { recursive: true });

@@ -345,6 +345,36 @@ describe('a restriction the coordinator applies mid-run', () => {
     }
   });
 
+  test('a single ampersand cannot hide reserved or external commands', () => {
+    for (const command of [
+      'echo ok & git commit -m bypass',
+      'echo ok & git push origin main',
+      'echo ok & npm publish',
+      'echo ok & curl https://example.com',
+    ]) {
+      assert.notEqual(classify('Bash', { command }).decision, 'allow', command);
+    }
+  });
+
+  test('implementation commands validate their real write targets against scope and git admin', () => {
+    const srcOnly: Partial<ActionContext> = { scopePaths: ['src/'] };
+    for (const command of ['touch docs/outside.txt', 'mkdir docs/new', 'chmod 777 docs/outside.txt']) {
+      assert.deepEqual(pick(classify('Bash', { command }, srcOnly)), { decision: 'escalate', reason: 'OUTSIDE_SCOPE_PATH' }, command);
+    }
+    assert.deepEqual(pick(classify('Bash', { command: 'touch .git/hooks/pre-commit' }, srcOnly)), { decision: 'deny', reason: 'GIT_ADMIN_AREA' });
+    for (const command of ['git apply patch.diff', 'patch -p0 < patch.diff']) {
+      assert.notEqual(classify('Bash', { command }, srcOnly).decision, 'allow', command);
+    }
+    for (const command of ['mkdir ~/fora', 'mkdir ~root/fora', 'mkdir ~-/fora', 'touch $HOME/fora', 'touch src/{ok,../../fora}', 'touch src/*.ts', 'New-Item HKCU:\\Software\\CodeOrquestraReview', 'New-Item Registry::HKEY_CURRENT_USER\\Software\\CodeOrquestraReview', 'New-Item Microsoft.PowerShell.Core\\Registry::HKEY_CURRENT_USER\\Software\\CodeOrquestraReview', 'New-Item Cert:\\CurrentUser\\CodeOrquestraReview', "Add-Content -Path ('C:\\outside') -Value x", "Add-Content -Path @('src/a','C:\\outside') -Value x", 'Add-Content -Path src/a,C:\\outside -Value x']) {
+      assert.deepEqual(pick(classify('Bash', { command }, srcOnly)), { decision: 'escalate', reason: 'DYNAMIC_WRITE_TARGET' }, command);
+    }
+  });
+
+  test('native file tools keep literal unicode and route-segment paths', () => {
+    assert.equal(classify('Write', { file_path: 'C:\\ws\\projeto\\src\\Aplicação\\[id]\\page.tsx' }).decision, 'allow');
+    assert.equal(classify('Edit', { file_path: 'C:\\ws\\projeto\\src\\Aplicação\\[id]\\page.tsx' }).decision, 'allow');
+  });
+
   test('tools with no external effect are never gated, so nobody is asked twice', () => {
     for (const tool of ['TodoWrite', 'AskUserQuestion', 'ExitPlanMode']) {
       assert.equal(classify(tool, {}, { escalate: 'all' }).decision, 'allow', tool);

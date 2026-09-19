@@ -238,6 +238,14 @@ describe('v2 execution target', () => {
     assertThrowsCode(() => resolveJobContract(jobV2(workspace, { limits: { maxTokens: 5000, maxCost: 5 } })), 'LIMITS_INVALID');
   });
 
+  test('unknown root fields are refused so authorization typos fail closed', () => {
+    const typoProfile = jobV2(workspace) as Record<string, unknown>;
+    delete typoProfile.profile;
+    typoProfile.profiles = 'read';
+    assertThrowsCode(() => resolveJobContract(typoProfile), 'JOB_FIELD_UNEXPECTED');
+    assertThrowsCode(() => resolveJobContract({ ...jobV2(workspace), limit: { maxTokens: 1 } }), 'JOB_FIELD_UNEXPECTED');
+  });
+
 });
 
 describe('the retired v1 contract', () => {

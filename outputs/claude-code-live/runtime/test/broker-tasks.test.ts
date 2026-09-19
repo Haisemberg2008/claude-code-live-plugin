@@ -42,6 +42,7 @@ interface TaskView {
     runId: string;
     status: string;
     sessionId: string | null;
+    resumeMode: 'new' | 'automatic' | 'explicit';
     requestedModel: string;
     modelReason: string;
     observedModel: string | null;
@@ -428,6 +429,24 @@ describe('trust gating and run with exact model, Extra effort and a durable sess
     const otherIdle = await waitForState(other.taskId, 'idle');
     assert.notEqual(otherIdle.currentRun?.sessionId, first);
     await endTask(other.taskId);
+  });
+
+  test('a materially different contract starts a fresh Claude session', async () => {
+    const registered = await register('thread-resume-compatibility');
+    await approveTrust(registered.taskId, workspaceA);
+    await startRun(registered.taskId, registered.taskHandle, devJob(workspaceA, 'say: primeira'));
+    const first = await waitForState(registered.taskId, 'idle');
+    const firstSession = first.currentRun?.sessionId;
+    assert.ok(firstSession);
+    await endTask(registered.taskId);
+
+    await approveTrust(registered.taskId, workspaceB);
+    await startRun(registered.taskId, registered.taskHandle, devJob(workspaceB, 'say: segunda'));
+    const second = await waitForState(registered.taskId, 'idle');
+    assert.notEqual(second.currentRun?.sessionId, firstSession);
+    const trace = await readTrace(second.currentRun!.workerPid!);
+    assert.equal(trace.find((entry) => entry.kind === 'query')!.data.resume, null);
+    await endTask(registered.taskId);
   });
 
   test('an effort downgrade reported by the CLI stops the run visibly instead of working silently', async () => {
@@ -999,8 +1018,10 @@ describe('failures and recovery', () => {
   });
 
   test('after a broker restart, in-flight work is uncertain and queued messages are not replayed', async () => {
+    const recoveryWorkspace = path.join(temp.root, 'ws-recovery-quarantine');
+    await mkdir(path.join(recoveryWorkspace, 'src'), { recursive: true });
     const { taskId, taskHandle } = await register('thread-restart');
-    await startRun(taskId, taskHandle, devJob(workspaceB, script(['say: antes', 'sleep: 60000'])));
+    await startRun(taskId, taskHandle, devJob(recoveryWorkspace, script(['say: antes', 'sleep: 60000'])));
     const busy = await waitForState(taskId, 'busy_tool');
     const queued = await broker.api(`/api/tasks/${taskId}/message`, { method: 'POST', headers: broker.bearerHeaders(), body: JSON.stringify({ text: 'say: não replay' }) });
     const messageId = (queued.body as { messageId: string }).messageId;
@@ -1309,6 +1330,23 @@ describe('parallel worktrees', () => {
     assert.ok(firstView.workspace && firstView.workspace !== repoWorkspace, 'a execução roda no worktree, não no checkout declarado');
   });
 
+  test('an unchanged worktree contract resumes its own Claude session', async () => {
+    await enrol();
+    const { taskId, taskHandle } = await register('thread-wt-resume');
+    await approveTrust(taskId, repoWorkspace);
+    const job = devJob(repoWorkspace, 'say: worktree', { execution: { mode: 'worktree' } });
+    await startRun(taskId, taskHandle, job);
+    const first = await waitForState(taskId, 'idle');
+    const sessionId = first.currentRun?.sessionId;
+    assert.ok(sessionId);
+    await endTask(taskId);
+    await startRun(taskId, taskHandle, job);
+    const resumed = await waitForState(taskId, 'idle');
+    assert.equal(resumed.currentRun?.sessionId, sessionId);
+    assert.equal(resumed.currentRun?.resumeMode, 'automatic');
+    await endTask(taskId);
+  });
+
   test('the fleet cap refuses the next run and names who holds the slots', async () => {
     // Its own repository: the cap counts live runs, so sharing one with the
     // test above would make this assert about that test's leftovers.
@@ -1328,19 +1366,22 @@ describe('parallel worktrees', () => {
     const second = await register('thread-wt-teto-b');
     await approveTrust(first.taskId, capRepo);
     const job = (prompt: string) => devJob(capRepo, prompt, { execution: { mode: 'worktree' } });
-    await startRun(first.taskId, first.taskHandle, job('sleep: 1500'));
-
-    const refused = await broker.api(`/api/tasks/${second.taskId}/runs`, {
+    const start = (target: typeof first, prompt: string) => broker.api(`/api/tasks/${target.taskId}/runs`, {
       method: 'POST', headers: broker.bearerHeaders(),
-      body: JSON.stringify({ taskHandle: second.taskHandle, job: job('say: nao deve iniciar'), observation: { mode: 'voz' } }),
+      body: JSON.stringify({ taskHandle: target.taskHandle, job: job(prompt), observation: { mode: 'voz' } }),
     });
+    const attempts = await Promise.all([start(first, 'sleep: 1500'), start(second, 'say: nao deve iniciar')]);
+    const accepted = attempts.filter((attempt) => attempt.status === 202);
+    const refused = attempts.find((attempt) => attempt.status === 429)!;
+    assert.equal(accepted.length, 1, attempts.map((attempt) => `${attempt.status}:${attempt.text}`).join('\n'));
+    assert.ok(refused, attempts.map((attempt) => `${attempt.status}:${attempt.text}`).join('\n'));
     assert.equal(refused.status, 429, refused.text);
     const body = refused.body as { error?: string; limit?: number; holders?: Array<{ taskId: string }> };
     assert.equal(body.error, 'FLEET_CAPACITY_REACHED');
     assert.equal(body.limit, 1);
     // Naming the holders is the point: N sessions share one account, so the
     // user has to know what to wait for.
-    assert.deepEqual(body.holders?.map((holder) => holder.taskId), [first.taskId]);
+    assert.equal(body.holders?.length, 1);
   });
 });
 
@@ -1386,6 +1427,9 @@ describe('diff annotations', () => {
     const diff = await broker.api(`/api/tasks/${taskId}/diff?file=${encodeURIComponent('src/anotado.ts')}&taskHandle=${encodeURIComponent(taskHandle)}`, { headers: broker.bearerHeaders() });
     assert.equal(diff.status, 200, diff.text);
     assert.equal((diff.body as { file: string }).file, 'src/anotado.ts');
+    const diffWithoutHandle = await broker.api(`/api/tasks/${taskId}/diff?file=${encodeURIComponent('src/anotado.ts')}`, { headers: broker.bearerHeaders({ [CLIENT_HEADER_NAME]: 'mcp' }) });
+    assert.equal(diffWithoutHandle.status, 403, diffWithoutHandle.text);
+    assert.equal((diffWithoutHandle.body as { error?: string }).error, 'TASK_HANDLE_REQUIRED');
 
     const sensitive = await broker.api(`/api/tasks/${taskId}/diff?file=${encodeURIComponent('.env')}&taskHandle=${encodeURIComponent(taskHandle)}`, { headers: broker.bearerHeaders() });
     assert.ok(sensitive.status === 400 || sensitive.status === 403, sensitive.text);

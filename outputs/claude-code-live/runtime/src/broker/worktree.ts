@@ -258,7 +258,7 @@ export interface EnsureOutcome {
 }
 
 /** A worktree that already exists and is usable, or null when there is none. */
-async function inspectExisting(target: string, repository: Repository): Promise<{ reusable: boolean; dirty: string[] } | null> {
+async function inspectExisting(target: string, repository: Repository): Promise<{ reusable: boolean; dirty: string[]; branch: string | null } | null> {
   try {
     await fs.access(target);
   } catch {
@@ -270,7 +270,8 @@ async function inspectExisting(target: string, repository: Repository): Promise<
   if (common.code !== 0 || canonicalize(common.stdout.trim()) !== repository.commonDir) {
     throw new WorktreeError('WORKTREE_PATH_OCCUPIED', 'Já existe um diretório nesse caminho que não é um worktree deste repositório. Nada foi removido; resolva manualmente.');
   }
-  return { reusable: true, dirty: await gitStatus(target) };
+  const branch = await git(['branch', '--show-current'], target);
+  return { reusable: true, dirty: await gitStatus(target), branch: branch.code === 0 ? branch.stdout.trim() || null : null };
 }
 
 /**
@@ -300,13 +301,23 @@ export async function ensureWorktree(options: {
         existing.dirty.slice(0, 20).join(', '),
       );
     }
+    if (existing.branch !== branch) {
+      throw new WorktreeError(
+        'WORKTREE_BRANCH_MISMATCH',
+        `O worktree existente está na branch ${existing.branch ?? 'desanexada'}, mas esta execução pediu ${branch}. Nada foi alterado; revise ou remova o worktree antes de continuar.`,
+      );
+    }
     return { path: target, branch, baseRef, created: false };
   }
   await fs.mkdir(path.dirname(target), { recursive: true });
-  // --no-track keeps the branch local. Never -B (it resets an existing branch,
-  // discarding commits) and never --force (it adopts a dirty path).
-  const args = ['worktree', 'add', '--no-track', '-b', branch, target];
-  if (baseRef) args.push(baseRef);
+  // A clean worktree may have been removed after an earlier run while its
+  // task branch remains. Reattach that branch instead of trying to recreate
+  // it. Never -B (it resets an existing branch, discarding commits) and never
+  // --force (it adopts a dirty path).
+  const branchProbe = await git(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], repository.topLevel);
+  const args = branchProbe.code === 0
+    ? ['worktree', 'add', target, branch]
+    : ['worktree', 'add', '--no-track', '-b', branch, target, ...(baseRef ? [baseRef] : [])];
   const result = await git(args, repository.topLevel, GIT_PROVISION_TIMEOUT_MS);
   if (result.code !== 0) {
     // Leave no half-created registration behind for the next run to trip on.

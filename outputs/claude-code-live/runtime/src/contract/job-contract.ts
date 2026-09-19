@@ -338,6 +338,16 @@ function resolveExecution(job: Dict, coordination: Coordination, profile: 'devel
 }
 
 function resolveV2(job: Dict): JobContract {
+  const allowed = new Set([
+    'contractVersion', 'workspace', 'prompt', 'promptFile', 'profile', 'model',
+    'effort', 'coordination', 'scope', 'execution', 'codexThreadId', 'auth',
+    'limits', 'resumeFrom',
+  ]);
+  for (const key of Object.keys(job)) {
+    if (!allowed.has(key) && !Object.prototype.hasOwnProperty.call(V1_FIELD_REPLACEMENTS, key)) {
+      throw new ContractError('JOB_FIELD_UNEXPECTED', `O job contém o campo inesperado ${key}; campos desconhecidos são recusados para que erros de digitação não ampliem permissões.`);
+    }
+  }
   for (const [field, replacement] of Object.entries(V1_FIELD_REPLACEMENTS)) {
     if (Object.prototype.hasOwnProperty.call(job, field)) throw new ContractError('LEGACY_FIELD_IN_V2', `O campo ${field} pertencia ao contrato v1, aposentado; no v2, ${replacement}.`);
   }

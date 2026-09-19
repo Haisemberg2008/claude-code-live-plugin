@@ -399,12 +399,26 @@ function checkReadTarget(context: ActionContext, candidate: string, outside: 'de
 }
 
 /** Shared write-target policy: capability, sensitivity, containment, scope. */
-function checkWriteTarget(target: string, context: ActionContext): ActionResult | null {
+function checkWriteTarget(target: string, context: ActionContext, shellExpression = false): ActionResult | null {
   const capabilities = capabilitiesOf(context);
   if (!capabilities.edit) {
     return context.responsibilities.implementation === 'claude'
       ? result('deny', 'CAPABILITY_EDIT_NOT_GRANTED', { path: target })
       : result('deny', 'NOT_ASSIGNED_IMPLEMENTATION', { path: target });
+  }
+  // Containment can only be proven for a literal path. Shell expansion happens
+  // after this classifier, so variables, home expansion, globs and brace
+  // expansion could resolve somewhere outside the approved workspace/scope.
+  if (shellExpression) {
+    const filesystemDrive = /^[A-Za-z]:[\\/]/.test(target);
+    const providerPath = target.includes('::') || (/^[A-Za-z][A-Za-z0-9_.-]*:/.test(target) && !filesystemDrive);
+    const literalPart = filesystemDrive ? target.slice(2) : target;
+    // This is intentionally an allowlist. A shell expression is not a path and
+    // cannot be proved contained without evaluating it in that shell.
+    const dynamicSyntax = /[^A-Za-z0-9._/\\ +\-]/.test(literalPart);
+    if (target.startsWith('~') || providerPath || dynamicSyntax) {
+      return result('escalate', 'DYNAMIC_WRITE_TARGET', { path: target });
+    }
   }
   if (isSensitivePath(target)) return result('deny', 'SENSITIVE_FILE', { path: target });
   const resolved = resolveWorkspacePath(context.workspace, target);
@@ -439,7 +453,7 @@ function classifyFileAction(tool: string, input: Record<string, unknown>, contex
 
 function splitSegments(command: string): string[] {
   return command
-    .split(/\r?\n|&&|\|\||;|\|/)
+    .split(/\r?\n|&&|\|\||;|\||(?<![&<>])&(?!&)/)
     .map((segment) => segment.trim())
     .filter((segment) => segment.length > 0);
 }
@@ -559,6 +573,16 @@ function optionWriteTargets(segmentTokens: string[]): string[] {
     }
   };
   switch (command) {
+    case 'touch':
+    case 'mkdir':
+    case 'md':
+    case 'new-item':
+    case 'ni':
+    case 'chmod':
+    case 'attrib':
+    case 'icacls':
+      targets.push(...positionals(segmentTokens));
+      break;
     case 'sort':
       valueAfter(['-o', '--output']);
       break;
@@ -634,7 +658,7 @@ function classifyCommandSegment(segment: string, context: ActionContext, whole: 
   }
   const writes = [...redirect.outputs, ...optionWriteTargets(segmentTokens)];
   for (const target of writes) {
-    const problem = checkWriteTarget(target, context);
+    const problem = checkWriteTarget(target, context, true);
     if (problem) return problem;
   }
   // Containment is decided on tokens that really look like paths; sensitivity
@@ -659,6 +683,9 @@ function classifyCommandSegment(segment: string, context: ActionContext, whole: 
   if (PROCESS_KILL_BROAD.test(base)) return result('escalate', 'PROCESS_KILL_BROAD');
   if (PROCESS_KILL.test(base)) return result('escalate', 'PROCESS_KILL');
   if (GIT_STATE_RULES.test(base)) return result('escalate', 'GIT_STATE_CHANGE');
+  // A patch names its write targets inside the patch document, not reliably on
+  // the command line. The text classifier cannot prove scope containment.
+  if (/^(git\s+apply|patch)\b/i.test(base)) return result('escalate', 'UNCLASSIFIED_COMMAND', { command: stripped });
   let category: ActionResult | null = null;
   if (INSPECTION_RULES.some((rule) => rule.test(base))) {
     if (!canRead(context.responsibilities)) return result('deny', 'NOT_ASSIGNED_INSPECTION');

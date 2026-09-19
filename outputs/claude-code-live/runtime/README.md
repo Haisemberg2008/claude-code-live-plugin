@@ -117,6 +117,7 @@ Redação de segredos é melhor esforço, não garantia. Filtros de texto não s
 * pedidos de permissão e perguntas têm ciclo de vida único por `requestId` + `runId`; respostas duplicadas, obsoletas ou de outra execução são recusadas;
 * 20 min sem atividade e 2 h decorridas **alertam**, nunca encerram;
 * incerteza sobrevive a reinício do broker e exige revisão explícita; mensagens enfileiradas nunca são reenviadas automaticamente;
+* retomada automática exige compatibilidade do contrato anterior; mudança de workspace, perfil, modelo, esforço, plano, revisão, responsáveis, escopo, destino ou autenticação inicia uma sessão nova;
 * terminação cooperativa é escopada ao processo registrado e à árvore ainda atribuível — nunca por nome. Identidade de criação e batimento reduzem enganos de PID, mas não são isolamento do SO: no Windows, um intermediário já encerrado pode ocultar um descendente órfão da visão por PPID;
 * reinício, desaparecimento do worker, saída anormal/desconhecida do CLI e falha de finalização usam reconciliação estrita e mantêm a trava em quarentena quando a árvore histórica não pode ser provada. `COMPLETED` confirma o término correlacionado da sessão supervisionada, não a ausência matemática de todo processo em segundo plano;
 * liberar uma quarentena é uma exceção exclusiva do administrador local: requer nota, reconhecimento explícito do risco e a identidade exata da posse, relida antes da remoção. A auditoria não retoma a sessão, não reenvia fila e não aprova artefatos;

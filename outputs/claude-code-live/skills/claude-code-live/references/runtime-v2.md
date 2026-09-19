@@ -319,8 +319,8 @@ combinacao das tres dimensoes:
   respondem `409 BUDGET_EXHAUSTED`, e o que ja estava na fila fica na fila,
   entregue quando houver orcamento de novo (na proxima execucao da tarefa).
 - Para continuar, encerre a execucao e inicie outra na mesma tarefa com
-  `limits` maior e `approvalRevision` maior; a sessao anterior e retomada
-  automaticamente. Subir o orcamento e uma re-aprovacao, e passa pelo
+  `limits` maior e `approvalRevision` maior; como a revisao mudou, a execucao
+  abre uma sessao nova. Subir o orcamento e uma re-aprovacao, e passa pelo
   mecanismo de re-aprovacao que ja existe.
 - `timeoutPolicy` e `timeoutSeconds` do formato v1 sao recusados com
   `LEGACY_FIELD_IN_V2`; `limits.maxRuntimeSeconds` e o equivalente, com a

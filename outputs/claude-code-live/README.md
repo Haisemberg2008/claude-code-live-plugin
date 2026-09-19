@@ -74,7 +74,7 @@ Cada execução preserva o log de eventos append-only e deriva `acompanhamento.t
 
 ## Retomar
 
-Na mesma tarefa Codex, a execução seguinte retoma automaticamente a última sessão Claude; a fila de orientações que ficou pendente é entregue quando houver turno. Retomar não desfaz edições nem repete ferramentas: reinspecione o estado e diga no prompt seguinte o que falta. Qualquer mudança aprovada exige `approvalRevision` maior.
+Na mesma tarefa Codex, a execução seguinte retoma a última sessão Claude somente quando workspace, perfil, modelo, esforço, plano, revisão, responsáveis, escopo, destino e política de autenticação continuam compatíveis. Mudança material cria uma sessão nova, sem importar contexto anterior. Retomar não desfaz edições nem repete ferramentas: reinspecione o estado e diga no prompt seguinte o que falta.
 
 ## Nuvem
 
